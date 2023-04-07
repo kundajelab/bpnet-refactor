@@ -136,7 +136,7 @@ def motif_module(
             filters[i], kernel_size=kernel_sizes[i], padding=padding, 
             activation='relu', 
             name='{}_conv_{}'.format(name_prefix, i))(motif_module_out)
-        if motif_module_dropouts!=[0.0]:
+        if motif_module_dropouts!=None:
             print(f"motif_module_dropouts[{i}]:",motif_module_dropouts[i])
             assert(len(motif_module_dropouts)==len(kernel_sizes))
             motif_module_out = layers.Dropout(motif_module_dropouts[i],
@@ -201,10 +201,10 @@ def syntax_module(
         # (activation before the weights layer in the residual unit)
         x_activated = layers.ReLU(name=x.name.split('/')[0]+'_relu')(x)
         
-        if i==1 and motif_module_dropouts!=[0.0]:
+        if i==1 and motif_module_dropouts!=None:
             print("motif_module_dropouts[-1]:",motif_module_dropouts[-1])
             x_activated = layers.Dropout(motif_module_dropouts[-1],name=x.name.split('/')[0]+'_relu_dropout')(x_activated)
-        elif syntax_module_dropouts!=[0.0]:
+        elif syntax_module_dropouts!=None:
             print(f"syntax_module_dropouts[{i-1}]:",syntax_module_dropouts[i-1])
             assert(len(syntax_module_dropouts)==num_dilation_layers)
             x_activated = layers.Dropout(syntax_module_dropouts[i-1],name=x.name.split('/')[0]+'_relu_dropout')(x_activated)
@@ -236,7 +236,7 @@ def syntax_module(
                            name='{}_add_{}'.format(name_prefix, i))
             
     x_activated = layers.ReLU(name=x.name.split('/')[0]+'_relu')(x)
-    if syntax_module_dropouts!=[0.0]:
+    if syntax_module_dropouts!=None:
         print("syntax_module_dropouts[-1]:",syntax_module_dropouts[-1])
         x_activated = layers.Dropout(syntax_module_dropouts[-1],name=x.name.split('/')[0]+'_relu_dropout')(x_activated)
 

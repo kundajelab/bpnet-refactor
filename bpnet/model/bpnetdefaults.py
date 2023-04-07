@@ -18,7 +18,7 @@ MOTIF_MODULE_PARAMS = {
     'filters': [64],
     'kernel_sizes': [21],
     'padding': 'valid',
-    'dropouts': [0.0] # length of dropout should match 'len('filters') or len('filters')' if not [0.0]
+    'dropouts': None # length of dropout list should match 'len('filters') or len('kernel_sizes')' if not None
 }
 
 # parameters to the syntax module that has many dilated 
@@ -29,7 +29,7 @@ SYNTAX_MODULE_PARAMS = {
     'kernel_size': 3,
     'padding': 'valid',
     'pre_activation_residual_unit': True,
-    'dropouts': [0.0] # length of dropout should match 'num_dilation_layers' if not [0.0]
+    'dropouts': None # length of dropouts list should match 'num_dilation_layers' if not None
 }
 
 # parameters to the profile head (the pre-bias profile predictions)
