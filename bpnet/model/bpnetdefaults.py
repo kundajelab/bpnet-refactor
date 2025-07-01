@@ -13,11 +13,12 @@ OUTPUT_PROFILE_LEN = 1000
 # regular convolutional layers
 MOTIF_MODULE_PARAMS = {
     # 'filters' and 'kernel_sizes' are lists in case we have more
-    # than one convolutional layer. In the default case we have a
+    # than one convolutional layer. 'filters' and 'kernel_sizes' should be of the same length. In the default case we have a
     # single convolutional layer for the motif module
     'filters': [64],
     'kernel_sizes': [21],
     'padding': 'valid',
+    'dropouts': None # length of dropout list should match 'len('filters') or len('kernel_sizes')' if not None
 }
 
 # parameters to the syntax module that has many dilated 
@@ -27,7 +28,8 @@ SYNTAX_MODULE_PARAMS = {
     'filters': 64,
     'kernel_size': 3,
     'padding': 'valid',
-    'pre_activation_residual_unit': True
+    'pre_activation_residual_unit': True,
+    'dropouts': None # length of dropouts list should match 'num_dilation_layers' if not None
 }
 
 # parameters to the profile head (the pre-bias profile predictions)
