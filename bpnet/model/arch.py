@@ -106,6 +106,7 @@ def motif_module(
     filters=bpnetdefaults.MOTIF_MODULE_PARAMS['filters'], 
     kernel_sizes=bpnetdefaults.MOTIF_MODULE_PARAMS['kernel_sizes'], 
     padding=bpnetdefaults.MOTIF_MODULE_PARAMS['padding'], 
+    motif_module_dropouts=bpnetdefaults.MOTIF_MODULE_PARAMS['dropouts'],
     name_prefix=None):
     
     """
@@ -121,6 +122,7 @@ def motif_module(
                 convolutional layer
             padding (str): padding to use for the convolutional
                 layers. Either 'valid' or 'same'
+            motif_module_dropouts (list): dropouts to be used for the syntax module after each conv activatation
             naem_prefix (str): prefix for layer name
         Returns:
             N-D tensor with shape: (batch_size, ..., filters[-1])
@@ -129,10 +131,16 @@ def motif_module(
     motif_module_out = one_hot_input
     # n-1 conv layers with activation (n = len(kernel_sizes))
     for i in range(len(kernel_sizes)-1):
+        assert(len(filters)==len(kernel_sizes)) # filters and kernel_size variables are both lists
         motif_module_out = layers.Conv1D(
             filters[i], kernel_size=kernel_sizes[i], padding=padding, 
             activation='relu', 
             name='{}_conv_{}'.format(name_prefix, i))(motif_module_out)
+        if motif_module_dropouts!=None:
+            print(f"motif_module_dropouts[{i}]:",motif_module_dropouts[i])
+            assert(len(motif_module_dropouts)==len(kernel_sizes))
+            motif_module_out = layers.Dropout(motif_module_dropouts[i],
+                                              name='{}_conv_{}_dropout'.format(name_prefix, i))(motif_module_out)
         
     # The activation of the last conv in the motif module is done
     # in the syntax module. The reason for this is to accommodate 
@@ -152,6 +160,8 @@ def syntax_module(
     padding=bpnetdefaults.SYNTAX_MODULE_PARAMS['padding'], 
     pre_activation_residual_unit=\
         bpnetdefaults.SYNTAX_MODULE_PARAMS['pre_activation_residual_unit'], 
+    syntax_module_dropouts=bpnetdefaults.SYNTAX_MODULE_PARAMS['dropouts'],
+    motif_module_dropouts=bpnetdefaults.MOTIF_MODULE_PARAMS['dropouts'],
     name_prefix=None):
     
     """
@@ -175,6 +185,8 @@ def syntax_module(
                 in this paper https://arxiv.org/pdf/1603.05027.pdf. 
                 The True condition is highlighted in 5(c) and False 
                 in 5(a). Default is True
+            syntax_module_dropouts (list): dropouts to be used for the syntax module after each conv activatation
+            motif_module_dropouts (list): the last value in the list of dropouts to be used for the motif_module_output after activatation
             name_prefix (str): prefix to use for layer name
         Returns:
             N-D tensor with shape: (batch_size, ..., filters)
@@ -188,6 +200,15 @@ def syntax_module(
         # apply relu to 'x' before applying dilated conv
         # (activation before the weights layer in the residual unit)
         x_activated = layers.ReLU(name=x.name.split('/')[0]+'_relu')(x)
+        
+        if i==1 and motif_module_dropouts!=None:
+            print("motif_module_dropouts[-1]:",motif_module_dropouts[-1])
+            x_activated = layers.Dropout(motif_module_dropouts[-1],name=x.name.split('/')[0]+'_relu_dropout')(x_activated)
+        elif syntax_module_dropouts!=None:
+            print(f"syntax_module_dropouts[{i-1}]:",syntax_module_dropouts[i-1])
+            assert(len(syntax_module_dropouts)==num_dilation_layers)
+            x_activated = layers.Dropout(syntax_module_dropouts[i-1],name=x.name.split('/')[0]+'_relu_dropout')(x_activated)
+
             
         # dilated convolution
         conv_output_without_activation = layers.Conv1D(
@@ -215,6 +236,10 @@ def syntax_module(
                            name='{}_add_{}'.format(name_prefix, i))
             
     x_activated = layers.ReLU(name=x.name.split('/')[0]+'_relu')(x)
+    if syntax_module_dropouts!=None:
+        print("syntax_module_dropouts[-1]:",syntax_module_dropouts[-1])
+        x_activated = layers.Dropout(syntax_module_dropouts[-1],name=x.name.split('/')[0]+'_relu_dropout')(x_activated)
+
             
     # the final output from the dilated convolutions with 
     # resnet-style connections
@@ -608,6 +633,7 @@ def BPNet(
     motif_module_out = motif_module(
         one_hot_input, motif_module_params['filters'], 
         motif_module_params['kernel_sizes'], motif_module_params['padding'], 
+        motif_module_params['dropouts'],
         name_prefix=name_prefix)
     
     # Step 3 - Syntax module (all dilation layers)
@@ -616,6 +642,8 @@ def BPNet(
         syntax_module_params['filters'], syntax_module_params['kernel_size'],
         syntax_module_params['padding'], 
         syntax_module_params['pre_activation_residual_unit'], 
+        syntax_module_params['dropouts'],
+        motif_module_params['dropouts'],
         name_prefix=name_prefix)
 
     # Step 4.1 - Profile head (large conv kernel)
