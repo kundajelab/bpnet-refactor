@@ -34,6 +34,7 @@ Tests run on the CPU. Set `BPNET_TEST_GPU=1` to let TensorFlow use a GPU.
 | `test_counts_loss_weight.py` | `bpnet-counts-loss-weight` |
 | `saved_weights.py` | reads a SavedModel's weights by layer name from its checkpoint |
 | `test_cli_end_to_end.py` | (slow) `bpnet-train` then `bpnet-predict` as subprocesses on the synthetic dataset; predictions, metric files and bigWigs recomputed from the saved weights with the numpy reference |
+| `test_cli_failures.py` | (slow) failures inside `bpnet-train` reach the exit status |
 | `data/` | small hand-made input files |
 
 ## Known defects

@@ -736,3 +736,12 @@ def train_and_validate_ksplits(
         
         # wait for the process to finish
         p.join()
+
+        # a training process that raised an exception or was killed
+        # must not look like a finished run: stop here, with an error
+        # status for the command line
+        if p.exitcode != 0:
+            raise NoTracebackException(
+                "Training of split {} failed (the training process ended "
+                "with exit code {}). See the messages above and {}".format(
+                    i, p.exitcode, logfname))
