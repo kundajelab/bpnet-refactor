@@ -33,8 +33,13 @@ def multinomial_log_prob(true_counts, logits):
         
         This is the log_prob of tensorflow-probability's Multinomial
         (which this package used until it stopped depending on that
-        library), written with the same operations in the same order, 
-        so that values and gradients are the same to the last bit.
+        library), written with the same operations, in the same 
+        order and under the same name scopes. Values and gradients 
+        are then the same to the last bit, eagerly and in a compiled 
+        function. (The name scopes matter: in a compiled function 
+        TensorFlow adds up the contributions to the gradient with 
+        respect to the counts in an order that depends on the names 
+        of the operations.)
         
         Args:
             true_counts (tensorflow.Tensor): observed counts, 
@@ -49,17 +54,22 @@ def multinomial_log_prob(true_counts, logits):
     logits = tf.convert_to_tensor(logits)
     counts_per_example = tf.reduce_sum(true_counts, axis=-1)
 
-    # positions without counts contribute nothing, whatever their 
-    # log probability (also when it is -inf)
-    log_p = tf.math.log_softmax(logits)
-    log_unnormalized = tf.reduce_sum(
-        tf.math.multiply_no_nan(log_p, true_counts), axis=-1)
+    with tf.name_scope('Multinomial'), tf.name_scope('log_prob'):
+        # positions without counts contribute nothing, whatever their 
+        # log probability (also when it is -inf)
+        log_p = tf.math.log_softmax(logits)
+        log_unnormalized = tf.reduce_sum(
+            tf.math.multiply_no_nan(log_p, true_counts), axis=-1)
 
-    # log of the number of ways the counts can be arranged
-    log_combinations = tf.math.lgamma(counts_per_example + 1) - \
-        tf.reduce_sum(tf.math.lgamma(true_counts + 1), axis=-1)
+        # log of the number of ways the counts can be arranged
+        with tf.name_scope('log_combinations'):
+            total_permutations = tf.math.lgamma(counts_per_example + 1)
+            counts_factorial = tf.math.lgamma(true_counts + 1)
+            redundant_permutations = tf.reduce_sum(
+                counts_factorial, axis=-1)
+            log_combinations = total_permutations - redundant_permutations
 
-    return log_unnormalized + log_combinations
+        return log_unnormalized + log_combinations
 
 
 def multinomial_nll(true_counts, logits):

@@ -102,17 +102,23 @@ def tensorflow_probability_nll(true_counts, logits):
 
 
 def value_and_gradient(function, counts, logits, compiled):
+    """
+        The loss, its gradient with respect to the logits (what
+        training uses) and with respect to the counts
+    """
+
     variable = tf.Variable(logits)
+    observed = tf.constant(counts)
 
     def run():
         with tf.GradientTape() as tape:
-            value = function(tf.constant(counts), variable)
-        return value, tape.gradient(value, variable)
+            tape.watch(observed)
+            value = function(observed, variable)
+        return (value,) + tuple(tape.gradient(value, [variable, observed]))
 
     if compiled:
         run = tf.function(run)
-    value, gradient = run()
-    return value.numpy(), gradient.numpy()
+    return [x.numpy() for x in run()]
 
 
 NLL_CASES = {
@@ -121,6 +127,9 @@ NLL_CASES = {
     "one row": dict(rows=1, positions=1000, rate=0.1),
     "deep coverage": dict(rows=3, positions=2000, rate=400.0),
     "one position": dict(rows=4, positions=1, rate=3.0),
+    # a bigWig can hold any number: neither implementation checks
+    "fractional counts": dict(rows=5, positions=40, rate=2.0, scale=0.37),
+    "negative counts": dict(rows=5, positions=40, rate=2.0, shift=-1.5),
 }
 
 
@@ -135,21 +144,45 @@ def test_multinomial_nll_equals_the_tensorflow_probability_version(
     """
 
     pytest.importorskip("tensorflow_probability")
+    options = dict(NLL_CASES[case])
+    scale, shift = options.pop("scale", 1.0), options.pop("shift", 0.0)
     for seed in range(3):
-        counts, logits = random_counts_and_logits(seed, **NLL_CASES[case])
+        counts, logits = random_counts_and_logits(seed, **options)
         # some rows and positions without any counts, and some very
         # unlikely positions
         counts[0] = 0
         counts[:, 1::3] = 0
         logits[:, -1] = -80.0
+        counts = (counts * scale + shift * (counts > 0)).astype(np.float32)
         new = value_and_gradient(losses.multinomial_nll, counts, logits,
                                  compiled)
         old = value_and_gradient(tensorflow_probability_nll, counts, logits,
                                  compiled)
         assert new[0].dtype == old[0].dtype == np.float32
-        assert np.array_equal(new[0], old[0]), (case, seed)
-        assert np.array_equal(new[1], old[1]), (case, seed)
-        assert np.isfinite(new[0]) and np.isfinite(new[1]).all()
+        for a, b, what in zip(new, old, ("loss", "gradient with respect to "
+                                         "the logits", "gradient with "
+                                         "respect to the counts")):
+            assert np.array_equal(a, b, equal_nan=True), (case, seed, what)
+        if shift == 0:
+            assert np.isfinite(new[0]) and np.isfinite(new[1]).all()
+            # the counts do have a gradient (none with one position:
+            # its probability is 1 whatever the count)
+            if counts.shape[1] > 1:
+                assert np.abs(new[2]).max() > 0
+
+
+def test_count_gradient_of_the_review_example_in_a_compiled_function():
+    # values recorded from the tensorflow-probability version under
+    # TensorFlow 2.4.1; without its name scopes three of them come out
+    # one bit different
+    counts = np.array([[0., 1., 2., 0.], [1., 2., 0., 1.]], dtype=np.float32)
+    logits = np.linspace(-2, 2, 8, dtype=np.float32).reshape(2, 4)
+    loss, _, gradient = value_and_gradient(
+        losses.multinomial_nll, counts, logits, True)
+    assert float(loss) == pytest.approx(3.8868778, rel=1e-7)
+    assert float(gradient[0, 1]) == np.float32(0.51701623)
+    assert float(gradient[1, 0]) == np.float32(0.6777304)
+    assert float(gradient[1, 2]) == np.float32(-0.39369822)
 
 
 def test_multinomial_log_prob_per_row():
