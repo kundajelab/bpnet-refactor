@@ -6,8 +6,9 @@
     given the same weights must reproduce these numbers.
 
     Supported: one task, 'valid' padding, with or without control
-    (bias) inputs, the joint multinomial loss over the strands of the
-    task or the original one-multinomial-per-strand loss.
+    (bias) inputs, a counts head with or without hidden layers, the
+    joint multinomial loss over the strands of the task or the original
+    one-multinomial-per-strand loss.
 
     Weights are passed as a dictionary: layer name -> [kernel, bias]
     with Keras conventions (Conv1D kernel (width, in, out), Dense
@@ -56,6 +57,17 @@ def center_crop(x, new_len):
 
 def relu(x):
     return np.maximum(x, 0.0)
+
+
+#: activations of the hidden layers of the counts head; Keras'
+#: LeakyReLU layer has a slope of 0.3 for negative inputs
+ACTIVATIONS = {
+    "linear": lambda x: x,
+    "relu": relu,
+    "leakyrelu": lambda x: np.where(x > 0, x, 0.3 * x),
+    "tanh": np.tanh,
+    "sigmoid": lambda x: 1.0 / (1.0 + np.exp(-x)),
+}
 
 
 def forward(weights, params, sequence, profile_bias=None, counts_bias=None,
@@ -112,8 +124,19 @@ def forward(weights, params, sequence, profile_bias=None, counts_bias=None,
     profile = center_crop(conv1d_valid(x, kernel, bias),
                           params["output_profile_len"])
 
-    # counts head: average over all positions, then a dense layer
-    pooled = x.mean(axis=1)
+    # counts head: with a single dense layer, the average over all
+    # positions feeds it; with hidden layers, all positions of all
+    # filters (flattened position by position) go through the hidden
+    # layers first (dropout is inactive at inference)
+    head = params["counts_head_params"]
+    if len(head["units"]) == 1:
+        pooled = x.mean(axis=1)
+    else:
+        pooled = x.reshape(x.shape[0], -1)
+        for i in range(len(head["units"]) - 1):
+            kernel, bias = weights["counts_dense_{}".format(i)]
+            pooled = ACTIVATIONS[head["activations"][i]](
+                pooled @ np.asarray(kernel, dtype=np.float64) + bias)
     has_bias = profile_bias is not None
     name = "{}_counts_head".format(name_prefix) if has_bias \
         else "logcounts_predictions"

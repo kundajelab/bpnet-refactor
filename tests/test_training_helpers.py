@@ -64,6 +64,16 @@ def test_lr_unchanged_when_any_recent_loss_improved():
     assert reduce_lr_on_plateau([5.0, 4.0, 6.0], 0.001, patience=2) == 0.001
 
 
+def test_lr_anchor_is_the_loss_before_the_window():
+    # as for early stopping, the comparison is with the loss `patience`
+    # epochs ago, not with the best loss so far: recovering from a
+    # spike counts as improvement
+    assert reduce_lr_on_plateau([3.0, 9.0, 8.0, 8.0], 0.001,
+                                patience=2) == 0.001
+    assert reduce_lr_on_plateau([3.0, 9.0, 9.0, 9.5], 0.001, factor=0.5,
+                                patience=2) == 0.0005
+
+
 def test_lr_reduced_on_a_plateau():
     assert reduce_lr_on_plateau([5.0, 5.0, 5.0], 0.001, factor=0.5,
                                 patience=2) == 0.0005

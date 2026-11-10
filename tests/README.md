@@ -28,6 +28,7 @@ Tests run on the CPU. Set `BPNET_TEST_GPU=1` to let TensorFlow use a GPU.
 | `test_losses.py` | multinomial NLL against scipy, its gradient and normalization constant, MSE and Poisson count losses |
 | `test_custommodel.py` | the training objective against the numpy reference (masking by weight, joint two-strand multinomial, log(total + 2) count target), gradients against finite differences, the Adam update rule, train / test step bookkeeping |
 | `test_training_helpers.py` | early stopping and learning-rate-on-plateau rules |
+| `test_optimizer.py` | the Adam update on prescribed gradients (40 steps, magnitudes around epsilon, a learning-rate change) |
 | `data/` | small hand-made input files |
 
 ## Known defects
@@ -35,3 +36,11 @@ Tests run on the CPU. Set `BPNET_TEST_GPU=1` to let TensorFlow use a GPU.
 Tests marked `xfail(strict=True)` describe behaviour we want but do not have yet. They fail
 today, and the PR that fixes a defect removes the marker (a strict xfail that starts passing
 fails the suite, so it cannot be forgotten).
+
+## Numerical tolerances
+
+Model outputs and losses are compared with the float64 numpy reference at a relative tolerance
+of 1e-4 (2e-4 for losses); weight updates at an absolute tolerance of a few 1e-6 for updates of
+about 1e-3. These bounds hold for float32 arithmetic on the CPU. On Ampere or newer NVIDIA GPUs
+TensorFlow computes convolutions in TF32 by default, which is less precise: run GPU parity checks
+with `NVIDIA_TF32_OVERRIDE=0`.

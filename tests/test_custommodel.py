@@ -329,3 +329,183 @@ def test_dropout_is_only_active_in_train_steps():
         model.train_step(data)["logcounts_predictions_loss"])
         for _ in range(4)}
     assert len(train_values) > 1
+
+
+# --------------------------------------------------------------------
+# loss weights
+# --------------------------------------------------------------------
+
+@pytest.mark.parametrize("loss_weights", [[0.25, 3.0], [2.0, 0.5],
+                                          [0.0, 3.0], [1.5, 0.0]])
+def test_both_loss_weights_are_applied(loss_weights):
+    params = small_params(loss_weights=loss_weights)
+    model = build(params)
+    weights = randomize_weights(model, seed=31)
+    batch = random_batch(params, seed=32)
+    inputs, outputs, sample_weights = batch
+
+    with tf.GradientTape() as tape:
+        total, profile_loss, counts_loss = model._get_loss(
+            inputs, outputs, tf.constant(sample_weights))
+    np.testing.assert_allclose(
+        float(total), loss_weights[0] * float(profile_loss)
+        + loss_weights[1] * float(counts_loss), rtol=1e-5)
+    np.testing.assert_allclose(float(total),
+                               reference_loss(weights, params, batch)[0],
+                               rtol=2e-4)
+
+    # a head whose loss has weight 0 gets no gradient
+    gradients = {v.name: g for v, g in zip(
+        model.trainable_variables,
+        tape.gradient(total, model.trainable_variables))}
+    profile_only = np.abs(
+        gradients["main_profile_head/kernel:0"].numpy()).max()
+    counts_only = np.abs(
+        gradients["main_counts_head/kernel:0"].numpy()).max()
+    assert (profile_only == 0) == (loss_weights[0] == 0)
+    assert (counts_only == 0) == (loss_weights[1] == 0)
+
+
+# --------------------------------------------------------------------
+# batches without foreground, as the compiled train function sees them
+# --------------------------------------------------------------------
+
+def compiled_train_step(model):
+    train_function = model.make_train_function()
+
+    def step(batch):
+        inputs, outputs, sample_weights = batch
+        dataset = tf.data.Dataset.from_tensors(
+            (inputs, outputs, sample_weights))
+        return train_function(iter(dataset))
+    return step
+
+
+def test_batch_without_foreground_in_the_compiled_train_step():
+    """
+        In the compiled train function a batch without foreground gives
+        the profile layers a gradient of zero (not "no gradient"): Adam
+        still moves them on the momentum of earlier batches. Another
+        backend has to do the same to follow the same trajectory.
+    """
+
+    params = small_params()
+    model = build(params)
+    randomize_weights(model, seed=33)
+    model.compile(Adam(learning_rate=0.001), loss=None)
+    step = compiled_train_step(model)
+    foreground = random_batch(params, seed=34)
+    background = random_batch(params, seed=35, weights=[0.0] * 6)
+
+    variable = [v for v in model.trainable_variables
+                if v.name == "main_profile_head/kernel:0"][0]
+    inputs, outputs, sample_weights = foreground
+    with tf.GradientTape() as tape:
+        total, _, _ = model._get_loss(inputs, outputs,
+                                      tf.constant(sample_weights))
+    g = tape.gradient(total, variable).numpy().astype(np.float64)
+
+    k0 = variable.numpy().astype(np.float64)
+    step(foreground)
+    k1 = variable.numpy().astype(np.float64)
+    logs = step(background)
+    k2 = variable.numpy().astype(np.float64)
+    assert float(logs["profile_predictions_loss"]) == 0.0
+
+    # step 1 with gradient g, step 2 with gradient 0
+    m1, v1 = 0.1 * g, 0.001 * g * g
+    lr1 = 0.001 * np.sqrt(1 - 0.999) / (1 - 0.9)
+    np.testing.assert_allclose(k1 - k0, -lr1 * m1 / (np.sqrt(v1) + 1e-7),
+                               rtol=0, atol=2e-6)
+    m2, v2 = 0.9 * m1, 0.999 * v1
+    lr2 = 0.001 * np.sqrt(1 - 0.999 ** 2) / (1 - 0.9 ** 2)
+    expected = -lr2 * m2 / (np.sqrt(v2) + 1e-7)
+    np.testing.assert_allclose(k2 - k1, expected, rtol=0, atol=2e-6)
+    # the layer did move in the batch without foreground
+    assert np.abs(k2 - k1).max() > 5e-4
+
+
+# --------------------------------------------------------------------
+# several optimizer steps
+# --------------------------------------------------------------------
+
+def test_several_adam_steps_follow_the_keras_rule():
+    """
+        m <- b1 m + (1 - b1) g; v <- b2 v + (1 - b2) g^2;
+        theta <- theta - lr * sqrt(1 - b2^t) / (1 - b1^t) * m /
+        (sqrt(v) + 1e-7), with the learning rate changed on the way as
+        the trainer does on a plateau
+    """
+
+    params = small_params()
+    model = build(params)
+    randomize_weights(model, seed=36)
+    model.compile(Adam(learning_rate=0.001), loss=None)
+    batches = [random_batch(params, seed=s) for s in (37, 38, 39)]
+
+    variables = model.trainable_variables
+    theta = [v.numpy().astype(np.float64) for v in variables]
+    m = [np.zeros_like(t) for t in theta]
+    v = [np.zeros_like(t) for t in theta]
+    lr = 0.001
+    for t in range(1, 8):
+        if t == 5:
+            lr = 0.0005
+            model.optimizer.learning_rate.assign(lr)
+        inputs, outputs, sample_weights = batches[t % 3]
+        with tf.GradientTape() as tape:
+            total, _, _ = model._get_loss(inputs, outputs,
+                                          tf.constant(sample_weights))
+        gradients = [g.numpy().astype(np.float64)
+                     for g in tape.gradient(total, variables)]
+        model.train_step((inputs, outputs, tf.constant(sample_weights)))
+
+        lr_t = lr * np.sqrt(1 - 0.999 ** t) / (1 - 0.9 ** t)
+        for i, g in enumerate(gradients):
+            m[i] = 0.9 * m[i] + 0.1 * g
+            v[i] = 0.999 * v[i] + 0.001 * g * g
+            theta[i] = theta[i] - lr_t * m[i] / (np.sqrt(v[i]) + 1e-7)
+            np.testing.assert_allclose(
+                variables[i].numpy(), theta[i], rtol=0, atol=1e-5,
+                err_msg="step {} {}".format(t, variables[i].name))
+        # follow the model's float32 weights, so the gradients of the
+        # next step are compared at the same point
+        theta = [var.numpy().astype(np.float64) for var in variables]
+
+
+# --------------------------------------------------------------------
+# POISSON counts loss, as it behaves today
+# --------------------------------------------------------------------
+
+def test_poisson_counts_loss_is_per_example_and_unweighted():
+    """
+        With counts_loss "POISSON" the counts loss stays a vector with
+        one value per example and the loss weights are not applied; the
+        total loss is that vector plus the (scalar) profile loss. This
+        differs from the MSE path (a batch mean, weighted) and is
+        recorded here as it is.
+    """
+
+    from scipy.special import gammaln, logsumexp
+
+    params = small_params(counts_loss="POISSON")
+    model = build(params)
+    weights = randomize_weights(model, seed=40, scale=0.05)
+    inputs, outputs, sample_weights = random_batch(params, seed=41)
+    total, profile_loss, counts_loss = model._get_loss(
+        inputs, outputs, tf.constant(sample_weights))
+
+    _, log_pred = reference_model.forward(
+        weights, params, inputs["sequence"], inputs["profile_bias_input_0"],
+        inputs["counts_bias_input_0"])
+    true = np.exp(logsumexp(
+        outputs["logcounts_predictions"].astype(np.float64), axis=1))
+    pred = np.exp(log_pred[:, 0])
+    expected = pred - true * np.log(pred + 1e-8) + gammaln(true + 1.0)
+
+    assert counts_loss.shape == (6,)
+    assert total.shape == (6,)
+    assert profile_loss.shape == ()
+    np.testing.assert_allclose(counts_loss.numpy(), expected, rtol=1e-4)
+    np.testing.assert_allclose(
+        total.numpy(), float(profile_loss) + counts_loss.numpy(), rtol=1e-5)

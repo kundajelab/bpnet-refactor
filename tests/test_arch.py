@@ -144,6 +144,15 @@ FORWARD_CASES = {
         output_profile_len=76,
         profile_bias_module_params={"kernel_sizes": [5]})),
     "original loss with control": dict(orig_multi_loss=True),
+    "counts head with hidden layers": dict(params=dict(
+        counts_head_params={
+            "units": [8, 4, 1], "dropouts": [0.5, 0.0, 0.0],
+            "activations": ["relu", "leakyrelu", "linear"]})),
+    "counts head with hidden layers, no control": dict(n_bias=0, params=dict(
+        counts_head_params={
+            "units": [5, 1], "dropouts": [0.0, 0.0],
+            "activations": ["tanh", "linear"]})),
+    "smoothed control tracks": dict(n_bias=4, smoothing=[[7.0, 81]] * 2),
 }
 
 
@@ -154,8 +163,12 @@ def test_forward_pass_matches_the_reference(case):
     n_signal = options.pop("n_signal", 2)
     n_bias = options.pop("n_bias", 2)
     orig_multi_loss = options.pop("orig_multi_loss", False)
+    smoothing = options.pop("smoothing", None)
 
-    model = build(params, make_tasks(n_signal, n_bias),
+    # a smoothed copy of each control track doubles the control channels
+    n_control_files = n_bias // 2 if smoothing else n_bias
+    model = build(params, make_tasks(n_signal, n_control_files,
+                                     smoothing=smoothing),
                   orig_multi_loss=orig_multi_loss)
     weights = randomize_weights(model, seed=1)
 
@@ -329,12 +342,37 @@ def test_building_a_model_leaves_the_defaults_alone():
     assert bpnetdefaults.SYNTAX_MODULE_PARAMS == before
 
 
-@pytest.mark.xfail(strict=True, reason="multi-task models: the per-task "
-                   "track counts are cumulative and every task's counts "
-                   "layer has one unit per task")
-def test_two_task_model():
+def two_task_model():
     params = small_params(profile_bias_module_params={"kernel_sizes": [1, 1]})
     model = build(params, make_tasks(n_tasks=2))
-    assert list(model.tracks_for_each_task) == [2, 2]
-    assert [tuple(t.shape) for t in model.outputs] == \
-        [(None, 80, 4), (None, 2)]
+    # the model builds today; its bookkeeping and counts output are wrong
+    assert tuple(model.outputs[0].shape) == (None, 80, 4)
+    return model
+
+
+@pytest.mark.xfail(strict=True, reason="multi-task models: the number of "
+                   "tracks per task is stored as a running total")
+def test_two_task_model_tracks_per_task():
+    assert list(two_task_model().tracks_for_each_task) == [2, 2]
+
+
+@pytest.mark.xfail(strict=True, reason="multi-task models: every task's "
+                   "counts layer has one unit per task, so two tasks give "
+                   "four count outputs")
+def test_two_task_model_has_one_count_per_task():
+    assert tuple(two_task_model().outputs[1].shape) == (None, 2)
+
+
+@pytest.mark.xfail(strict=True, raises=AssertionError,
+                   reason="an output length whose difference to the profile "
+                   "head's length is odd cannot be cropped symmetrically; "
+                   "the model is built with another length without notice")
+def test_uncroppable_output_length_is_not_silently_changed():
+    from bpnet.utils.exceptionhandler import NoTracebackException
+    # the profile head produces 80 positions here; 79 was asked for
+    params = small_params(output_profile_len=79)
+    try:
+        model = build(params, make_tasks(n_bias=0))
+    except NoTracebackException:
+        return
+    assert tuple(model.outputs[0].shape) == (None, 79, 2)
