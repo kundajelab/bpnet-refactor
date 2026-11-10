@@ -10,6 +10,7 @@ import pytest
 from bpnet.generators import sequtils
 
 from tests.checks import one_hot
+from tests.legacy_reference import one_hot_encode_v0
 
 
 # --------------------------------------------------------------------
@@ -57,13 +58,63 @@ def test_fix_sequence_length():
     assert sequtils.fix_sequence_length("", 2) == "NN"
 
 
-@pytest.mark.xfail(strict=True, reason="the IUPAC codes B, D, H, V (and any "
-                   "other letter) raise ValueError instead of encoding as "
-                   "zeros like N")
-@pytest.mark.parametrize("letter", list("BDHV"))
-def test_one_hot_encode_other_iupac_codes_are_zeros(letter):
+@pytest.mark.parametrize("letter", list("BDHVUX-*.?") + ["\u00e9"])
+def test_one_hot_encode_any_other_character_is_zeros(letter):
+    # the remaining IUPAC codes and anything else: zeros, like N
     result = sequtils.one_hot_encode(["A" + letter + "T"], 3)
     assert np.array_equal(result[0], one_hot("ANT"))
+
+
+def test_one_hot_encode_lower_case_bases():
+    result = sequtils.one_hot_encode(["acgtn", "AcGtN"], 5)
+    assert np.array_equal(result[0], one_hot("ACGTN"))
+    assert np.array_equal(result[1], one_hot("ACGTN"))
+
+
+@pytest.mark.parametrize("seed", range(3))
+def test_one_hot_encode_equals_the_previous_implementation(seed):
+    """
+        Same values and same type as the implementation it replaced, on
+        every letter that one supported, with sequences shorter and
+        longer than the requested length
+    """
+
+    rng = np.random.RandomState(seed)
+    letters = list("ACGTNYRMSWK")
+    sequences = ["".join(rng.choice(letters, size=rng.randint(1, 400)))
+                 for _ in range(50)]
+    for length in (1, 50, 200, 400, 450):
+        new = sequtils.one_hot_encode(sequences, length)
+        old = one_hot_encode_v0(sequences, length)
+        assert new.dtype == old.dtype == np.float64
+        assert new.shape == old.shape == (50, length, 4)
+        assert np.array_equal(new, old)
+
+
+@pytest.mark.parametrize("dtype", [np.int8, np.uint8, np.float32,
+                                   np.float64, bool])
+def test_one_hot_encode_dtype(dtype):
+    rng = np.random.RandomState(0)
+    sequences = ["".join(rng.choice(list("ACGTN"), size=30))
+                 for _ in range(4)]
+    result = sequtils.one_hot_encode(sequences, 30, dtype=dtype)
+    assert result.dtype == np.dtype(dtype)
+    assert np.array_equal(result, sequtils.one_hot_encode(sequences, 30))
+    # the result is the caller's own array
+    assert result.flags.writeable
+    result[:] = 0
+    assert sequtils.one_hot_encode(sequences, 30).sum() > 0
+
+
+def test_one_hot_encode_has_at_most_one_base_per_position():
+    rng = np.random.RandomState(1)
+    sequences = ["".join(chr(c) for c in rng.randint(32, 127, size=200))
+                 for _ in range(20)]
+    result = sequtils.one_hot_encode(sequences, 200)
+    assert set(np.unique(result)) <= {0.0, 1.0}
+    assert result.sum(axis=2).max() == 1
+    for i, sequence in enumerate(sequences):
+        assert np.array_equal(result[i], one_hot(sequence.upper()))
 
 
 # --------------------------------------------------------------------
