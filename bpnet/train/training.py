@@ -157,6 +157,11 @@ def global_seed():
     return None if seed is None else int(seed)
 
 
+#: seed of the graph in which initializers_follow_global_seed looks at
+#: an initializer; no operation carries this number by chance
+_PROBE_SEED = 987654
+
+
 def initializers_follow_global_seed():
     """
         Whether TensorFlow itself derives the initial weights of new 
@@ -164,13 +169,15 @@ def initializers_follow_global_seed():
         from reading the sources, up to 2.9); later versions draw 
         them from seeds that keras makes up.
         
-        Found out by observation rather than from the version number:
-        two unseeded initializers are run, each in a function graph of 
-        its own. If the global seed determines what they draw, the two 
-        draw the same numbers. Running them takes no operation seed 
-        from the global stream, leaves the random kernels of earlier 
-        operations alone and restores the state of Python's random 
-        module, so that everything after it is as if it had not run.
+        Found out by looking rather than from the version number: an 
+        unseeded initializer is called in a graph of its own whose 
+        seed is set to a known number. Where initial weights follow 
+        TensorFlow's seed, the random operation it creates carries 
+        that number. Nothing is run: no operation seed is taken from 
+        the global stream, the random kernels of earlier operations 
+        are left alone, and the state of Python's random module is 
+        restored, so that everything after it is as if it had not been
+        called.
         
         Outside eager execution the answer is always yes: initial 
         weights in a TensorFlow 1 style graph are left to TensorFlow. 
@@ -183,17 +190,20 @@ def initializers_follow_global_seed():
         return True
     
     state = random.getstate()
+    graph = tf.Graph()
     try:
-        draws = []
-        for _ in range(2):
-            @tf.function
-            def draw():
-                return tf.keras.initializers.GlorotUniform()(
-                    shape=(8,), dtype=tf.float32)
-            draws.append(draw().numpy())
+        with graph.as_default():
+            tf.compat.v1.set_random_seed(_PROBE_SEED)
+            tf.keras.initializers.GlorotUniform()(
+                shape=(8,), dtype=tf.float32)
     finally:
         random.setstate(state)
-    return bool(np.array_equal(draws[0], draws[1]))
+        
+    for operation in graph.get_operations():
+        if 'seed' in operation.node_def.attr and \
+                operation.get_attr('seed') == _PROBE_SEED:
+            return True
+    return False
 
 
 def train_and_validate(

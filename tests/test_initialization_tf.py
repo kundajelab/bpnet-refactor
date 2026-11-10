@@ -266,6 +266,60 @@ def test_whether_tensorflow_draws_initial_weights_from_its_seed(seed):
     assert training.initializers_follow_global_seed() is SEEDED_BY_TENSORFLOW
 
 
+def test_the_answer_does_not_depend_on_how_functions_are_run():
+    # with tf.function bodies run eagerly (a debugging setting) an
+    # initializer inside a function would take operation seeds from
+    # the global stream; the answer is found without running anything
+    tf.config.run_functions_eagerly(True)
+    try:
+        before = seed_stream_state()
+        assert training.initializers_follow_global_seed() is \
+            SEEDED_BY_TENSORFLOW
+        assert seed_stream_state() == before
+    finally:
+        tf.config.run_functions_eagerly(False)
+
+
+def test_the_answer_is_no_for_a_generator_that_ignores_the_seed(monkeypatch):
+    # an initializer that draws with a seed of its own, as newer keras
+    # versions do, on any TensorFlow version
+    class OwnSeed(tf.keras.initializers.GlorotUniform):
+        def __init__(self):
+            super(OwnSeed, self).__init__(seed=random.randint(1, 10 ** 9))
+
+    monkeypatch.setattr(tf.keras.initializers, "GlorotUniform", OwnSeed)
+    state = random.getstate()
+    assert training.initializers_follow_global_seed() is False
+    # the state of Python's random module is put back
+    assert random.getstate() == state
+
+    # and one that gives the seeded random operation fixed seeds of
+    # its own
+    class FixedSeeds(tf.keras.initializers.Initializer):
+        def __call__(self, shape, dtype=None, **kwargs):
+            return tf.raw_ops.RandomUniform(shape=shape, dtype=dtype,
+                                            seed=7, seed2=8)
+
+    monkeypatch.setattr(tf.keras.initializers, "GlorotUniform", FixedSeeds)
+    assert training.initializers_follow_global_seed() is False
+
+
+def test_the_answer_is_yes_for_a_generator_that_takes_tensorflows_seeds(
+        monkeypatch):
+    # an initializer that draws with a random operation without a seed
+    # of its own, as keras did up to 2.9, on any TensorFlow version
+    class TensorFlowSeeds(tf.keras.initializers.Initializer):
+        def __call__(self, shape, dtype=None, **kwargs):
+            return tf.random.uniform(shape, -1.0, 1.0, dtype=dtype)
+
+    monkeypatch.setattr(tf.keras.initializers, "GlorotUniform",
+                        TensorFlowSeeds)
+    before = seed_stream_state()
+    assert training.initializers_follow_global_seed() is True
+    assert seed_stream_state() == before
+    assert training.global_seed() == initialization.DEFAULT_SEED
+
+
 def test_finding_out_leaves_no_trace():
     """
         Everything random after initializers_follow_global_seed() is
@@ -276,11 +330,13 @@ def test_finding_out_leaves_no_trace():
 
     def after(probe):
         tf.random.set_seed(99)
+        assert training.global_seed() == 99
         random.seed(5)
         np.random.seed(5)
         first = tf.random.uniform([3], seed=9).numpy()
         if probe:
             training.initializers_follow_global_seed()
+        assert training.global_seed() == 99
         return (first, seed_stream_state(), random.random(),
                 np.random.rand(),
                 # a kernel that was used before continues its stream
