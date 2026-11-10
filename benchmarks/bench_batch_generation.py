@@ -1,6 +1,7 @@
 """
-    Time to construct one training batch, on real data, with the one
-    hot encoder the package had before and with the present one.
+    Time to construct one training batch, on real data, with the
+    present code and with one piece of it replaced by the
+    implementation it had before.
 
         python benchmarks/bench_batch_generation.py \\
             --input-data input.json --reference-genome genome.fa \\
@@ -34,7 +35,17 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from benchmarks.timing import compare, report
 from bpnet.generators import generators, sequtils
-from tests.legacy_reference import one_hot_encode_v0
+from tests import legacy_reference
+
+#: the pieces that were replaced by faster ones: (what, the module and
+#: the name the batch generator looks it up under, the implementation
+#: it had before)
+REPLACED = [
+    ("one hot encoder", sequtils, "one_hot_encode",
+     legacy_reference.one_hot_encode_v0),
+    ("bigWig reading", generators, "interval_values",
+     legacy_reference.interval_values_v0),
+]
 
 
 def main():
@@ -58,62 +69,63 @@ def main():
           "with reverse complements) is timed".format(
               len(rows), args.batches, args.batch_size))
 
-    present = sequtils.one_hot_encode
-    encode_seconds = {"old": [], "new": []}
     warmup = 2
-    calls = [0]
 
-    def timed_encoder(name, function):
-        def encode(sequences, seq_length):
-            start = time.perf_counter()
-            result = function(sequences, seq_length)
-            # the calls of the warm up are not part of the timing
-            if calls[0] >= 2 * warmup:
-                encode_seconds[name].append(time.perf_counter() - start)
-            return result
-        return encode
+    def batch_rows(start):
+        # the rows of a batch as a worker process prepares them
+        rows_of_batch = rows.iloc[start:start + args.batch_size][
+            ['chrom', 'pos', 'weight']].copy()
+        rows_of_batch['status'] = 1
+        rows_of_batch.loc[rows_of_batch['weight'] == 0, 'status'] = -1
+        rows_of_batch['idx'] = rows_of_batch.index.values
+        return rows_of_batch
 
-    position = [0]
+    for what, module, name, previous in REPLACED:
+        present = getattr(module, name)
+        seconds = {"old": [], "new": []}
+        calls = [0]
+        position = [0]
 
-    def batch(name, function):
-        def run():
-            start = position[0] % (len(rows) - args.batch_size)
-            # the rows of a batch as a worker process prepares them
-            batch_rows = rows.iloc[start:start + args.batch_size][
-                ['chrom', 'pos', 'weight']].copy()
-            batch_rows['status'] = 1
-            batch_rows.loc[batch_rows['weight'] == 0, 'status'] = -1
-            batch_rows['idx'] = batch_rows.index.values
-            sequtils.one_hot_encode = timed_encoder(name, function)
-            # the same jitters for both variants
-            random.seed(start)
-            try:
-                gen._generate_batch(batch_rows)
-            finally:
-                sequtils.one_hot_encode = present
-        return run
+        def timed(variant, function):
+            def run(*arguments):
+                start = time.perf_counter()
+                result = function(*arguments)
+                # the calls of the warm up are not part of the timing
+                if calls[0] >= 2 * warmup:
+                    seconds[variant].append(time.perf_counter() - start)
+                return result
+            return run
 
-    old, new = batch("old", one_hot_encode_v0), batch("new", present)
+        def construct(variant, function):
+            def run():
+                start = position[0] % (len(rows) - args.batch_size)
+                setattr(module, name, timed(variant, function))
+                # the same jitters for both variants
+                random.seed(start)
+                try:
+                    gen._generate_batch(batch_rows(start))
+                finally:
+                    setattr(module, name, present)
+                # compare() calls the two alternately; after every
+                # second call both have constructed the current slice
+                # of rows, and the next slice is taken
+                calls[0] += 1
+                if calls[0] % 2 == 0:
+                    position[0] += args.batch_size
+            return run
 
-    # compare() calls the two alternately; after every second call
-    # both have constructed the current slice of rows, and the next
-    # slice is taken
-    def paired(function):
-        def run():
-            function()
-            calls[0] += 1
-            if calls[0] % 2 == 0:
-                position[0] += args.batch_size
-        return run
-
-    result = compare(paired(old), paired(new), rounds=args.batches,
-                     warmup=warmup)
-    report("construction of one training batch", result)
-    for name in ("old", "new"):
-        share = np.median(encode_seconds[name]) / result[name + "_seconds"]
-        print("  {} encoder: {:.2f} ms per batch, {:.0f}% of the batch "
-              "time".format(name, 1e3 * np.median(encode_seconds[name]),
-                            100 * share))
+        result = compare(construct("old", previous),
+                         construct("new", present), rounds=args.batches,
+                         warmup=warmup)
+        report("batch, previous {}".format(what), result)
+        per_batch = len(seconds["new"]) / float(args.batches)
+        for variant in ("old", "new"):
+            # time inside the piece, summed over its calls in a batch
+            inside = np.sum(seconds[variant]) / args.batches
+            print("  {} {}: {:.2f} ms per batch ({:.0f} calls), {:.0f}% of "
+                  "the batch time".format(
+                      variant, what, 1e3 * inside, per_batch,
+                      100 * inside / result[variant + "_seconds"]))
 
 
 if __name__ == "__main__":

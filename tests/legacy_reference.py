@@ -40,3 +40,14 @@ def one_hot_encode_v0(sequences, seq_length):
     encoder = np.vstack([np.eye(4), np.zeros(4)])
     X = encoder[int_sequences]
     return X.reshape(len(sequences), len(sequences[0]), 4)
+
+
+def interval_values_v0(bigwig, chrom, start, end):
+    """
+        How the batch generator read an interval of a bigWig file
+        before interval_values (bpnet/generators/generators.py at
+        main@0b11a7c): a Python list of floats from pyBigWig, converted
+        by numpy.nan_to_num into a float64 array
+    """
+
+    return np.nan_to_num(bigwig.values(chrom, start, end))

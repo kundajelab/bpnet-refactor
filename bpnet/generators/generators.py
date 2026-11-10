@@ -73,6 +73,40 @@ from queue import Queue
 from threading import Thread
 
 
+def interval_values(bigwig, chrom, start, end):
+    """
+        The values of a bigWig file in an interval, with zero at the 
+        positions that have no data
+        
+        pyBigWig hands the values over as a float32 array (the type 
+        they have in the file) when it was built with numpy; without, 
+        it returns a Python list of floats that numpy converts again, 
+        which takes several times longer. Both give the same numbers 
+        once they are stored in a float32 array.
+        
+        Args:
+            bigwig (pyBigWig.bigWigFile): an open bigWig file
+            chrom (str): chromosome
+            start (int): start of the interval
+            end (int): end of the interval (exclusive)
+            
+        Returns:
+            numpy.ndarray: one value per position
+    """
+    
+    if pyBigWig.numpy:
+        values = bigwig.values(chrom, start, end, numpy=True)
+        # a file without any data has nothing to return: pyBigWig 
+        # 0.3.22 then hands back an array without dimensions and with 
+        # arbitrary content. Anything but a row of values is read the 
+        # other way, which gives an empty result as it always did
+        if values.ndim == 1:
+            values[np.isnan(values)] = 0.0
+            return values
+    
+    return np.nan_to_num(bigwig.values(chrom, start, end))
+
+
 class MSequenceGenerator:
     
     """ Multi task batch data generation for training deep neural
@@ -1087,7 +1121,7 @@ class MBPNetSequenceGenerator(MSequenceGenerator):
                 # Step 2. get the profile signal value
                 for signal_file in signal_files[i]:
                     profile_predictions[rowCnt, :, profile_track_idx] = \
-                        np.nan_to_num(signal_file.values(chrom, start, end))  
+                        interval_values(signal_file, chrom, start, end)
                         
                     profile_track_idx += 1
 
@@ -1107,7 +1141,7 @@ class MBPNetSequenceGenerator(MSequenceGenerator):
                     for j in range(cur_num_bias_files):
                         bias_file = bias_files[i][j]
                         profile_bias_input[i][rowCnt, :, bias_track_idx] = \
-                            np.nan_to_num(bias_file.values(chrom, start, end))
+                            interval_values(bias_file, chrom, start, end)
 
                         bias_track_idx += 1                    
                     

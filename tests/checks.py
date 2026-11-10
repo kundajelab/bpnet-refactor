@@ -186,6 +186,10 @@ def check_batch(dataset, inputs, input_len, output_len, profiles, logcounts,
             if bias_is_zero:
                 assert not got.any() and not got_counts.any()
             else:
+                # the control tracks as they are in the file: exactly;
+                # the smoothed copies that follow them: to rounding
+                n_raw = len(dataset["input_data"][str(task)]["bias"]["source"])
+                assert np.array_equal(got[:, :n_raw], bias[:, :n_raw])
                 np.testing.assert_allclose(got, bias, rtol=1e-5, atol=1e-6)
                 np.testing.assert_allclose(
                     got_counts, expected["counts_bias"][task], rtol=1e-5)
