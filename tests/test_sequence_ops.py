@@ -10,6 +10,7 @@ import pytest
 from bpnet.generators import sequtils
 
 from tests.checks import one_hot
+from tests.legacy_reference import one_hot_encode_v0
 
 
 # --------------------------------------------------------------------
@@ -57,13 +58,116 @@ def test_fix_sequence_length():
     assert sequtils.fix_sequence_length("", 2) == "NN"
 
 
-@pytest.mark.xfail(strict=True, reason="the IUPAC codes B, D, H, V (and any "
-                   "other letter) raise ValueError instead of encoding as "
-                   "zeros like N")
-@pytest.mark.parametrize("letter", list("BDHV"))
-def test_one_hot_encode_other_iupac_codes_are_zeros(letter):
+@pytest.mark.parametrize("letter", list("BDHVUX-*.? \n56789") + [
+    "\u00e9", "\u00b2", "\u0665"])
+def test_one_hot_encode_any_other_character_is_zeros(letter):
+    # the remaining IUPAC codes and anything else: zeros, like N. The
+    # previous implementation raised ValueError or IndexError for these
     result = sequtils.one_hot_encode(["A" + letter + "T"], 3)
     assert np.array_equal(result[0], one_hot("ANT"))
+    with pytest.raises((ValueError, IndexError)):
+        one_hot_encode_v0(["A" + letter + "T"], 3)
+
+
+def test_one_hot_encode_lower_case_bases():
+    result = sequtils.one_hot_encode(["acgtn", "AcGtN"], 5)
+    assert np.array_equal(result[0], one_hot("ACGTN"))
+    assert np.array_equal(result[1], one_hot("ACGTN"))
+
+
+#: every character the previous implementation accepted: the letters
+#: it knew, and the digits 0 to 4 (it encoded a digit like the letter
+#: it would have translated to that digit), in ASCII or as a decimal
+#: digit of another script
+PREVIOUSLY_ACCEPTED = list("ACGTNYRMSWK01234") + [
+    "\u0660", "\u0661", "\u0662", "\u0663", "\u0664",   # Arabic-Indic
+    "\uff10", "\uff13", "\uff14",                       # fullwidth
+    "\U0001d7ce", "\U0001d7d1"]                          # mathematical bold
+
+
+@pytest.mark.parametrize("character", PREVIOUSLY_ACCEPTED)
+def test_one_hot_encode_of_every_previously_accepted_character(character):
+    new = sequtils.one_hot_encode(["A" + character + "T", character], 3)
+    old = one_hot_encode_v0(["A" + character + "T", character], 3)
+    assert np.array_equal(new, old)
+    assert new.dtype == old.dtype
+
+
+def test_one_hot_encode_digits_are_bases():
+    result = sequtils.one_hot_encode(["01234", "\u0660\u0661\u0662\u0663\u0664"], 5)
+    assert np.array_equal(result[0], one_hot("ACGTN"))
+    assert np.array_equal(result[1], one_hot("ACGTN"))
+
+
+@pytest.mark.parametrize("sequences,length", [
+    ([], 4), (["", ""], 0), ([""], 0), ([""], 3), (["AC"], 2.0),
+    ([np.str_("ACGT"), np.str_("NN")], 4), (("ACG", "T"), 3),
+    (["ACGT"], 0)])
+def test_one_hot_encode_unusual_arguments_as_before(sequences, length):
+    new = sequtils.one_hot_encode(sequences, length)
+    old = one_hot_encode_v0(sequences, length)
+    if old is None:
+        assert new is None
+    else:
+        assert new.shape == old.shape and new.dtype == old.dtype
+        assert np.array_equal(new, old)
+
+
+@pytest.mark.parametrize("sequences,length", [
+    ([b"ACGT"], 4), (["AC"], 3.5), ([None], 2), ("ACGT", None)])
+def test_one_hot_encode_arguments_rejected_as_before(sequences, length):
+    with pytest.raises(TypeError):
+        one_hot_encode_v0(sequences, length)
+    with pytest.raises(TypeError):
+        sequtils.one_hot_encode(sequences, length)
+
+
+@pytest.mark.parametrize("seed", range(3))
+def test_one_hot_encode_equals_the_previous_implementation(seed):
+    """
+        Same values and same type as the implementation it replaced, on
+        every character that one accepted, with sequences shorter and
+        longer than the requested length
+    """
+
+    rng = np.random.RandomState(seed)
+    letters = PREVIOUSLY_ACCEPTED
+    sequences = ["".join(rng.choice(letters, size=rng.randint(1, 400)))
+                 for _ in range(50)]
+    for length in (1, 50, 200, 400, 450):
+        new = sequtils.one_hot_encode(sequences, length)
+        old = one_hot_encode_v0(sequences, length)
+        assert new.dtype == old.dtype == np.float64
+        assert new.shape == old.shape == (50, length, 4)
+        assert np.array_equal(new, old)
+
+
+@pytest.mark.parametrize("dtype", [np.int8, np.uint8, np.float32,
+                                   np.float64, bool])
+def test_one_hot_encode_dtype(dtype):
+    rng = np.random.RandomState(0)
+    sequences = ["".join(rng.choice(list("ACGTN"), size=30))
+                 for _ in range(4)]
+    result = sequtils.one_hot_encode(sequences, 30, dtype=dtype)
+    assert result.dtype == np.dtype(dtype)
+    assert np.array_equal(result, sequtils.one_hot_encode(sequences, 30))
+    # the result is the caller's own array
+    assert result.flags.writeable
+    result[:] = 0
+    assert sequtils.one_hot_encode(sequences, 30).sum() > 0
+
+
+def test_one_hot_encode_has_at_most_one_base_per_position():
+    rng = np.random.RandomState(1)
+    sequences = ["".join(chr(c) for c in rng.randint(32, 127, size=200))
+                 for _ in range(20)]
+    result = sequtils.one_hot_encode(sequences, 200)
+    assert set(np.unique(result)) <= {0.0, 1.0}
+    assert result.sum(axis=2).max() == 1
+    for i, sequence in enumerate(sequences):
+        # lower case letters and the digits 0 to 3 are bases
+        assert np.array_equal(result[i], one_hot(
+            sequence.upper().translate(str.maketrans("0123", "ACGT"))))
 
 
 # --------------------------------------------------------------------

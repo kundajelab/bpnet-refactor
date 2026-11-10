@@ -35,6 +35,7 @@ Tests run on the CPU. Set `BPNET_TEST_GPU=1` to let TensorFlow use a GPU.
 | `saved_weights.py` | reads a SavedModel's weights by layer name from its checkpoint |
 | `test_cli_end_to_end.py` | (slow) `bpnet-train` then `bpnet-predict` as subprocesses on the synthetic dataset; predictions, metric files and bigWigs recomputed from the saved weights with the numpy reference |
 | `test_cli_failures.py` | (slow) failures inside `bpnet-train` reach the exit status |
+| `legacy_reference.py` | earlier implementations of functions that were replaced by faster ones, kept verbatim to prove equality |
 | `data/` | small hand-made input files |
 
 ## Known defects
@@ -50,3 +51,10 @@ of 1e-4 (2e-4 for losses); weight updates at an absolute tolerance of a few 1e-6
 about 1e-3. These bounds hold for float32 arithmetic on the CPU. On Ampere or newer NVIDIA GPUs
 TensorFlow computes convolutions in TF32 by default, which is less precise: run GPU parity checks
 with `NVIDIA_TF32_OVERRIDE=0`.
+
+## Benchmarks
+
+`benchmarks/` holds timing scripts for code that was made faster, each comparing the new
+implementation with the one in `tests/legacy_reference.py` in alternating order
+(`benchmarks/timing.py`). Run from the repository root, for example
+`python benchmarks/bench_one_hot.py`.
