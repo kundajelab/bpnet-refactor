@@ -449,16 +449,18 @@ def test_workers_of_a_parent_end_by_their_parent_alone(synth_dataset, method):
                        case="nothing is known of the consumer")
 
 
-def sleeper(name=None):
+def sleeper(name=None, rename=None):
     if name is not None:
-        # (the name of the process, as /proc shows it)
+        # (the name of the process, as /proc shows it, when it is
+        # asked for)
+        rename.wait(TIME_LIMIT)
         with open("/proc/self/comm", "w") as comm:
             comm.write(name)
     time.sleep(TIME_LIMIT)
 
 
-def a_sleeper(name=None):
-    child = multiprocessing.Process(target=sleeper, args=(name,))
+def a_sleeper(name=None, rename=None):
+    child = multiprocessing.Process(target=sleeper, args=(name, rename))
     child.start()
     return child
 
@@ -507,16 +509,18 @@ def test_start_time_of_a_process(monkeypatch):
 def test_start_time_of_a_process_with_an_odd_name(name):
     """
         The name of a process is part of the line the start time is
-        read from, and may hold spaces, parentheses and line ends
+        read from, and may hold spaces, parentheses and line ends: the
+        start time of a process is the same before and after it takes
+        such a name
     """
 
-    child = a_sleeper()
+    rename = multiprocessing.Event()
+    child = a_sleeper(name, rename)
     try:
         started = generators.process_start(child.pid)
-    finally:
-        end(child)
-    child = a_sleeper(name)
-    try:
+        assert isinstance(started, int) and started > 0
+        rename.set()
+
         def renamed():
             with open("/proc/{}/comm".format(child.pid)) as comm:
                 return comm.read() == name + "\n"
@@ -524,10 +528,7 @@ def test_start_time_of_a_process_with_an_odd_name(name):
         assert wait_until(renamed, 10.0)
         with open("/proc/{}/stat".format(child.pid), "rb") as stat:
             assert name.encode() in stat.read()
-        found = generators.process_start(child.pid)
-        # started after the first child, within the time of this test
-        assert isinstance(found, int)
-        assert started <= found <= started + 100 * os.sysconf("SC_CLK_TCK")
+        assert generators.process_start(child.pid) == started
     finally:
         end(child)
 
@@ -586,10 +587,22 @@ def test_consumer_as_a_worker_sees_it(monkeypatch):
         monkeypatch.undo()
 
     # a process that may not be signalled is there
-    if os.getuid() != 0:
-        assert generators.Consumer((1, None)).gone() is False
-        assert generators.Consumer(
-            (1, generators.process_start(1))).gone() is False
+    child = a_sleeper()
+    try:
+        identity = (child.pid, generators.process_start(child.pid))
+
+        def not_permitted(pid, number):
+            raise PermissionError("no signals for process {}".format(pid))
+
+        monkeypatch.setattr(generators.os, "kill", not_permitted)
+        try:
+            by_id_alone = generators.Consumer((child.pid, None)).gone()
+            by_start_time = generators.Consumer(identity).gone()
+        finally:
+            monkeypatch.undo()
+        assert by_id_alone is False and by_start_time is False
+    finally:
+        end(child)
 
 
 def test_one_worker_delivers_in_order(synth_dataset):
