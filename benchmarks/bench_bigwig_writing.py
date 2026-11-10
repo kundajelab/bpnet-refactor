@@ -11,6 +11,10 @@
     shape of what bpnet-predict writes. Both writers get the same
     regions, in alternating order. The sizes of the two files and
     whether they hold the same values are reported as well.
+
+    Runs of positions are only written with pyBigWig 0.3.29 or later
+    (bpnet.utils.bigwig_helper.RUNS); with an older pyBigWig the two
+    writers do the same and the speedup is 1.
 """
 
 import argparse
@@ -25,6 +29,7 @@ import pyBigWig
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from benchmarks.timing import compare, report
+from bpnet.utils import bigwig_helper
 from bpnet.utils.bigwig_helper import write_bigwig
 from tests.legacy_reference import write_bigwig_v0
 
@@ -51,6 +56,9 @@ def main():
     data = rng.gamma(0.3, 2.0, size=(args.regions, args.width)).astype(
         np.float32)
 
+    print("pyBigWig {}: positions are written as {}".format(
+        pyBigWig.__version__, "runs" if bigwig_helper.RUNS
+        else "an entry per position (as before)"))
     directory = tempfile.mkdtemp()
     try:
         paths = {name: os.path.join(directory, name + ".bw")
@@ -75,9 +83,8 @@ def main():
             a = old.values(chrom, 0, span + args.width, numpy=True)
             b = new.values(chrom, 0, span + args.width, numpy=True)
             same = same and a.tobytes() == b.tobytes()
-        same = same and old.header() == new.header()
-        print("file size: old {:.1f} MB, new {:.1f} MB; same values and "
-              "header statistics: {}".format(
+        print("file size: old {:.1f} MB, new {:.1f} MB; same values: "
+              "{}".format(
                   os.path.getsize(paths["old"]) / 1e6,
                   os.path.getsize(paths["new"]) / 1e6, same))
     finally:

@@ -1,6 +1,19 @@
+import re
+
 import pyBigWig
 import numpy as np
 from tqdm import tqdm
+
+#: whether the positions of a region are written as a run (a fixedStep 
+#: section: one value per position) or, as they always were, as an 
+#: entry per position with its own start and end. pyBigWig before 
+#: 0.3.29 records the end of a run six positions too far, in the 
+#: section and in the index of the file; the values that are read 
+#: back are right, but the file is not, so with those versions 
+#: nothing changes.
+RUNS = tuple(int(part) for part in re.findall(
+    r'\d+', pyBigWig.__version__)[:3]) >= (0, 3, 29)
+
 
 def region_segments(regions, order):
     """
@@ -66,17 +79,47 @@ def region_segments(regions, order):
     return segments
 
 
+def as_float32(values):
+    """
+        The values as pyBigWig stores a list of Python floats: every 
+        value as a double first, then as a float32
+        
+        Going through the double matters for the few values that a 
+        direct conversion treats differently: integers beyond 2**53 
+        and long doubles are rounded twice, and a signalling NaN 
+        becomes a quiet one. Values beyond the range of float32 
+        become infinite. Anything that is not a plain array of 
+        numbers (a masked array, a list, an array of objects) is 
+        converted value by value with float(), as it always was.
+        
+        Args:
+            values (numpy.ndarray): the values of a run of positions
+            
+        Returns:
+            numpy.ndarray: float32 array
+    """
+    
+    with np.errstate(over='ignore', invalid='ignore'):
+        if isinstance(values, np.ma.MaskedArray) or \
+                not isinstance(values, np.ndarray) or \
+                values.dtype.kind not in 'biuf':
+            doubles = np.array([float(x) for x in values], dtype=np.float64)
+        else:
+            doubles = values.astype(np.float64)
+        return doubles.astype(np.float32)
+
+
 def add_run(bw, chrom, start, end, values):
     """
         Add the values of the consecutive positions start .. end - 1 
         to a bigWig file that is being written
         
-        The positions go into the file as one fixedStep run, which 
-        holds a value per position. (An entry per position, with its 
-        own start and end, takes three times the space before 
-        compression and several times as long to write; what is read 
-        back from the file, position by position or as a summary, is 
-        the same.) Values are stored as float32, as always.
+        Where pyBigWig can be trusted with it (see RUNS) the 
+        positions go into the file as one run of float32 values. An 
+        entry per position, with its own start and end, takes three 
+        times the space before compression and several times as long 
+        to write; what is read back from the file, position by 
+        position or as a summary, is the same.
         
         Args:
             bw (pyBigWig.bigWigFile): file opened for writing, with 
@@ -92,20 +135,26 @@ def add_run(bw, chrom, start, end, values):
     """
     
     start, end = int(start), int(end)
-    if end == start:
-        return
     
-    # what pyBigWig refused when it was given every position (a 
-    # fixedStep run has no ends to compare with)
+    # what pyBigWig refuses when it is given every position (a run 
+    # has no ends to compare with, and a negative start is taken for 
+    # a very large one)
     if start < 0 or end < start or len(values) != end - start:
         raise RuntimeError(
             "Cannot write {} values to {}:{}-{} of the bigWig file".format(
                 len(values), chrom, start, end))
     
-    # the conversion pyBigWig applies to Python floats: values beyond 
-    # the range of float32 become infinite
-    with np.errstate(over='ignore'):
-        values = np.ascontiguousarray(values, dtype=np.float32)
+    if end == start:
+        return
+    
+    if not RUNS:
+        bw.addEntries([chrom] * (end - start), 
+                      list(range(start, end)), 
+                      ends=list(range(start + 1, end + 1)), 
+                      values=[float(x) for x in values])
+        return
+    
+    values = as_float32(values)
     if not pyBigWig.numpy:
         values = [float(x) for x in values]
     
