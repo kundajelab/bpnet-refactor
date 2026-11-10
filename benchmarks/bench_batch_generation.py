@@ -1,6 +1,6 @@
 """
-    Time a worker spends on one training batch, on real data, with the
-    one hot encoder it had before and with the present one.
+    Time to construct one training batch, on real data, with the one
+    hot encoder the package had before and with the present one.
 
         python benchmarks/bench_batch_generation.py \\
             --input-data input.json --reference-genome genome.fa \\
@@ -8,14 +8,23 @@
 
     Run from the repository root. `input.json` is the input-data file
     of bpnet-train (signal and control bigWigs, peaks, background). A
-    batch is generated the way a worker process of the trainer does it
-    (64 loci and their reverse complements, 2,114 bases, jitter 128):
-    sequences are fetched and encoded, signal and control values are
-    read. Both variants generate the same rows, in alternating order.
+    batch is constructed the way a worker process of the trainer does
+    it (64 loci and their reverse complements, 2,114 bases, jitter
+    128): files are opened, sequences fetched and encoded, signal and
+    control values read, reverse complements made. Both variants
+    construct the same rows with the same jitters, in alternating
+    order.
+
+    Not included: starting the worker processes, preparing and
+    shuffling the epoch, several workers competing for the disk, the
+    queues between the workers and the trainer, and everything
+    TensorFlow does with a batch. The result is the speed of batch
+    construction, not of training.
 """
 
 import argparse
 import os
+import random
 import sys
 import time
 
@@ -45,18 +54,22 @@ def main():
         args.input_data, params, args.reference_genome, args.chrom_sizes,
         args.chroms, num_threads=2, batch_size=args.batch_size, epochs=1)
     rows = gen.get_resized_samples()[0]
-    print("{} loci in the epoch; {} batches of {} (x2 with reverse "
-          "complements) are timed".format(
+    print("{} loci in the epoch; the construction of {} batches of {} (x2 "
+          "with reverse complements) is timed".format(
               len(rows), args.batches, args.batch_size))
 
     present = sequtils.one_hot_encode
     encode_seconds = {"old": [], "new": []}
+    warmup = 2
+    calls = [0]
 
     def timed_encoder(name, function):
         def encode(sequences, seq_length):
             start = time.perf_counter()
             result = function(sequences, seq_length)
-            encode_seconds[name].append(time.perf_counter() - start)
+            # the calls of the warm up are not part of the timing
+            if calls[0] >= 2 * warmup:
+                encode_seconds[name].append(time.perf_counter() - start)
             return result
         return encode
 
@@ -72,6 +85,8 @@ def main():
             batch_rows.loc[batch_rows['weight'] == 0, 'status'] = -1
             batch_rows['idx'] = batch_rows.index.values
             sequtils.one_hot_encode = timed_encoder(name, function)
+            # the same jitters for both variants
+            random.seed(start)
             try:
                 gen._generate_batch(batch_rows)
             finally:
@@ -81,10 +96,8 @@ def main():
     old, new = batch("old", one_hot_encode_v0), batch("new", present)
 
     # compare() calls the two alternately; after every second call
-    # both have generated the current slice of rows, and the next
+    # both have constructed the current slice of rows, and the next
     # slice is taken
-    calls = [0]
-
     def paired(function):
         def run():
             function()
@@ -93,8 +106,9 @@ def main():
                 position[0] += args.batch_size
         return run
 
-    result = compare(paired(old), paired(new), rounds=args.batches, warmup=2)
-    report("one training batch in a worker", result)
+    result = compare(paired(old), paired(new), rounds=args.batches,
+                     warmup=warmup)
+    report("construction of one training batch", result)
     for name in ("old", "new"):
         share = np.median(encode_seconds[name]) / result[name + "_seconds"]
         print("  {} encoder: {:.2f} ms per batch, {:.0f}% of the batch "
