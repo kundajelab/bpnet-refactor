@@ -238,33 +238,33 @@ def close_reading_end(mpq):
 
 def process_start(pid):
     """
-        When a process was started, as the kernel records it. With 
-        the process id it identifies a process: an id is given to 
-        another process later, the time is not.
+        When a process was started, as the kernel records it (clock 
+        ticks since the system was started). With the process id it 
+        tells a process from a later one that was given the same id: 
+        the two would have to be started within the same tick to be 
+        taken for each other.
         
         Args:
             pid (int): process id
         
         Returns:
-            int: the start time in clock ticks since the system was 
-                started, or None if there is no such process any 
-                more (also when it has ended and only waits to be 
-                collected by its parent)
+            int: the start time, or None if the process has ended 
+                and only waits to be collected by its parent
         
         Raises:
             OSError, ValueError, IndexError: when that cannot be 
-                told (a system without /proc raises 
-                NotADirectoryError)
+                told: there is no /proc (NotADirectoryError), or 
+                /proc has no entry for the process 
+                (FileNotFoundError: there is no such process, or it 
+                is hidden from this one)
     """
     
     if not os.path.isdir("/proc/self"):
         raise NotADirectoryError("/proc")
-    try:
-        with open("/proc/{}/stat".format(pid), "rb") as stat:
-            fields = stat.read()
-    except (FileNotFoundError, ProcessLookupError):
-        return None
-    # "pid (name) state parent ...": the name may hold anything
+    with open("/proc/{}/stat".format(pid), "rb") as stat:
+        fields = stat.read()
+    # "pid (name) state parent ...": the name may hold anything, 
+    # also spaces, parentheses and line ends
     fields = fields.rsplit(b")", 1)[1].split()
     if fields[0] in (b"Z", b"X"):
         return None
@@ -292,23 +292,30 @@ class Consumer(object):
         
         A worker whose consumer was killed (out of memory, by a 
         scheduler) makes batches for nobody, and can wait forever 
-        for room in its queue. It finds out in two ways:
+        for room in its queue. It finds out in these ways:
         
         - its parent process is no longer the one that started it. 
           With the "fork" and "spawn" start methods of 
           multiprocessing the parent is the consumer.
-        - the process with the id of the consumer is gone, or is 
-          another process (it was started at another time). This 
-          also works with the "forkserver" start method, where the 
-          parent of a worker is the fork server, which outlives the 
-          consumer. Where the start time cannot be read (no /proc), 
-          only the existence of a process with that id is checked; 
-          a consumer that has ended and is not collected by its 
-          parent then still counts as there.
+        - there is no process with the id of the consumer any more;
+        - the process with that id has ended and waits to be 
+          collected, or was started at another time than the 
+          consumer (it is a later process with the same id). 
         
-        Nothing here depends on what a process inherits when it is 
-        forked: a process that was forked from the consumer is 
-        another process.
+        The last two also work with the "forkserver" start method, 
+        where the parent of a worker is the fork server, which 
+        outlives the consumer. Nothing here depends on what a 
+        process inherits when it is forked: a process that was 
+        forked from the consumer is another process.
+        
+        When in doubt the consumer counts as there: a worker that 
+        ends is reported by its consumer as a failure. The third way 
+        needs the entry of the consumer in /proc. Without it (no 
+        /proc, or the entry is hidden from the worker) a worker 
+        started by a fork server does not notice a consumer that 
+        has ended and is not collected by its parent, or whose id 
+        was given to another process. The worker is assumed to see 
+        the same process ids as its consumer.
         
         Args:
             identity (tuple): (process id of the consumer, its start 
@@ -330,20 +337,25 @@ class Consumer(object):
             return True
         if self.pid is None:
             return False
-        if self.started is not None:
-            try:
-                return process_start(self.pid) != self.started
-            except (OSError, ValueError, IndexError):
-                # (cannot be told now: the consumer counts as there)
-                return False
+        
+        # is there a process with that id at all?
         try:
             os.kill(self.pid, 0)
         except ProcessLookupError:
             return True
         except OSError:
-            # (not allowed to signal it: there is such a process)
+            # (not allowed to signal it: there is one)
+            pass
+        if self.started is None:
             return False
-        return False
+        
+        # there is one: has it ended, or is it another process?
+        try:
+            return process_start(self.pid) != self.started
+        except (OSError, ValueError, IndexError):
+            # (cannot be told, now or ever: no entry in /proc does 
+            # not mean that there is no such process)
+            return False
 
 
 def stop_workers(epoch):

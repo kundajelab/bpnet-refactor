@@ -449,8 +449,24 @@ def test_workers_of_a_parent_end_by_their_parent_alone(synth_dataset, method):
                        case="nothing is known of the consumer")
 
 
-def sleeper():
+def sleeper(name=None):
+    if name is not None:
+        # (the name of the process, as /proc shows it)
+        with open("/proc/self/comm", "w") as comm:
+            comm.write(name)
     time.sleep(TIME_LIMIT)
+
+
+def a_sleeper(name=None):
+    child = multiprocessing.Process(target=sleeper, args=(name,))
+    child.start()
+    return child
+
+
+def end(child):
+    if child.is_alive():
+        os.kill(child.pid, signal.SIGKILL)
+    child.join()
 
 
 def test_start_time_of_a_process(monkeypatch):
@@ -464,24 +480,60 @@ def test_start_time_of_a_process(monkeypatch):
     assert generators.process_start(os.getpid()) == mine
     assert generators.process_identity() == (os.getpid(), mine)
 
-    child = multiprocessing.Process(target=sleeper)
-    child.start()
+    child = a_sleeper()
     try:
         started = generators.process_start(child.pid)
         assert isinstance(started, int) and started >= mine
         os.kill(child.pid, signal.SIGKILL)
-        # it has ended and waits to be collected: no such process
+        # it has ended and waits to be collected
         assert wait_until(lambda: ended(child.pid), 10.0)
         assert generators.process_start(child.pid) is None
     finally:
-        child.join()
-    assert generators.process_start(child.pid) is None
+        end(child)
+    # no entry: it cannot be told from here whether there is no such
+    # process or a hidden one
+    with pytest.raises(FileNotFoundError):
+        generators.process_start(child.pid)
 
-    # a system without /proc: the start time cannot be told
+    # a system without /proc
     monkeypatch.setattr(generators.os.path, "isdir", lambda path: False)
     with pytest.raises(NotADirectoryError):
         generators.process_start(os.getpid())
     assert generators.process_identity() == (os.getpid(), None)
+
+
+@needs_proc
+@pytest.mark.parametrize("name", ["a b", "a) Z 1 (b", "(x)\nR 2 3", ")"])
+def test_start_time_of_a_process_with_an_odd_name(name):
+    """
+        The name of a process is part of the line the start time is
+        read from, and may hold spaces, parentheses and line ends
+    """
+
+    child = a_sleeper()
+    try:
+        started = generators.process_start(child.pid)
+    finally:
+        end(child)
+    child = a_sleeper(name)
+    try:
+        def renamed():
+            with open("/proc/{}/comm".format(child.pid)) as comm:
+                return comm.read() == name + "\n"
+
+        assert wait_until(renamed, 10.0)
+        with open("/proc/{}/stat".format(child.pid), "rb") as stat:
+            assert name.encode() in stat.read()
+        found = generators.process_start(child.pid)
+        # started after the first child, within the time of this test
+        assert isinstance(found, int)
+        assert started <= found <= started + 100 * os.sysconf("SC_CLK_TCK")
+    finally:
+        end(child)
+
+
+def hidden(pid):
+    raise FileNotFoundError("/proc/{}/stat".format(pid))
 
 
 @needs_proc
@@ -493,8 +545,7 @@ def test_consumer_as_a_worker_sees_it(monkeypatch):
     consumer.parent += 1
     assert consumer.gone() is True
 
-    child = multiprocessing.Process(target=sleeper)
-    child.start()
+    child = a_sleeper()
     try:
         identity = (child.pid, generators.process_start(child.pid))
         by_start = generators.Consumer(identity)
@@ -508,25 +559,37 @@ def test_consumer_as_a_worker_sees_it(monkeypatch):
         by_start.parent += 1
         assert by_start.gone() is True
         by_start.parent -= 1
-        # when the start time cannot be read at the moment, the
-        # consumer counts as there
-        monkeypatch.setattr(generators, "process_start", unreadable)
-        assert by_start.gone() is False and other.gone() is False
-        monkeypatch.undo()
+        # when the start time cannot be read, or the process is hidden
+        # from this one, the consumer counts as there
+        for cannot_tell in (unreadable, hidden):
+            monkeypatch.setattr(generators, "process_start", cannot_tell)
+            assert by_start.gone() is False and other.gone() is False
+            monkeypatch.undo()
 
         os.kill(child.pid, signal.SIGKILL)
         assert wait_until(lambda: ended(child.pid), 10.0)
         # ended and not collected yet: gone by its start time; by its
-        # id alone it still counts as there
+        # id alone, or hidden, it still counts as there
         assert by_start.gone() is True
         assert by_id.gone() is False
+        monkeypatch.setattr(generators, "process_start", hidden)
+        assert by_start.gone() is False
+        monkeypatch.undo()
     finally:
-        child.join()
+        end(child)
+    # collected: there is no process with that id, whatever /proc
+    # shows
     assert by_start.gone() is True and by_id.gone() is True
+    for cannot_tell in (unreadable, hidden):
+        monkeypatch.setattr(generators, "process_start", cannot_tell)
+        assert by_start.gone() is True
+        monkeypatch.undo()
 
     # a process that may not be signalled is there
     if os.getuid() != 0:
         assert generators.Consumer((1, None)).gone() is False
+        assert generators.Consumer(
+            (1, generators.process_start(1))).gone() is False
 
 
 def test_one_worker_delivers_in_order(synth_dataset):
