@@ -22,11 +22,8 @@ from scipy.spatial.distance import jensenshannon
 from scipy.special import logsumexp
 from scipy.stats import pearsonr, spearmanr, multinomial
 from tqdm import tqdm
-from tensorflow.keras.models import load_model
-from tensorflow.keras.utils import CustomObjectScope
 
-from bpnet.model.custommodel \
-    import CustomModel
+from bpnet.model import loading
 
 """
 Currently only supports single-tasking 
@@ -376,8 +373,16 @@ def metrics_update(
 
 
 def predict(args, pred_dir):    
-    # load the model
-    model = load_model(args.model)
+    # load the model: the layers and weights are read from the saved 
+    # files and rebuilt, which works for models saved by any 
+    # TensorFlow version (see bpnet.model.loading)
+    try:
+        model = loading.load_model(args.model)
+    except (OSError, ValueError, tf.errors.OpError) as error:
+        # not there, not a saved model, damaged, or with layers the 
+        # models of this package do not have
+        raise NoTracebackException(
+            "Cannot load the model {}: {}".format(args.model, error))
 
     # parameters that are specific to the batch generation process.
     # for prediction we dont use jitter, reverse complement 
@@ -908,11 +913,7 @@ def predict_main():
     logger.init_logger(logfname)
 
     # predict
-
-    with CustomObjectScope({'tf': tf,
-                            'CustomModel': CustomModel}):
-            
-        predict(args, pred_dir)
+    predict(args, pred_dir)
     
 if __name__ == '__main__':
     predict_main()

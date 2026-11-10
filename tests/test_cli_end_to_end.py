@@ -180,16 +180,6 @@ def predicted(synth_dataset, trained, tmp_path_factory):
         "--output-window-size", d["output_len"], "--batch-size", 16,
         "--reverse-complement-average", "--threads", 2,
         "--generate-predicted-profile-bigWigs"], cwd=str(out_dir))
-    legacy_stack = tuple(int(x) for x in tf.__version__.split(".")[:2]) \
-        < (2, 5)
-    if code != 0 and not legacy_stack and "__init__() missing" in output \
-            and "required positional argument" in output:
-        # TF 2.11: "CustomModel.__init__() missing 6 required positional
-        # arguments"; TF 2.15: "Functional.__init__() missing 2 ...".
-        # On the TF 2.4 stack the prediction tests must run.
-        pytest.xfail("bpnet-predict cannot load a saved model with this "
-                     "TensorFlow version (keras cannot rebuild the "
-                     "CustomModel class from the saved configuration)")
     assert code == 0, output[-3000:]
 
     with h5py.File(str(out_dir / "model_split000_predictions.h5"), "r") as f:
@@ -607,12 +597,47 @@ def test_missing_test_indices_file_is_reported(synth_dataset, trained,
         "--output-dir", tmp_path, "--input-data", d["input_json"],
         "--input-seq-len", d["input_len"], "--output-len", d["output_len"],
         "--output-window-size", d["output_len"]], cwd=str(tmp_path))
-    if code != 0 and "required positional argument" in output:
-        pytest.xfail("bpnet-predict cannot load a saved model with this "
-                     "TensorFlow version")
     assert code != 0
     assert "File not found: {}".format(missing) in output
     assert "NameError" not in output
+
+
+def test_model_that_cannot_be_loaded_is_reported(synth_dataset, tmp_path):
+    d = synth_dataset
+    arguments = [
+        "--chrom-sizes", d["chrom_sizes"], "--test-indices-file", "None",
+        "--reference-genome", d["fasta"], "--output-dir", tmp_path,
+        "--input-data", d["input_json"], "--input-seq-len", d["input_len"],
+        "--output-len", d["output_len"],
+        "--output-window-size", d["output_len"]]
+
+    missing = tmp_path / "no_such_model"
+    code, output = run_cli("bpnet.cli.predict",
+                           ["--model", missing] + arguments, cwd=str(tmp_path))
+    assert code != 0
+    assert "Cannot load the model {}: Model not found".format(missing) \
+        in output
+    assert "Traceback" not in output
+
+    # a directory that is not a saved model
+    code, output = run_cli("bpnet.cli.predict",
+                           ["--model", tmp_path] + arguments,
+                           cwd=str(tmp_path))
+    assert code != 0
+    assert "it has no saved_model.pb" in output
+    assert "Traceback" not in output
+
+    # a damaged file
+    damaged = tmp_path / "damaged"
+    damaged.mkdir()
+    with open(str(damaged / "saved_model.pb"), "wb") as fh:
+        fh.write(b"\x12\xff\xff\xff")
+    code, output = run_cli("bpnet.cli.predict",
+                           ["--model", damaged] + arguments,
+                           cwd=str(tmp_path))
+    assert code != 0
+    assert "Cannot load the model {}: Truncated".format(damaged) in output
+    assert "Traceback" not in output
 
 
 def test_predicted_bigwigs(synth_dataset, predicted):

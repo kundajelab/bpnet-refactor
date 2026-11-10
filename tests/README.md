@@ -35,10 +35,12 @@ Tests run on the CPU. Set `BPNET_TEST_GPU=1` to let TensorFlow use a GPU.
 | `test_bigwig_writing.py` | both bigWig writers: region order, the split of overlapping regions between their centres, the statistics file |
 | `test_counts_loss_weight.py` | `bpnet-counts-loss-weight` |
 | `saved_weights.py` | reads a SavedModel's weights by layer name from its checkpoint |
-| `test_cli_end_to_end.py` | (slow) `bpnet-train` then `bpnet-predict` as subprocesses on the synthetic dataset; predictions, metric files and bigWigs recomputed from the saved weights with the numpy reference; the weights a run starts from and the loci `--seed` selects, from runs with a learning rate of zero |
+| `test_loading_formats.py` | the file reading of `bpnet.model.loading` without TensorFlow: protocol buffer fields, where keras keeps the layer graph in a SavedModel, what is not a saved model |
+| `test_loading.py` | `bpnet.model.loading`: models of thirteen architecture variants saved and loaded again (same predictions, bit for bit), on TensorFlow 2.4 against keras' own loader in a fresh process, models saved by TensorFlow 2.4.1, 2.11.0 and 2.15.1 (`data/saved_models/`) loaded in the running version, layer graphs and weights that cannot be loaded |
+| `test_cli_end_to_end.py` | (slow) `bpnet-train` then `bpnet-predict` as subprocesses on the synthetic dataset, on every TensorFlow version; predictions, metric files and bigWigs recomputed from the saved weights with the numpy reference; the weights a run starts from and the loci `--seed` selects, from runs with a learning rate of zero |
 | `test_cli_failures.py` | (slow) failures inside `bpnet-train` reach the exit status |
 | `legacy_reference.py` | earlier implementations of functions that were replaced by faster ones, kept verbatim to prove equality |
-| `data/` | small hand-made input files |
+| `data/` | small hand-made input files; `data/saved_models/` holds small models saved by each supported TensorFlow version and the script that wrote them |
 
 ## Known defects
 
