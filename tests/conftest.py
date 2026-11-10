@@ -26,3 +26,30 @@ def synth_dataset(tmp_path_factory):
     """
 
     return synth.make_dataset(str(tmp_path_factory.mktemp("synth")), seed=0)
+
+
+@pytest.fixture(autouse=True)
+def restore_bpnet_defaults():
+    """
+        Put the default architecture parameters back after every test.
+        Building a model with non default parameters currently changes
+        the module level defaults (see
+        test_arch.py::test_building_a_model_leaves_the_defaults_alone),
+        which would make test results depend on the test order.
+    """
+
+    import copy
+    from bpnet.model import bpnetdefaults
+
+    names = [n for n in dir(bpnetdefaults) if n.isupper()]
+    saved = {n: copy.deepcopy(getattr(bpnetdefaults, n)) for n in names}
+    yield
+    for name, value in saved.items():
+        current = getattr(bpnetdefaults, name)
+        if isinstance(current, dict):
+            current.clear()
+            current.update(value)
+        elif isinstance(current, list):
+            current[:] = value
+        else:
+            setattr(bpnetdefaults, name, value)

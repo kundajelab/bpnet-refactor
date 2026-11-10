@@ -22,6 +22,12 @@ Tests run on the CPU. Set `BPNET_TEST_GPU=1` to let TensorFlow use a GPU.
 | `test_generators_synth.py` | `MBPNetSequenceGenerator` on the synthetic dataset: epoch composition (trimming, padding, background resampling), batch contents against the truth, jitter, reverse-complement copies, smoothed controls, unstranded / no-control / two-task layouts |
 | `test_sequtils.py` | peak loading, one-hot encoding, reverse complement |
 | `test_generators.py` | batch generation in train / val / test mode on the mini genome in `data/` |
+| `reference_model.py` | the forward pass and the training loss in plain numpy (float64), written from the description of the architecture; the yardstick for every backend |
+| `model_helpers.py` | small and released architecture parameters, random weights, random batches |
+| `test_arch.py` | the graph `arch.BPNet` builds (layer names, weight shapes, cropping, dilation) and its outputs against the numpy reference for ten configurations |
+| `test_losses.py` | multinomial NLL against scipy, its gradient and normalization constant, MSE and Poisson count losses |
+| `test_custommodel.py` | the training objective against the numpy reference (masking by weight, joint two-strand multinomial, log(total + 2) count target), gradients against finite differences, the Adam update rule, train / test step bookkeeping |
+| `test_training_helpers.py` | early stopping and learning-rate-on-plateau rules |
 | `data/` | small hand-made input files |
 
 ## Known defects
