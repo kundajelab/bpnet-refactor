@@ -743,5 +743,5 @@ def train_and_validate_ksplits(
         if p.exitcode != 0:
             raise NoTracebackException(
                 "Training of split {} failed (the training process ended "
-                "with exit code {}). See the messages above and {}".format(
-                    i, p.exitcode, logfname))
+                "with exit code {}). See the messages above and the "
+                "trainer logs in {}".format(i, p.exitcode, model_dir))

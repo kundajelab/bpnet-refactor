@@ -76,8 +76,11 @@ def test_training_stops_at_the_first_failed_split(synth_dataset, tmp_path):
         cwd=str(tmp_path))
     assert code != 0
     assert "Training of split 0 failed" in output
-    assert "Training of split 1 failed" not in output
-    assert not os.path.exists(str(model_dir / "trainer_split001.log"))
+    # the second split was not started
+    assert "Split #0" in output
+    assert "Split #1" not in output
+    # the message points at the directory that holds the logs
+    assert "trainer logs in {}".format(model_dir) in output
 
 
 def test_missing_splits_file_message(synth_dataset, tmp_path):
