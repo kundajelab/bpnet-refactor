@@ -71,7 +71,8 @@ from bpnet.generators import windows
 from bpnet.utils.exceptionhandler import NoTracebackException
 from bpnet.utils.misc import gaussian1D_smoothing
 from queue import Empty, Queue
-from threading import Thread
+from threading import RLock, Thread
+import time
 import traceback
 
 
@@ -96,9 +97,119 @@ class WorkerFailure(object):
 #: delivered a batch is still running
 WORKER_POLL_SECONDS = 1.0
 
-#: seconds a worker process gets to end after it was asked to, before 
-#: it is killed
+#: seconds the worker processes of an epoch get to end after they were 
+#: asked to, before they are killed
 WORKER_STOP_SECONDS = 10.0
+
+
+class Epoch(object):
+    """
+        The worker processes, the threads that collect their batches 
+        and the queues between them, for one epoch that a generator 
+        has under way
+        
+        Args:
+            generator (MSequenceGenerator): the generator
+    """
+    
+    def __init__(self, generator):
+        self.generator = generator
+        #: id of the process that starts the workers. Only that 
+        #: process may wait for them or end them.
+        self.owner = os.getpid()
+        #: worker processes, collecting threads and multiprocessing 
+        #: queues, in the order the workers were started (None for a 
+        #: worker that has no data)
+        self.procs = []
+        self.threads = []
+        self.mp_queues = []
+        #: True once the epoch was ended on purpose before its last 
+        #: batch (stop()): the batches end without an error then
+        self.stopped = False
+
+
+#: the epochs that are under way in this process, and the lock for 
+#: starting, stopping and ending them
+_EPOCHS = []
+_EPOCHS_LOCK = RLock()
+
+
+def _forget_the_epochs_of_the_parent():
+    """
+        In a forked process: the epochs of the parent are not this 
+        process's to stop, and the lock may have been held by a 
+        thread that does not exist here
+    """
+    
+    global _EPOCHS_LOCK
+    _EPOCHS_LOCK = RLock()
+    del _EPOCHS[:]
+
+
+os.register_at_fork(after_in_child=_forget_the_epochs_of_the_parent)
+
+
+def stop_workers(epoch):
+    """
+        End the worker processes of an epoch: ask them to end, and 
+        kill those that have not after WORKER_STOP_SECONDS (for all 
+        of them together)
+        
+        Args:
+            epoch (Epoch): an epoch of this process
+    """
+    
+    procs = [proc for proc in epoch.procs if proc is not None]
+    for proc in procs:
+        if proc.is_alive():
+            proc.terminate()
+    deadline = time.time() + WORKER_STOP_SECONDS
+    for proc in procs:
+        proc.join(max(0.0, deadline - time.time()))
+    for proc in procs:
+        if proc.is_alive():
+            proc.kill()
+    for proc in procs:
+        proc.join()
+
+
+def stop_all(generator=None):
+    """
+        End every epoch that is under way in this process, before its 
+        last batch
+        
+        For a consumer of batches that has failed, or is interrupted. 
+        The workers of the epoch would go on making batches that 
+        nobody takes, and a process cannot end while its workers and 
+        the threads that collect their batches are running. Closing 
+        the generator object does not always work: Keras reads the 
+        batches on a thread of its own, and keeps the generator 
+        after a failure.
+        
+        The worker processes are ended (see stop_workers), and the 
+        collecting threads are waited for. This does not depend on 
+        the consumer taking another batch; if it does, the batches 
+        end there, without an error. Calling this when no epoch is 
+        under way, or again, does nothing.
+        
+        Args:
+            generator (MSequenceGenerator): only the epochs of this 
+                generator, if given
+    """
+    
+    with _EPOCHS_LOCK:
+        for epoch in list(_EPOCHS):
+            if epoch.owner != os.getpid():
+                continue
+            if generator is not None and epoch.generator is not generator:
+                continue
+            epoch.stopped = True
+            stop_workers(epoch)
+            # a thread ends when its worker has: it finds the end of 
+            # the worker's queue
+            for thread in epoch.threads:
+                if thread is not None:
+                    thread.join(WORKER_STOP_SECONDS)
 
 
 def close_writing_end(mpq):
@@ -712,6 +823,13 @@ class MSequenceGenerator:
                 # data beyond the length of the dataframe
                 if (i + self._batch_size) > coords_df.shape[0]:
                     break
+                
+                # the process that takes the batches is gone (it was 
+                # killed, for example): nobody waits for the rest, 
+                # and what is in the queue cannot be handed over
+                if os.getppid() != getattr(self, '_consumer', os.getppid()):
+                    mpq.cancel_join_thread()
+                    return
                     
                 batch_df = coords_df.iloc[i:i + self._batch_size]
                 batch_df = batch_df.copy()
@@ -808,7 +926,7 @@ class MSequenceGenerator:
             "{} stealer thread {} got {} batches from mpq".format(
                 self._mode, thread_id, num_batches))
 
-    def _epoch_run(self, data):
+    def _epoch_run(self, data, epoch):
         """
             Manage batch generation processes & threads
             for one epoch
@@ -816,18 +934,25 @@ class MSequenceGenerator:
             Args:
                 data (pandas.DataFrame): dataframe with 'chrom' &
                     'pos' columns
+                
+                epoch (Epoch): where the processes, threads and 
+                    queues are recorded as they are started
+            
+            Returns:
+                tuple: (the queue the batches arrive in, the number 
+                    of batches of the epoch)
         """
         
         # list of processes that are spawned
-        procs = []     
+        procs = epoch.procs
         
         # list of multiprocessing queues corresponding to each 
         # process
-        mp_queues = [] 
+        mp_queues = epoch.mp_queues
 
         # list of stealer threads (that steal the items out of 
         # the mp queues)
-        threads = []   
+        threads = epoch.threads
                        
         # the regular queue
         q = Queue()    
@@ -842,6 +967,10 @@ class MSequenceGenerator:
 
         # batches that will be generated by each process thread
         num_batches = []
+        
+        #: the process the workers hand their batches to; a worker 
+        #: ends when that process is gone
+        self._consumer = os.getpid()
         
         # spawn processes that will generate batches of data and "put"
         # into the multiprocessing queues
@@ -866,10 +995,10 @@ class MSequenceGenerator:
                 # spawn and start the batch generation process 
                 p = mp.Process(target=self._proc_target, args=[df, mpq, i])
                 p.start()
-                # only the worker writes to its queue
-                close_writing_end(mpq)
                 procs.append(p)
                 mp_queues.append(mpq)
+                # only the worker writes to its queue
+                close_writing_end(mpq)
                 
             else:
                 if not warning_dispatched:
@@ -918,61 +1047,56 @@ class MSequenceGenerator:
                     "{} skipping stealer thread {} ".format(
                         self._mode, i, num_batches))
 
-        return procs, threads, mp_queues, q, sum(num_batches)
+        return q, sum(num_batches)
 
-    def _end_epoch(self, procs, threads, mp_queues, complete):
+    def _end_epoch(self, epoch, complete):
         """
             Wait for the worker processes and the stealer threads of 
             an epoch to end, and close their queues
             
             Args:
-                procs (list): the worker processes (None for a worker 
-                    without data)
-                
-                threads (list): the stealer threads (None likewise)
-                
-                mp_queues (list): the multiprocessing queues (None 
-                    likewise)
+                epoch (Epoch): the processes, threads and queues 
+                    that were started for the epoch (not all of them, 
+                    if starting them failed)
                 
                 complete (bool): whether all batches of the epoch 
-                    were taken. If not (a worker failed, or the 
-                    consumer of the batches stopped early) the 
-                    workers are still making batches that nobody 
-                    will take, and are stopped.
+                    were taken. If not (a worker failed, the consumer 
+                    of the batches stopped early, or the epoch was 
+                    stopped) the workers are still making batches 
+                    that nobody will take, and are stopped.
         """
         
         if not complete:
-            for proc in procs:
-                if proc is not None and proc.is_alive():
-                    proc.terminate()
+            stop_workers(epoch)
         
-        for j in range(self._num_threads):
-            if procs[j] is not None:
+        for j, proc in enumerate(epoch.procs):
+            if proc is not None:
                 logging.debug(
                     "{} waiting to join process {}".format(self._mode, j))
-                if complete:
-                    procs[j].join()
-                else:
-                    procs[j].join(WORKER_STOP_SECONDS)
-                    if procs[j].is_alive():
-                        procs[j].kill()
-                        procs[j].join()
+                proc.join()
 
-            # the thread ends with its process: it has all batches, or 
-            # finds the end of the queue
-            if threads[j] is not None:
+        # a thread ends with its process: it has all batches, or 
+        # finds the end of the queue
+        for j, thread in enumerate(epoch.threads):
+            if thread is not None:
                 logging.debug(
                     "{} waiting to join thread {}".format(self._mode, j))
-                threads[j].join()
+                thread.join()
 
-            if mp_queues[j] is not None:
-                mp_queues[j].close()
-
-            logging.debug(
-                "{} join complete for process {}".format(self._mode, j))
+        for mpq in epoch.mp_queues:
+            if mpq is not None:
+                mpq.close()
 
         logging.debug(
             "{} Finished join for epoch".format(self._mode))
+
+    def stop(self):
+        """
+            End the epochs of this generator that are under way, 
+            before their last batch (see stop_all)
+        """
+        
+        stop_all(self)
 
     def gen(self):
         """
@@ -980,9 +1104,11 @@ class MSequenceGenerator:
             
             The worker processes and threads of the epoch end with 
             it: after the last batch, when a worker fails (which 
-            raises NoTracebackException), and when the consumer stops 
+            raises NoTracebackException), when the consumer stops 
             before the last batch (the generator is closed or 
-            garbage collected, or an exception is raised in it).
+            garbage collected, or an exception is raised in it), and 
+            when the epoch is stopped from outside (stop(), 
+            stop_all(): the batches then end without an error).
 
         """
         
@@ -993,16 +1119,26 @@ class MSequenceGenerator:
         else:
             data = self._resized_loci[self.curr_epoch]
 
-        # spawn multiple processes to generate batches of data in
-        # parallel for each epoch
-        owner = os.getpid()
-        procs, threads, mp_queues, q, total_batches = self._epoch_run(data)
-
+        epoch = Epoch(self)
         complete = False
         try:
+            # spawn multiple processes to generate batches of data in
+            # parallel for each epoch. The epoch is known before its 
+            # first worker is started, and cannot be stopped half 
+            # started.
+            with _EPOCHS_LOCK:
+                _EPOCHS.append(epoch)
+                q, total_batches = self._epoch_run(data, epoch)
+
             # yield the correct number of batches for each epoch
-            for j in range(total_batches):      
+            for j in range(total_batches):
+                if epoch.stopped:
+                    return
                 batch = q.get()
+                if epoch.stopped:
+                    # what arrived is a batch nobody waits for, or 
+                    # the end of a worker that was stopped
+                    return
                 if isinstance(batch, WorkerFailure):
                     # no more batches will come from that worker: 
                     # report, instead of waiting forever
@@ -1015,8 +1151,11 @@ class MSequenceGenerator:
         finally:
             # (a copy of this generator in a forked process has no 
             # workers of its own to end)
-            if os.getpid() == owner:
-                self._end_epoch(procs, threads, mp_queues, complete)
+            if os.getpid() == epoch.owner:
+                with _EPOCHS_LOCK:
+                    self._end_epoch(epoch, complete)
+                    if epoch in _EPOCHS:
+                        _EPOCHS.remove(epoch)
 
         logging.debug("{} Ready for next epoch".format(self._mode))
 

@@ -51,6 +51,7 @@ import multiprocessing as mp
 import os
 import pandas as pd
 import random
+import signal
 import time
 
 import numpy as np
@@ -661,6 +662,67 @@ def train_and_validate(
     return model
 
 
+#: when bpnet-train is interrupted: seconds the training process of a 
+#: split gets to show that the interrupt reached it too, and seconds 
+#: it gets to end after each further request
+TRAINER_NOTICE_SECONDS = 2.0
+TRAINER_STOP_SECONDS = 30.0
+
+
+def train_and_validate_or_stop(*args):
+    """
+        What the training process of a split runs: train_and_validate, 
+        and if that fails or is interrupted, the end of the batch 
+        generation that is under way
+        
+        The worker processes of the epoch would otherwise go on 
+        making the rest of its batches, and this process could not 
+        end before they are done.
+        
+        Args:
+            *args: the arguments of train_and_validate
+    """
+    
+    try:
+        train_and_validate(*args)
+    except BaseException:
+        try:
+            generators.stop_all()
+        except Exception:
+            # the failure of the training is the one to report
+            logging.exception("Could not stop the batch generation")
+        raise
+
+
+def end_training_process(process):
+    """
+        End the training process of a split after bpnet-train was 
+        interrupted while it waited for it
+        
+        An interrupt from the keyboard reaches the training process 
+        too, and it ends by itself. One that only reached this 
+        process is passed on, so that the training process stops its 
+        batch workers and ends. If it does not (it can only act on 
+        the interrupt between two training steps), it is terminated; 
+        its batch workers then end by themselves when they find it 
+        gone.
+        
+        Args:
+            process (multiprocessing.Process): the training process
+    """
+    
+    process.join(TRAINER_NOTICE_SECONDS)
+    if process.is_alive():
+        os.kill(process.pid, signal.SIGINT)
+        process.join(TRAINER_STOP_SECONDS)
+    if process.is_alive():
+        process.terminate()
+        process.join(TRAINER_STOP_SECONDS)
+    if process.is_alive():
+        process.kill()
+        process.join()
+
+
 def train_and_validate_ksplits(
     input_data, model_arch_name, model_arch_params_json, output_params, 
     genome_params, batch_gen_params, hyper_params, parallelization_params, 
@@ -840,7 +902,7 @@ def train_and_validate_ksplits(
         # is considerably slow
         logging.debug("Split {}: Creating training process".format(i))
         p = mp.Process(
-            target=train_and_validate, 
+            target=train_and_validate_or_stop, 
             args=[input_data, model_arch_name, model_arch_params_json,
                   output_params, genome_params, batch_gen_params, hyper_params,
                   parallelization_params, model_dir, train_chroms, val_chroms, train_indices,
@@ -851,7 +913,11 @@ def train_and_validate_ksplits(
         p.start()
         
         # wait for the process to finish
-        p.join()
+        try:
+            p.join()
+        except BaseException:
+            end_training_process(p)
+            raise
 
         # a training process that raised an exception or was killed
         # must not look like a finished run: stop here, with an error

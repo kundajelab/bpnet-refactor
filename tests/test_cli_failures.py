@@ -5,12 +5,16 @@
 
 import json
 import os
+import signal
+import subprocess
+import sys
+import time
 
 import pytest
 
 pytest.importorskip("tensorflow")
 
-from tests.test_cli_end_to_end import run_cli
+from tests.test_cli_end_to_end import REPO, run_cli
 
 pytestmark = pytest.mark.slow
 
@@ -126,3 +130,273 @@ def test_failure_in_a_batch_worker_ends_the_training(tmp_path):
     assert time.time() - start < 300
     assert not any(name.startswith("model") for name in os.listdir(
         str(model_dir)))
+
+
+# --------------------------------------------------------------------
+# a tool that fails, or is interrupted, while its batch workers have
+# work left
+# --------------------------------------------------------------------
+
+#: seconds a tool gets to reach the point of the test, and to end after
+#: it
+START_LIMIT = 300
+END_LIMIT = 60
+
+#: seconds within which a tool has to end. (Not at once: TensorFlow 2.7
+#: or later can hold a failure back inside fit() until the batch that
+#: is being fetched has arrived, or the one after it.)
+PROMPT = 20
+
+#: seconds a batch worker of these tests takes for every batch after
+#: its first. With one locus per batch the workers of an epoch then
+#: have minutes of work left when the tool fails.
+SLOW = 2.0
+
+#: for both drivers: batch workers (of the mode WORKERS_OF) that are
+#: slow from their second batch on, and say so
+WORKERS = """
+import os, time
+from bpnet.generators import generators
+
+construct = generators.MBPNetSequenceGenerator._generate_batch
+
+
+def slow(self, coords):
+    self._made = getattr(self, '_made', 0) + 1
+    if self._mode == os.environ['WORKERS_OF'] and self._made > 1:
+        open('worker.{}'.format(os.getpid()), 'w').close()
+        time.sleep(float(os.environ['SLOW']))
+    return construct(self, coords)
+
+
+generators.MBPNetSequenceGenerator._generate_batch = slow
+"""
+
+#: bpnet-train whose second training or validation step fails
+TRAIN_AND_FAIL = WORKERS + """
+import tensorflow as tf
+from bpnet.cli import bpnettrainer
+
+
+class Fails(tf.keras.callbacks.Callback):
+    def fail(self, batch, what):
+        if os.environ['FAIL_IN'] == what and batch == 1:
+            open('failed', 'w').close()
+            raise RuntimeError('the {} step failed'.format(what))
+
+    def on_train_batch_end(self, batch, logs=None):
+        self.fail(batch, 'train')
+
+    def on_test_batch_end(self, batch, logs=None):
+        self.fail(batch, 'val')
+
+
+def with_the_callback(call):
+    def run(self, *args, **kwargs):
+        kwargs['callbacks'] = [Fails()]
+        return call(self, *args, **kwargs)
+    return run
+
+
+tf.keras.Model.fit = with_the_callback(tf.keras.Model.fit)
+tf.keras.Model.evaluate = with_the_callback(tf.keras.Model.evaluate)
+bpnettrainer.main()
+"""
+
+#: bpnet-predict whose second call of the model fails
+PREDICT_AND_FAIL = WORKERS + """
+import tensorflow as tf
+from bpnet.cli import predict
+
+model_predict = tf.keras.Model.predict
+calls = []
+
+
+def fails_the_second_time(self, *args, **kwargs):
+    calls.append(1)
+    if len(calls) == 2:
+        open('failed', 'w').close()
+        raise RuntimeError('the prediction failed')
+    return model_predict(self, *args, **kwargs)
+
+
+tf.keras.Model.predict = fails_the_second_time
+predict.predict_main()
+"""
+
+
+def processes_of(session):
+    """
+        The processes of a session that are still running
+    """
+
+    found = []
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        try:
+            with open("/proc/{}/stat".format(name)) as fh:
+                state, _, _, sid = fh.read().rsplit(")", 1)[1].split()[:4]
+        except (IOError, OSError, ValueError):
+            continue
+        if int(sid) == session and state != "Z":
+            found.append(int(name))
+    return found
+
+
+def run_until(code, args, cwd, env, event, then=None):
+    """
+        Run `python -c <code> <args>` in a session of its own until
+        `event(cwd)` is true, call `then(process)`, and wait for the
+        tool to end
+
+        Returns:
+            tuple: (return code, output, seconds from the event to the
+                end of the tool, processes of the session that were
+                still running a moment later)
+
+        The test fails if the event does not come or the tool does not
+        end in time; everything the tool started is killed either way.
+    """
+
+    env = dict(os.environ, PYTHONPATH=REPO, CUDA_VISIBLE_DEVICES="",
+               SLOW=str(SLOW), **env)
+    log = os.path.join(cwd, "output.txt")
+    with open(log, "w") as out:
+        process = subprocess.Popen(
+            [sys.executable, "-c", code] + [str(a) for a in args], cwd=cwd,
+            env=env, stdout=out, stderr=subprocess.STDOUT,
+            start_new_session=True)
+    try:
+        deadline = time.time() + START_LIMIT
+        while not event(cwd) and process.poll() is None and \
+                time.time() < deadline:
+            time.sleep(0.1)
+        with open(log) as fh:
+            assert event(cwd), "the tool did not get there:\n" + \
+                fh.read()[-3000:]
+        reached = time.time()
+        if then is not None:
+            then(process)
+        try:
+            code = process.wait(timeout=END_LIMIT)
+        except subprocess.TimeoutExpired:
+            with open(log) as fh:
+                pytest.fail("the tool was still running {} s later\n{}".format(
+                    END_LIMIT, fh.read()[-3000:]))
+        seconds = time.time() - reached
+        # what the tool started has a moment to go away
+        deadline = time.time() + 5
+        while processes_of(process.pid) and time.time() < deadline:
+            time.sleep(0.1)
+        left = processes_of(process.pid)
+    finally:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        process.wait()
+    with open(log) as fh:
+        return code, fh.read(), seconds, left
+
+
+def failed(cwd):
+    return os.path.exists(os.path.join(cwd, "failed"))
+
+
+def two_workers_have_work_left(cwd):
+    return len([name for name in os.listdir(cwd)
+                if name.startswith("worker.")]) == 2
+
+
+needs_proc = pytest.mark.skipif(
+    not os.path.isdir("/proc/self"),
+    reason="needs /proc to look at other processes")
+
+
+@needs_proc
+@pytest.mark.parametrize("step", ["train", "val"])
+def test_failed_step_ends_bpnet_train_and_its_workers(synth_dataset,
+                                                      tmp_path, step):
+    """
+        A training or validation step fails while the batch workers of
+        the epoch have minutes of work left. bpnet-train ends with the
+        error of the step, without waiting for them, and leaves no
+        process behind. (It used to end when the workers had made the
+        rest of the epoch.)
+    """
+
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    code, output, seconds, left = run_until(
+        TRAIN_AND_FAIL, train_args(synth_dataset, model_dir,
+                                   **{"--batch-size": 1}),
+        str(tmp_path), {"WORKERS_OF": step, "FAIL_IN": step}, failed)
+    assert code != 0, output[-3000:]
+    assert "the {} step failed".format(step) in output
+    assert "Training of split 0 failed" in output
+    # the failure of the step is what is reported, not a batch worker
+    assert "Batch generation failed" not in output
+    print("ended {:.1f} s after the {} step failed".format(seconds, step))
+    assert seconds < PROMPT
+    assert left == []
+    assert not any(name.startswith("model") for name in os.listdir(
+        str(model_dir)))
+
+
+@needs_proc
+def test_interrupt_of_bpnet_train_alone_ends_its_processes(synth_dataset,
+                                                           tmp_path):
+    """
+        An interrupt that reaches only the process that waits for the
+        training process (not the whole group, as from a keyboard):
+        the training process is asked to end, stops its batch workers
+        and ends. (bpnet-train used to wait until the training was
+        over.)
+    """
+
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    code, output, seconds, left = run_until(
+        TRAIN_AND_FAIL, train_args(synth_dataset, model_dir,
+                                   **{"--batch-size": 1}),
+        str(tmp_path), {"WORKERS_OF": "train", "FAIL_IN": "never"},
+        two_workers_have_work_left,
+        then=lambda process: os.kill(process.pid, signal.SIGINT))
+    assert code != 0, output[-3000:]
+    # the interrupt of bpnet-train and the one it passed on to the
+    # training process
+    assert output.count("KeyboardInterrupt") >= 2, output[-3000:]
+    print("ended {:.1f} s after the interrupt".format(seconds))
+    assert seconds < PROMPT
+    assert left == []
+
+
+@needs_proc
+def test_failure_in_bpnet_predict_ends_its_workers(synth_dataset, tmp_path):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    code, output = run_cli("bpnet.cli.bpnettrainer", train_args(
+        synth_dataset, model_dir), cwd=str(tmp_path))
+    assert code == 0, output[-3000:]
+
+    out_dir = tmp_path / "predictions"
+    out_dir.mkdir()
+    d = synth_dataset
+    code, output, seconds, left = run_until(PREDICT_AND_FAIL, [
+        "--model", model_dir / "model_split000",
+        "--chrom-sizes", d["chrom_sizes"],
+        "--chroms"] + d["splits"]["0"]["test"] + [
+        "--test-indices-file", "None", "--reference-genome", d["fasta"],
+        "--output-dir", out_dir, "--input-data", d["input_json"],
+        "--sequence-generator-name", "BPNet",
+        "--input-seq-len", d["input_len"], "--output-len", d["output_len"],
+        "--output-window-size", d["output_len"], "--batch-size", 1,
+        "--threads", 2], str(out_dir), {"WORKERS_OF": "test"}, failed)
+    assert code != 0, output[-3000:]
+    assert "the prediction failed" in output
+    assert "Batch generation failed" not in output
+    print("ended {:.1f} s after the prediction failed".format(seconds))
+    assert seconds < PROMPT
+    assert left == []
+
