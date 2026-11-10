@@ -17,7 +17,8 @@ from bpnet.model import arch
 
 from tests import reference_model
 from tests.model_helpers import (
-    make_tasks, random_batch, randomize_weights, small_params)
+    RELEASED_PARAMS, make_tasks, random_batch, randomize_weights,
+    small_params)
 
 
 def build(params=None, n_signal=2, n_bias=2, **kwargs):
@@ -509,3 +510,99 @@ def test_poisson_counts_loss_is_per_example_and_unweighted():
     np.testing.assert_allclose(counts_loss.numpy(), expected, rtol=1e-4)
     np.testing.assert_allclose(
         total.numpy(), float(profile_loss) + counts_loss.numpy(), rtol=1e-5)
+
+
+# --------------------------------------------------------------------
+# the type of the one hot input
+# --------------------------------------------------------------------
+
+def optimizer_state(optimizer):
+    variables = optimizer.variables
+    if callable(variables):
+        variables = variables()
+    return [np.asarray(v) for v in variables]
+
+
+def fit_from_the_same_start(params, batch, steps, n_bias=2):
+    """
+        A new model with fixed weights, trained on `batch` for some
+        steps of fit() from a Python generator (the way the trainer
+        feeds the model)
+
+        Returns:
+            tuple: (losses of the epoch, weights, optimizer variables,
+                number of trainable variables)
+    """
+
+    inputs, outputs, sample_weights = batch
+    tf.random.set_seed(41)
+    model = build(copy.deepcopy(params), n_bias=n_bias)
+    randomize_weights(model, seed=42)
+    model.compile(Adam(learning_rate=0.01), loss=None)
+
+    def batches():
+        while True:
+            yield inputs, outputs, sample_weights
+
+    history = model.fit(batches(), epochs=1, steps_per_epoch=steps, verbose=0)
+    return history.history, model.get_weights(), \
+        optimizer_state(model.optimizer), len(model.trainable_variables)
+
+
+SEQUENCE_TYPE_CASES = {
+    "small": dict(params=small_params(), steps=4),
+    "dropout in the counts head": dict(params=small_params(
+        counts_head_params={"units": [8, 1], "dropouts": [0.5, 0.0],
+                            "activations": ["relu", "linear"]}),
+        steps=4, n_bias=0),
+    "released architecture": dict(params=copy.deepcopy(RELEASED_PARAMS),
+                                  steps=2, batch_size=4),
+}
+
+
+@pytest.mark.parametrize("case", sorted(SEQUENCE_TYPE_CASES))
+def test_training_does_not_depend_on_the_type_of_the_one_hot_input(case):
+    """
+        Steps of fit() from the same start with the sequences as
+        float64 (as the batch generator always made them) and as int8
+        (as bpnet-train asks for them now): the same losses, weights
+        and optimizer state, bit for bit. Two float64 runs show that
+        the comparison is between runs that repeat exactly, dropout
+        included.
+    """
+
+    options = dict(SEQUENCE_TYPE_CASES[case])
+    params, steps = options["params"], options["steps"]
+    n_bias = options.get("n_bias", 2)
+    inputs, outputs, sample_weights = random_batch(
+        params, batch_size=options.get("batch_size", 6), n_bias=n_bias,
+        seed=43)
+    assert inputs["sequence"].dtype == np.float64
+    as_int8 = dict(inputs, sequence=inputs["sequence"].astype(np.int8))
+
+    runs = [fit_from_the_same_start(params, (x, outputs, sample_weights),
+                                    steps, n_bias)
+            for x in (inputs, inputs, as_int8)]
+    repeats = runs[1][0] == runs[0][0] and all(
+        a.tobytes() == b.tobytes()
+        for a, b in zip(runs[1][1] + runs[1][2], runs[0][1] + runs[0][2]))
+    if not repeats and tf.config.list_physical_devices("GPU"):
+        # GPU kernels of newer TensorFlow versions do not repeat to
+        # the last bit unless tf.config.experimental
+        # .enable_op_determinism() is on (with it, the three runs are
+        # identical on a GPU as well)
+        pytest.skip("two fits with float64 sequences differ on this GPU: "
+                    "runs cannot be compared bit for bit")
+    for history, weights, state, trainable in runs[1:]:
+        assert history == runs[0][0]
+        assert len(weights) == len(runs[0][1]) >= trainable >= 10
+        for a, b in zip(weights, runs[0][1]):
+            assert a.dtype == b.dtype and a.tobytes() == b.tobytes()
+        # the step counter and the two moments of every trainable
+        # variable
+        assert len(state) == len(runs[0][2]) == 1 + 2 * trainable
+        for a, b in zip(state, runs[0][2]):
+            assert a.dtype == b.dtype and a.tobytes() == b.tobytes()
+        assert int(state[0]) == steps
+    assert sorted(runs[0][0]) == LOG_KEYS
+    assert np.isfinite(runs[0][0]["loss"][0])

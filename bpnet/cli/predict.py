@@ -396,6 +396,8 @@ def predict(args, pred_dir):
     batch_gen_params['max_jitter'] = 0
     batch_gen_params['shuffle'] = False
     batch_gen_params['mode'] = 'test'
+    # see bpnettrainer.py
+    batch_gen_params['sequence_dtype'] = 'int8'
 
     # instantiate the batch generator class for testing
         # get the corresponding batch generator class for this model
