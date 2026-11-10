@@ -96,6 +96,39 @@ class WorkerFailure(object):
 #: delivered a batch is still running
 WORKER_POLL_SECONDS = 1.0
 
+#: seconds a worker process gets to end after it was asked to, before 
+#: it is killed
+WORKER_STOP_SECONDS = 10.0
+
+
+def close_writing_end(mpq):
+    """
+        Give up this process's handle on the writing end of a 
+        multiprocessing queue that only a child process writes to
+        
+        With the handle closed, the end of the child shows as the end 
+        of the data, also when the child is killed while it hands 
+        over an item. With it open, reading the rest of that item 
+        would wait forever. multiprocessing has no public way to 
+        close one end only; this is the one place that reaches for 
+        the queue's private attribute.
+        
+        Args:
+            mpq (multiprocessing.Queue): the queue, after the child 
+                that writes to it was started
+        
+        Returns:
+            bool: False if this Python's queue has no such handle; 
+                the end of a child is then found by looking at the 
+                process now and then
+    """
+    
+    writer = getattr(mpq, '_writer', None)
+    if writer is None:
+        return False
+    writer.close()
+    return True
+
 
 class MSequenceGenerator:
     
@@ -810,14 +843,8 @@ class MSequenceGenerator:
                 # spawn and start the batch generation process 
                 p = mp.Process(target=self._proc_target, args=[df, mpq, i])
                 p.start()
-                # Only the worker writes to its queue. This process 
-                # gives up its own handle on the writing end, so that 
-                # a worker that is killed while it hands over a batch 
-                # shows as the end of the data; with the handle open, 
-                # reading the rest of that batch would wait forever.
-                writer = getattr(mpq, '_writer', None)
-                if writer is not None:
-                    writer.close()
+                # only the worker writes to its queue
+                close_writing_end(mpq)
                 procs.append(p)
                 mp_queues.append(mpq)
                 
@@ -868,11 +895,71 @@ class MSequenceGenerator:
                     "{} skipping stealer thread {} ".format(
                         self._mode, i, num_batches))
 
-        return procs, threads, q, sum(num_batches)
+        return procs, threads, mp_queues, q, sum(num_batches)
+
+    def _end_epoch(self, procs, threads, mp_queues, complete):
+        """
+            Wait for the worker processes and the stealer threads of 
+            an epoch to end, and close their queues
+            
+            Args:
+                procs (list): the worker processes (None for a worker 
+                    without data)
+                
+                threads (list): the stealer threads (None likewise)
+                
+                mp_queues (list): the multiprocessing queues (None 
+                    likewise)
+                
+                complete (bool): whether all batches of the epoch 
+                    were taken. If not (a worker failed, or the 
+                    consumer of the batches stopped early) the 
+                    workers are still making batches that nobody 
+                    will take, and are stopped.
+        """
+        
+        if not complete:
+            for proc in procs:
+                if proc is not None and proc.is_alive():
+                    proc.terminate()
+        
+        for j in range(self._num_threads):
+            if procs[j] is not None:
+                logging.debug(
+                    "{} waiting to join process {}".format(self._mode, j))
+                if complete:
+                    procs[j].join()
+                else:
+                    procs[j].join(WORKER_STOP_SECONDS)
+                    if procs[j].is_alive():
+                        procs[j].kill()
+                        procs[j].join()
+
+            # the thread ends with its process: it has all batches, or 
+            # finds the end of the queue
+            if threads[j] is not None:
+                logging.debug(
+                    "{} waiting to join thread {}".format(self._mode, j))
+                threads[j].join()
+
+            if mp_queues[j] is not None:
+                mp_queues[j].close()
+
+            logging.debug(
+                "{} join complete for process {}".format(self._mode, j))
+
+        logging.debug(
+            "{} Finished join for epoch".format(self._mode))
 
     def gen(self):
         """
             Generator function to yield one epoch of data
+            
+            The worker processes and threads of the epoch end with 
+            it: after the last batch, when a worker fails (which 
+            raises NoTracebackException), and when the consumer stops 
+            before the last batch (the generator is closed or 
+            garbage collected, or an exception is raised in it).
 
         """
         
@@ -885,44 +972,28 @@ class MSequenceGenerator:
 
         # spawn multiple processes to generate batches of data in
         # parallel for each epoch
-        procs, threads, q, total_batches = self._epoch_run(data)
+        owner = os.getpid()
+        procs, threads, mp_queues, q, total_batches = self._epoch_run(data)
 
-        # yield the correct number of batches for each epoch
-        for j in range(total_batches):      
-            batch = q.get()
-            if isinstance(batch, WorkerFailure):
-                # no more batches will come from that worker: stop the 
-                # others and report, instead of waiting forever
-                for proc in procs:
-                    if proc is not None and proc.is_alive():
-                        proc.terminate()
-                for proc in procs:
-                    if proc is not None:
-                        proc.join()
-                raise NoTracebackException(
-                    "Batch generation failed in worker process {} ({} "
-                    "mode): {}".format(batch.worker, self._mode, 
-                                       batch.reason))
-            yield batch
-
-        # wait for batch generation processes to finish once the
-        # required number of batches have been yielded
-        for j in range(self._num_threads):
-            if procs[j] is not None:
-                logging.debug(
-                    "{} waiting to join process {}".format(self._mode, j))
-                procs[j].join()
-
-            if threads[j] is not None:
-                logging.debug(
-                    "{} waiting to join thread {}".format(self._mode, j))
-                threads[j].join()
-
-            logging.debug(
-                "{} join complete for process {}".format(self._mode, j))
-
-        logging.debug(
-            "{} Finished join for epoch".format(self._mode))
+        complete = False
+        try:
+            # yield the correct number of batches for each epoch
+            for j in range(total_batches):      
+                batch = q.get()
+                if isinstance(batch, WorkerFailure):
+                    # no more batches will come from that worker: 
+                    # report, instead of waiting forever
+                    raise NoTracebackException(
+                        "Batch generation failed in worker process {} ({} "
+                        "mode): {}".format(batch.worker, self._mode, 
+                                           batch.reason))
+                yield batch
+            complete = True
+        finally:
+            # (a copy of this generator in a forked process has no 
+            # workers of its own to end)
+            if os.getpid() == owner:
+                self._end_epoch(procs, threads, mp_queues, complete)
 
         logging.debug("{} Ready for next epoch".format(self._mode))
 
