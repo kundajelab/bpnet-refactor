@@ -29,6 +29,14 @@ MOTIF = "TGACTCA"
 #: bases per line of the FASTA file that is written
 FASTA_LINE = 60
 
+#: width of the window around a peak position that receives reads
+SIGNAL_WIDTH = 121
+
+#: input length minus output length of the architecture written to
+#: bpnet_params.json: 20 (first convolution) + 2 * (2 + 4) (two dilated
+#: convolutions) + 74 (profile head)
+SHRINKAGE = 106
+
 
 def write_bigwig(path, chrom_sizes, tracks):
     """
@@ -46,6 +54,7 @@ def write_bigwig(path, chrom_sizes, tracks):
 
     bw = pyBigWig.open(path, "w")
     bw.addHeader([(c, int(n)) for c, n in chrom_sizes.items()], maxZooms=0)
+    written = 0
     for chrom in chrom_sizes:
         values = tracks[chrom]
         idx = np.flatnonzero(values)
@@ -54,6 +63,12 @@ def write_bigwig(path, chrom_sizes, tracks):
         bw.addEntries([chrom] * len(idx), [int(i) for i in idx],
                       ends=[int(i) + 1 for i in idx],
                       values=[float(v) for v in values[idx]])
+        written += len(idx)
+    if written == 0:
+        # a bigWig without any entry cannot be queried (values() returns
+        # an empty list), so an all-zero track gets one explicit zero
+        chrom = next(iter(chrom_sizes))
+        bw.addEntries([chrom], [0], ends=[1], values=[0.0])
     bw.close()
 
 
@@ -68,15 +83,20 @@ def write_fasta(path, sequences):
     """
 
     offset = 0
-    with open(path, "w") as fasta, open(path + ".fai", "w") as fai:
+    index = []
+    with open(path, "w") as fasta:
         for chrom, seq in sequences.items():
             fasta.write(">{}\n".format(chrom))
             offset += len(chrom) + 2
-            fai.write("{}\t{}\t{}\t{}\t{}\n".format(
+            index.append("{}\t{}\t{}\t{}\t{}\n".format(
                 chrom, len(seq), offset, FASTA_LINE, FASTA_LINE + 1))
             for i in range(0, len(seq), FASTA_LINE):
                 fasta.write(seq[i:i + FASTA_LINE] + "\n")
             offset += len(seq) + (len(seq) + FASTA_LINE - 1) // FASTA_LINE
+    # the index is written after the FASTA file is closed: readers
+    # rebuild an index that is older than its FASTA file
+    with open(path + ".fai", "w") as fai:
+        fai.writelines(index)
 
 
 def write_narrowpeak(path, rows):
@@ -131,6 +151,18 @@ def make_dataset(outdir, seed=0, chroms=("chr1", "chr2", "chr3"),
                 every bigWig keyed by path, 'sequences')
     """
 
+    n_loci = n_peaks + n_background
+    if len(chroms) < 3:
+        raise ValueError("at least 3 chromosomes are needed for the "
+                         "train / val / test split")
+    if n_peaks < 1 or n_background < 0:
+        raise ValueError("n_peaks must be positive and n_background "
+                         "non negative")
+    if input_len - output_len != SHRINKAGE:
+        raise ValueError("input_len - output_len must be {} for the "
+                         "architecture in bpnet_params.json".format(
+                             SHRINKAGE))
+
     os.makedirs(outdir, exist_ok=True)
     rng = np.random.RandomState(seed)
     chrom_sizes = {c: chrom_len for c in chroms}
@@ -143,11 +175,12 @@ def make_dataset(outdir, seed=0, chroms=("chr1", "chr2", "chr3"),
     seqs = {c: rng.choice(list("ACGT"), size=chrom_len) for c in chroms}
 
     # non overlapping slots; a random subset becomes peaks, another
-    # background
-    n_loci = n_peaks + n_background
+    # background. Centers move by up to 5 bases inside their slot, so a
+    # slot of SIGNAL_WIDTH + 10 keeps the signal windows of neighbours
+    # apart
     slots_per_chrom = int(np.ceil(n_loci / float(len(chroms))))
     slot = (chrom_len - 2 * margin) // slots_per_chrom
-    if slot < 130:
+    if slot < SIGNAL_WIDTH + 10:
         raise ValueError("chromosomes too short for the requested loci")
     loci = []
     for chrom in chroms:
@@ -240,8 +273,7 @@ def make_dataset(outdir, seed=0, chroms=("chr1", "chr2", "chr3"),
         json.dump(input_data, fh, indent=2)
 
     # a small architecture with the receptive field arithmetic of the
-    # default one: 20 (first conv) + 2 * (2 + 4) (two dilated convs)
-    # + 74 (profile head) = input_len - output_len = 106
+    # default one (see SHRINKAGE)
     params = {
         "input_len": input_len,
         "output_profile_len": output_len,

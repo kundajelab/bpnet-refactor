@@ -5,53 +5,148 @@
 
 import hashlib
 import json
+import os
 
 import numpy as np
 import pyBigWig
 import pyfaidx
+import pytest
 
 from tests import synth
 
+# sha256 over the arrays, sequences and loci of make_dataset(seed=0)
+# with default arguments. The builder draws everything from a legacy
+# numpy RandomState, whose streams are stable across numpy versions,
+# so this value must not depend on the environment. Golden test data
+# derived from the builder rely on it.
+DEFAULT_DATASET_DIGEST = \
+    "01c213b48529a4c36e965414e3ca1aa803aaf0aa13fa0ed0b46a54223c15b158"
 
-def read_dense(path, chrom, length):
+SMALL = dict(chrom_len=20000, n_peaks=30, n_background=30)
+
+
+def read_raw(path, chrom, length):
     """
-        All values of one chromosome of a bigWig, NaN replaced by 0
+        All values of one chromosome of a bigWig, as stored (NaN where
+        nothing was written)
     """
 
     bw = pyBigWig.open(path)
-    values = np.nan_to_num(np.array(bw.values(chrom, 0, length)))
+    values = np.array(bw.values(chrom, 0, length))
     bw.close()
     return values
 
 
-def test_fasta_matches_truth(synth_dataset):
-    fasta = pyfaidx.Fasta(synth_dataset["fasta"])
-    assert list(fasta.keys()) == synth_dataset["chroms"]
-    for chrom in synth_dataset["chroms"]:
-        truth = synth_dataset["sequences"][chrom]
-        assert len(fasta[chrom]) == synth_dataset["chrom_len"]
+def digest(dataset):
+    h = hashlib.sha256()
+    for path in sorted(dataset["tracks"], key=os.path.basename):
+        for chrom in dataset["chroms"]:
+            h.update(dataset["tracks"][path][chrom].tobytes())
+    for chrom in dataset["chroms"]:
+        h.update(dataset["sequences"][chrom].encode())
+    h.update(repr(dataset["peak_rows"]).encode())
+    h.update(repr(dataset["background_rows"]).encode())
+    return h.hexdigest()
+
+
+def assert_files_match_truth(dataset):
+    """
+        Every file of a dataset agrees with the arrays the builder
+        returned
+    """
+
+    # FASTA, read through the index the builder wrote (pyfaidx must not
+    # build its own)
+    index_path = dataset["fasta"] + ".fai"
+    assert os.path.exists(index_path)
+    with open(index_path, "rb") as fh:
+        index_bytes = fh.read()
+    fasta = pyfaidx.Fasta(dataset["fasta"], build_index=False, rebuild=False)
+    assert list(fasta.keys()) == dataset["chroms"]
+    for chrom in dataset["chroms"]:
+        truth = dataset["sequences"][chrom]
+        assert len(truth) == dataset["chrom_len"]
         assert fasta[chrom][:].seq == truth
-        # an interval that crosses line boundaries exercises the index
+        # intervals that cross line boundaries and reach the last line
         assert fasta[chrom][55:187].seq == truth[55:187]
+        assert fasta[chrom][len(truth) - 71:].seq == truth[-71:]
     fasta.close()
+    with open(index_path, "rb") as fh:
+        assert fh.read() == index_bytes
 
-
-def test_chrom_sizes(synth_dataset):
-    with open(synth_dataset["chrom_sizes"]) as fh:
+    with open(dataset["chrom_sizes"]) as fh:
         rows = [line.split() for line in fh]
-    assert [r[0] for r in rows] == synth_dataset["chroms"]
-    assert all(int(r[1]) == synth_dataset["chrom_len"] for r in rows)
+    assert [r[0] for r in rows] == dataset["chroms"]
+    assert all(int(r[1]) == dataset["chrom_len"] for r in rows)
+
+    # bigWigs: stored values equal the truth, zeros are not stored
+    assert sorted(dataset["tracks"]) == \
+        sorted(dataset["signal"] + dataset["control"])
+    for path in dataset["signal"] + dataset["control"]:
+        for chrom in dataset["chroms"]:
+            raw = read_raw(path, chrom, dataset["chrom_len"])
+            truth = dataset["tracks"][path][chrom]
+            assert raw.shape == truth.shape
+            assert np.array_equal(np.isnan(raw), truth == 0)
+            assert np.array_equal(np.nan_to_num(raw), truth)
+        assert sum(t.sum() for t in dataset["tracks"][path].values()) > 0
+
+    # loci
+    for key, rows in (("peaks", dataset["peak_rows"]),
+                      ("background", dataset["background_rows"])):
+        with open(dataset[key]) as fh:
+            lines = [line.rstrip("\n").split("\t") for line in fh]
+        assert len(lines) == len(rows)
+        assert all(len(line) == 10 for line in lines)
+        for line, (chrom, start, end, _, summit) in zip(lines, rows):
+            assert line[0] == chrom
+            assert (int(line[1]), int(line[2]), int(line[9])) == \
+                (start, end, summit)
+
+    # json files agree with the returned dictionaries and the file lists
+    with open(dataset["input_json"]) as fh:
+        tasks = json.load(fh)
+    assert tasks == dataset["input_data"]
+    per_task = len(dataset["signal"]) // len(tasks)
+    for i, key in enumerate(sorted(tasks, key=int)):
+        task = tasks[key]
+        assert task["signal"]["source"] == \
+            dataset["signal"][i * per_task:(i + 1) * per_task]
+        if dataset["control"]:
+            assert task["bias"]["source"] == \
+                dataset["control"][i * per_task:(i + 1) * per_task]
+        else:
+            assert task["bias"]["source"] == []
+        assert task["bias"]["smoothing"] == \
+            [None] * len(task["bias"]["source"])
+        assert task["loci"]["source"] == [dataset["peaks"]]
+        assert task["background_loci"]["source"] == [dataset["background"]]
+    with open(dataset["params_json"]) as fh:
+        assert json.load(fh) == dataset["params"]
+    with open(dataset["splits_json"]) as fh:
+        assert json.load(fh) == dataset["splits"]
 
 
-def test_bigwigs_match_truth(synth_dataset):
-    paths = synth_dataset["signal"] + synth_dataset["control"]
-    assert len(paths) == 4
-    for path in paths:
-        for chrom in synth_dataset["chroms"]:
-            values = read_dense(path, chrom, synth_dataset["chrom_len"])
-            truth = synth_dataset["tracks"][path][chrom]
-            assert np.array_equal(values, truth)
-            assert truth.sum() > 0
+def test_default_dataset_files(synth_dataset):
+    assert_files_match_truth(synth_dataset)
+    assert len(synth_dataset["signal"]) == 2
+    assert len(synth_dataset["control"]) == 2
+    assert len(synth_dataset["peak_rows"]) == 240
+    assert len(synth_dataset["background_rows"]) == 240
+
+
+def test_default_dataset_is_pinned(synth_dataset):
+    assert digest(synth_dataset) == DEFAULT_DATASET_DIGEST
+
+
+def test_builder_is_deterministic(tmp_path):
+    a = synth.make_dataset(str(tmp_path / "a"), seed=3, **SMALL)
+    b = synth.make_dataset(str(tmp_path / "b"), seed=3, **SMALL)
+    c = synth.make_dataset(str(tmp_path / "c"), seed=4, **SMALL)
+    assert digest(a) == digest(b)
+    assert digest(a) != digest(c)
+    with open(a["fasta"], "rb") as fa, open(b["fasta"], "rb") as fb:
+        assert fa.read() == fb.read()
 
 
 def test_peaks_carry_the_motif_and_signal(synth_dataset):
@@ -62,7 +157,8 @@ def test_peaks_carry_the_motif_and_signal(synth_dataset):
         seq = synth_dataset["sequences"][chrom]
         assert seq[pos:pos + len(synth.MOTIF)] == synth.MOTIF
         assert start < pos < end
-        # reads pile up upstream on the plus strand, downstream on minus
+        # with this seed: reads pile up upstream on the plus strand and
+        # downstream on the minus strand
         assert plus[chrom][pos - 60:pos].sum() > plus[chrom][pos:pos + 60].sum()
         assert minus[chrom][pos:pos + 60].sum() > minus[chrom][pos - 60:pos].sum()
 
@@ -78,8 +174,6 @@ def test_background_has_little_signal(synth_dataset):
 
 def test_loci_are_distinct_and_leave_room_for_jitter(synth_dataset):
     rows = synth_dataset["peak_rows"] + synth_dataset["background_rows"]
-    assert len(synth_dataset["peak_rows"]) == 240
-    assert len(synth_dataset["background_rows"]) == 240
     positions = sorted((c, s + m) for c, s, e, _, m in rows)
     assert len(set(positions)) == len(positions)
     flank = synth_dataset["input_len"] // 2
@@ -89,92 +183,97 @@ def test_loci_are_distinct_and_leave_room_for_jitter(synth_dataset):
         assert pos + flank + max_jitter <= synth_dataset["chrom_len"]
     # signal windows of neighbouring loci do not overlap
     for (c1, p1), (c2, p2) in zip(positions[:-1], positions[1:]):
-        assert c1 != c2 or p2 - p1 > 121
+        assert c1 != c2 or p2 - p1 >= synth.SIGNAL_WIDTH
 
 
-def test_bed_files_are_narrowpeak(synth_dataset):
-    for key, rows in (("peaks", synth_dataset["peak_rows"]),
-                      ("background", synth_dataset["background_rows"])):
-        with open(synth_dataset[key]) as fh:
-            lines = [line.rstrip("\n").split("\t") for line in fh]
-        assert len(lines) == len(rows)
-        assert all(len(line) == 10 for line in lines)
-        for line, (chrom, start, end, _, summit) in zip(lines, rows):
-            assert line[0] == chrom
-            assert (int(line[1]), int(line[2]), int(line[9])) == \
-                (start, end, summit)
+def test_densest_allowed_layout_keeps_signal_windows_apart(tmp_path):
+    # 3 chromosomes x 141 slots of exactly SIGNAL_WIDTH + 10 bases
+    n_loci = 3 * 141
+    chrom_len = 141 * (synth.SIGNAL_WIDTH + 10) + 2 * 306
+    dataset = synth.make_dataset(
+        str(tmp_path), chrom_len=chrom_len, n_peaks=n_loci // 2,
+        n_background=n_loci - n_loci // 2)
+    rows = dataset["peak_rows"] + dataset["background_rows"]
+    positions = sorted((c, s + m) for c, s, e, _, m in rows)
+    gaps = [p2 - p1 for (c1, p1), (c2, p2)
+            in zip(positions[:-1], positions[1:]) if c1 == c2]
+    assert min(gaps) >= synth.SIGNAL_WIDTH
+
+    with pytest.raises(ValueError):
+        synth.make_dataset(str(tmp_path / "too_dense"),
+                           chrom_len=chrom_len - 141, n_peaks=n_loci // 2,
+                           n_background=n_loci - n_loci // 2)
 
 
 def test_json_inputs(synth_dataset):
-    with open(synth_dataset["input_json"]) as fh:
-        tasks = json.load(fh)
+    tasks = synth_dataset["input_data"]
     assert list(tasks.keys()) == ["0"]
-    assert tasks["0"]["signal"]["source"] == synth_dataset["signal"]
-    assert tasks["0"]["bias"]["source"] == synth_dataset["control"]
     assert tasks["0"]["bias"]["smoothing"] == [None, None]
-    assert tasks["0"]["loci"]["source"] == [synth_dataset["peaks"]]
     assert tasks["0"]["background_loci"]["ratio"] == [0.5]
-
-    with open(synth_dataset["params_json"]) as fh:
-        params = json.load(fh)
-    # receptive field: first conv, dilated convs, profile head
-    shrink = 20 + 2 * (2 + 4) + 74
-    assert params["input_len"] - params["output_profile_len"] == shrink
-
-    with open(synth_dataset["splits_json"]) as fh:
-        splits = json.load(fh)["0"]
+    params = synth_dataset["params"]
+    assert params["input_len"] - params["output_profile_len"] == \
+        synth.SHRINKAGE
+    splits = synth_dataset["splits"]["0"]
     chroms = splits["train"] + splits["val"] + splits["test"]
     assert sorted(chroms) == sorted(synth_dataset["chroms"])
+    assert all(len(splits[k]) > 0 for k in ("train", "val", "test"))
 
 
-def digest(dataset):
-    h = hashlib.sha256()
-    for path in sorted(dataset["tracks"]):
-        for chrom in dataset["chroms"]:
-            h.update(dataset["tracks"][path][chrom].tobytes())
-    for chrom in dataset["chroms"]:
-        h.update(dataset["sequences"][chrom].encode())
-    h.update(repr(dataset["peak_rows"]).encode())
-    h.update(repr(dataset["background_rows"]).encode())
-    return h.hexdigest()
+def test_unstranded_variant(tmp_path):
+    dataset = synth.make_dataset(str(tmp_path), stranded=False, **SMALL)
+    assert_files_match_truth(dataset)
+    assert len(dataset["signal"]) == 1
+    assert len(dataset["control"]) == 1
 
 
-def test_builder_is_deterministic(tmp_path, synth_dataset):
-    small = dict(chrom_len=20000, n_peaks=30, n_background=30)
-    a = synth.make_dataset(str(tmp_path / "a"), seed=3, **small)
-    b = synth.make_dataset(str(tmp_path / "b"), seed=3, **small)
-    c = synth.make_dataset(str(tmp_path / "c"), seed=4, **small)
-    assert digest(a) == digest(b)
-    assert digest(a) != digest(c)
-    with open(a["fasta"], "rb") as fa, open(b["fasta"], "rb") as fb:
-        assert fa.read() == fb.read()
-
-
-def test_variants(tmp_path):
-    small = dict(chrom_len=20000, n_peaks=30, n_background=30)
-
-    unstranded = synth.make_dataset(
-        str(tmp_path / "unstranded"), stranded=False, **small)
-    assert len(unstranded["signal"]) == 1
-    assert len(unstranded["control"]) == 1
-
-    no_control = synth.make_dataset(
-        str(tmp_path / "no_control"), with_control=False, **small)
-    assert no_control["control"] == []
-    assert no_control["input_data"]["0"]["bias"] == \
+def test_no_control_variant(tmp_path):
+    dataset = synth.make_dataset(str(tmp_path), with_control=False, **SMALL)
+    assert_files_match_truth(dataset)
+    assert dataset["control"] == []
+    assert dataset["input_data"]["0"]["bias"] == \
         {"source": [], "smoothing": []}
 
-    two_tasks = synth.make_dataset(
-        str(tmp_path / "two_tasks"), num_tasks=2, **small)
-    assert len(two_tasks["signal"]) == 4
-    assert list(two_tasks["input_data"].keys()) == ["0", "1"]
-    assert two_tasks["params"]["profile_bias_module_params"] == \
+
+def test_two_task_variant(tmp_path):
+    dataset = synth.make_dataset(str(tmp_path), num_tasks=2, **SMALL)
+    assert_files_match_truth(dataset)
+    assert len(dataset["signal"]) == 4
+    assert list(dataset["input_data"].keys()) == ["0", "1"]
+    assert dataset["params"]["profile_bias_module_params"] == \
         {"kernel_sizes": [1, 1]}
-    # the second task has more reads in the same peaks
-    chrom, start, end, _, summit = two_tasks["peak_rows"][0]
+    # with this seed the second task has more reads in the first peak
+    chrom, start, end, _, summit = dataset["peak_rows"][0]
     window = slice(start + summit - 60, start + summit + 61)
-    t0 = sum(two_tasks["tracks"][p][chrom][window].sum()
-             for p in two_tasks["signal"][:2])
-    t1 = sum(two_tasks["tracks"][p][chrom][window].sum()
-             for p in two_tasks["signal"][2:])
+    t0 = sum(dataset["tracks"][p][chrom][window].sum()
+             for p in dataset["signal"][:2])
+    t1 = sum(dataset["tracks"][p][chrom][window].sum()
+             for p in dataset["signal"][2:])
     assert t1 > t0
+
+
+def test_chromosome_length_not_a_multiple_of_the_fasta_line(tmp_path):
+    dataset = synth.make_dataset(str(tmp_path), chrom_len=20003,
+                                 n_peaks=30, n_background=30)
+    assert_files_match_truth(dataset)
+
+
+def test_invalid_arguments(tmp_path):
+    with pytest.raises(ValueError):
+        synth.make_dataset(str(tmp_path / "a"), chroms=("chr1", "chr2"))
+    with pytest.raises(ValueError):
+        synth.make_dataset(str(tmp_path / "b"), n_peaks=0)
+    with pytest.raises(ValueError):
+        synth.make_dataset(str(tmp_path / "c"), input_len=306,
+                           output_len=400)
+    # nothing is written for a rejected request
+    assert not any((tmp_path / d).exists() for d in "abc")
+
+
+def test_all_zero_bigwig_can_be_read(tmp_path):
+    path = str(tmp_path / "zeros.bw")
+    sizes = {"chr1": 50, "chr2": 30}
+    synth.write_bigwig(path, sizes, {c: np.zeros(n) for c, n in sizes.items()})
+    for chrom, n in sizes.items():
+        values = read_raw(path, chrom, n)
+        assert values.shape == (n,)
+        assert not np.nan_to_num(values).any()
