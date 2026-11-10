@@ -55,6 +55,7 @@ from numpy.random import seed
 seed(1234)
 
 import hashlib
+import itertools
 import json
 import logging
 import multiprocessing as mp
@@ -72,6 +73,7 @@ from bpnet.generators import windows
 from bpnet.utils.exceptionhandler import NoTracebackException
 from bpnet.utils.misc import gaussian1D_smoothing
 from contextlib import contextmanager
+from multiprocessing.connection import Connection
 from queue import Empty, Full, Queue
 from threading import RLock, Thread
 import time
@@ -153,14 +155,20 @@ class Epoch(object):
         #: held while the workers of the epoch are being stopped
         self.lock = RLock()
         #: a pipe that nothing is written to. The consumer holds the 
-        #: writing end for as long as the epoch lasts, and no other 
-        #: process does (a process that is forked from the consumer 
-        #: gives up its copy, see _CONSUMER_HANDLES); every worker 
-        #: gets the reading end, and finds the end of the data there 
-        #: once the consumer is gone (see Consumer).
-        with _CONSUMER_HANDLES_LOCK:
-            self.alive_reader, self.alive_writer = mp.Pipe(duplex=False)
-            _CONSUMER_HANDLES.add(self.alive_writer)
+        #: writing end (a file descriptor) for as long as the epoch 
+        #: lasts, and no other process does: a process that is 
+        #: forked from the consumer gives up its copy (see 
+        #: _CONSUMER_PIPES). Every worker gets the reading end, and 
+        #: finds the end of the data there once the consumer is gone 
+        #: (see Consumer).
+        self._alive = object()
+        # (also when the record of the epoch is dropped without 
+        # close())
+        self._give_up = weakref.finalize(
+            self, _close_consumer_pipe, self._alive)
+        self._give_up.atexit = False
+        reading, self.alive_writer = _make_consumer_pipe(self._alive)
+        self.alive_reader = Connection(reading, writable=False)
 
     def close(self):
         """
@@ -168,9 +176,7 @@ class Epoch(object):
             consumer is there (after the workers have ended)
         """
         
-        with _CONSUMER_HANDLES_LOCK:
-            self.alive_writer.close()
-            _CONSUMER_HANDLES.discard(self.alive_writer)
+        self._give_up()
         self.alive_reader.close()
 
 
@@ -182,46 +188,100 @@ _EPOCHS = []
 _EPOCHS_LOCK = RLock()
 
 
-#: the handles that stand for this process as the consumer of an 
-#: epoch (Epoch.alive_writer: the writing ends of the pipes the 
-#: workers look at), and the lock under which such a handle is made 
-#: and recorded, or closed. A fork takes the lock too. So a forked 
-#: process knows every such handle of its parent, whatever the 
-#: parent was doing in its other threads, and gives all of them up: 
-#: otherwise the workers of the parent would take it for their 
-#: consumer once the parent is gone. (The handles are not kept alive 
-#: by being recorded.)
-_CONSUMER_HANDLES = weakref.WeakSet()
-_CONSUMER_HANDLES_LOCK = RLock()
+#: The pipes that stand for this process as the consumer of an epoch 
+#: (see Epoch): a token of the epoch -> (reading end, writing end), 
+#: as file descriptors. A process that is forked from this one finds 
+#: all of them here and closes its copies of the writing ends: 
+#: otherwise the workers of this process would take it for their 
+#: consumer once this process is gone. For that, no fork may fall 
+#: between making a pipe and recording it:
+#: 
+#: - a fork takes the lock under which pipes are made and recorded 
+#:   (_before_a_fork), so that one from another thread waits;
+#: - a pipe is made and recorded by one call that runs no Python 
+#:   code (_make_consumer_pipe), so that no signal handler of the 
+#:   same thread, which could fork, runs in between.
+_CONSUMER_PIPES = {}
+_CONSUMER_PIPES_LOCK = RLock()
+
+
+def _pipes():
+    """
+        Returns:
+            iterator: its only item is a new pipe, (reading end, 
+                writing end), made when the item is taken
+    """
+    
+    return itertools.starmap(os.pipe, [()])
+
+
+def _make_consumer_pipe(token):
+    """
+        Make a pipe and record it in _CONSUMER_PIPES
+        
+        Args:
+            token: the key of the record
+        
+        Returns:
+            tuple: (reading end, writing end)
+    """
+    
+    with _CONSUMER_PIPES_LOCK:
+        # dict.update() takes the item from the iterators and stores 
+        # it without returning to Python code: signal handlers run 
+        # between Python instructions only
+        _CONSUMER_PIPES.update(zip([token], _pipes()))
+    return _CONSUMER_PIPES[token]
+
+
+def _close_consumer_pipe(token):
+    """
+        Forget a pipe of _CONSUMER_PIPES and close its writing end 
+        (no error if it was forgotten before)
+        
+        The record goes first. A process that is forked right after 
+        that keeps a writing end of an epoch whose workers have 
+        ended, which harms nobody. In the other order it could close 
+        a descriptor that was closed here and given to another file 
+        since.
+    """
+    
+    with _CONSUMER_PIPES_LOCK:
+        fds = _CONSUMER_PIPES.pop(token, None)
+        if fds is not None:
+            try:
+                os.close(fds[1])
+            except OSError:  # pragma: no cover
+                pass
 
 
 def _before_a_fork():
-    _CONSUMER_HANDLES_LOCK.acquire()
+    _CONSUMER_PIPES_LOCK.acquire()
 
 
 def _after_a_fork():
-    _CONSUMER_HANDLES_LOCK.release()
+    _CONSUMER_PIPES_LOCK.release()
 
 
 def _forget_the_epochs_of_the_parent():
     """
         In a forked process: the epochs of the parent are not this 
-        process's to stop, and the lock may have been held by a 
-        thread that does not exist here. The process is not the 
-        consumer of those epochs either: it closes its copies of 
-        the handles that stand for the consumer.
+        process's to stop, and the locks may be held by threads that 
+        do not exist here. The process is not the consumer of those 
+        epochs either: it closes its copies of the writing ends of 
+        their pipes.
     """
     
-    global _EPOCHS_LOCK, _CONSUMER_HANDLES_LOCK
+    global _EPOCHS_LOCK, _CONSUMER_PIPES_LOCK
     _EPOCHS_LOCK = RLock()
     del _EPOCHS[:]
-    for handle in list(_CONSUMER_HANDLES):
+    for reading, writing in list(_CONSUMER_PIPES.values()):
         try:
-            handle.close()
+            os.close(writing)
         except OSError:  # pragma: no cover
             pass
-    _CONSUMER_HANDLES.clear()
-    _CONSUMER_HANDLES_LOCK = RLock()
+    _CONSUMER_PIPES.clear()
+    _CONSUMER_PIPES_LOCK = RLock()
 
 
 if hasattr(os, 'register_at_fork'):
@@ -296,7 +356,7 @@ class Consumer(object):
         - its parent process is no longer the one that started it. 
           With the "fork" and "spawn" start methods of 
           multiprocessing the parent is the consumer.
-        - the pipe of the epoch (Epoch.alive_writer) is at its end: 
+        - the pipe of the epoch (Epoch.alive_reader) is at its end: 
           the consumer, the only process with the writing end, is 
           gone. This also works with the "forkserver" start method, 
           where the parent of a worker is the fork server, which 
