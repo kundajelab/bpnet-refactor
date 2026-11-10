@@ -151,6 +151,22 @@ class Epoch(object):
         self.stopped = False
         #: held while the workers of the epoch are being stopped
         self.lock = RLock()
+        #: a pipe that nothing is written to. The consumer holds the 
+        #: writing end for as long as the epoch lasts, and no other 
+        #: process does (a process that is forked from the consumer 
+        #: gives up its copy, see _forget_the_epochs_of_the_parent); 
+        #: every worker gets the reading end, and finds the end of 
+        #: the data there once the consumer is gone (see Consumer).
+        self.alive_reader, self.alive_writer = mp.Pipe(duplex=False)
+
+    def close(self):
+        """
+            Give up the pipe that shows the workers that their 
+            consumer is there (after the workers have ended)
+        """
+        
+        self.alive_writer.close()
+        self.alive_reader.close()
 
 
 #: the epochs that are under way in this process, and the lock for 
@@ -166,10 +182,21 @@ def _forget_the_epochs_of_the_parent():
         In a forked process: the epochs of the parent are not this 
         process's to stop, and the lock may have been held by a 
         thread that does not exist here
+        
+        The process is not the consumer of those epochs either: it 
+        closes its copies of the handles that stand for the consumer 
+        (Epoch.alive_writer). Otherwise the workers of the parent 
+        would take this process for their consumer when the parent 
+        is gone.
     """
     
     global _EPOCHS_LOCK
     _EPOCHS_LOCK = RLock()
+    for epoch in _EPOCHS:
+        try:
+            epoch.alive_writer.close()
+        except OSError:  # pragma: no cover
+            pass
     del _EPOCHS[:]
 
 
@@ -230,6 +257,52 @@ def close_reading_end(mpq):
         return False
     reader.close()
     return True
+
+
+class Consumer(object):
+    """
+        In a worker process: the process that takes its batches, and 
+        whether it is still there
+        
+        A worker whose consumer was killed (out of memory, by a 
+        scheduler) makes batches for nobody, and can wait forever 
+        for room in its queue. It finds out in two ways:
+        
+        - its parent process is no longer the one that started it. 
+          With the "fork" and "spawn" start methods of 
+          multiprocessing the parent is the consumer.
+        - the pipe of the epoch (Epoch.alive_writer) is at its end: 
+          the consumer, the only process with the writing end, is 
+          gone. This also works with the "forkserver" start method, 
+          where the parent of a worker is the fork server, which 
+          outlives the consumer.
+        
+        Args:
+            alive (multiprocessing.connection.Connection): the 
+                reading end of the pipe of the epoch (None: only the 
+                parent process is looked at)
+    """
+    
+    def __init__(self, alive=None):
+        self.parent = os.getppid()
+        self.alive = alive
+    
+    def gone(self):
+        """
+            Returns:
+                bool: True if the consumer has ended
+        """
+        
+        if os.getppid() != self.parent:
+            return True
+        if self.alive is None:
+            return False
+        try:
+            # nothing is ever written to the pipe: what can be read 
+            # from it is its end
+            return bool(self.alive.poll())
+        except (EOFError, OSError):
+            return True
 
 
 def stop_workers(epoch):
@@ -906,7 +979,7 @@ class MSequenceGenerator:
         """
         raise NotImplementedError("Method not implemented.")
 
-    def _proc_target(self, coords_df, mpq, proc_idx):
+    def _proc_target(self, coords_df, mpq, proc_idx, alive=None):
         """
             Function that will be executed in a separate process.
             Takes a dataframe of peak coordinates and parses them in 
@@ -919,13 +992,16 @@ class MSequenceGenerator:
                 
                 mpq (multiprocessing.Queue): The multiprocessing queue
                     to hold the batches
+                
+                proc_idx (int): number of the worker
+                
+                alive (multiprocessing.connection.Connection): the 
+                    reading end of the pipe that shows whether the 
+                    process that takes the batches is still there 
+                    (see Consumer)
         """
         
-        # The process that started this one takes its batches. (With 
-        # the "forkserver" start method the parent is the fork 
-        # server, which outlives the consumer: then the check below 
-        # never finds the consumer gone, as before there was a check.)
-        consumer = os.getppid()
+        consumer = Consumer(alive)
         close_reading_end(mpq)
         
         # divide the coordinates dataframe into batches
@@ -940,7 +1016,7 @@ class MSequenceGenerator:
                 # the process that takes the batches is gone (it was 
                 # killed, for example): nobody waits for the rest, 
                 # and what is in the queue cannot be handed over
-                if os.getppid() != consumer:
+                if consumer.gone():
                     mpq.cancel_join_thread()
                     return
                     
@@ -989,8 +1065,8 @@ class MSequenceGenerator:
                 
                 item: what to put
                 
-                consumer (int): id of the process that takes the 
-                    batches (the parent of the worker)
+                consumer (Consumer): the process that takes the 
+                    batches
                 
             Returns:
                 bool: False if the consumer is gone; the worker has 
@@ -1002,7 +1078,11 @@ class MSequenceGenerator:
                 mpq.put(item, timeout=WORKER_POLL_SECONDS)
                 return True
             except Full:
-                if os.getppid() != consumer:
+                # A worker that waits here may have nothing left to 
+                # write (small batches are in the pipe at once), so 
+                # that no failing write tells it that the consumer 
+                # is gone: it has to look.
+                if consumer.gone():
                     mpq.cancel_join_thread()
                     return False
 
@@ -1148,7 +1228,8 @@ class MSequenceGenerator:
                 # spawn and start the batch generation process. It is 
                 # recorded before it is started, so that the epoch 
                 # can end it whatever happens right after the start.
-                p = mp.Process(target=self._proc_target, args=[df, mpq, i])
+                p = mp.Process(target=self._proc_target, 
+                               args=[df, mpq, i, epoch.alive_reader])
                 procs.append(p)
                 mp_queues.append(mpq)
                 p.start()
@@ -1244,6 +1325,7 @@ class MSequenceGenerator:
         for mpq in epoch.mp_queues:
             if mpq is not None:
                 mpq.close()
+        epoch.close()
 
         logging.debug(
             "{} Finished join for epoch".format(self._mode))
