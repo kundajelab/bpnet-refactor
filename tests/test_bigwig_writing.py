@@ -228,6 +228,19 @@ def test_importance_bigwig(tmp_path, gzipped):
     check_file(out, HEADER, regions, list(projected), stats)
 
 
+def test_importance_bigwig_without_regions_is_an_error(tmp_path):
+    # no region on the requested chromosome: a clear error before any
+    # output file is created
+    h5_path, bed_path, sizes_path, _, _ = make_scores(
+        tmp_path, [l for l in LOCI if l[0] != "chr10"])
+    out, stats = tmp_path / "scores.bw", tmp_path / "stats.txt"
+    with pytest.raises(ValueError, match="No regions to write on "
+                       "chromosome chr10"):
+        importance_hdf5_to_bigwig(h5_path, bed_path, str(out), str(stats),
+                                  sizes_path, debug_chr="chr10")
+    assert not out.exists() and not stats.exists()
+
+
 @pytest.mark.parametrize("debug_chr", ["chr1", "chr2", "chr10"])
 def test_importance_bigwig_debug_chromosome(tmp_path, debug_chr):
     """

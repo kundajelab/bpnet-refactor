@@ -79,6 +79,11 @@ def importance_hdf5_to_bigwig(hdf5_path: str,
         order_of_regs = [x for x in order_of_regs
                          if regions[x][0] == debug_chr]
 
+    if len(order_of_regs) == 0:
+        raise ValueError(
+            "No regions to write" + (
+                " on chromosome {}".format(debug_chr) if debug_chr else ""))
+
     # regions may overlap but as we go in sorted order, for regions that overlap values are repeated used
     # from the nearest peak 
 
