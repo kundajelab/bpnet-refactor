@@ -123,6 +123,73 @@ def test_background_is_sampled_in_proportion_to_the_peaks(tasks):
     assert df["weight"].tolist() == [1] * 6 + [0] * 3
 
 
+def test_val_background_follows_random_state_1(tasks):
+    """
+        The validation background must be the same in every run: pandas
+        sample(n, random_state=1) on the background loci that fit, in
+        (chromosome, window end) order
+    """
+
+    df = sequtils.getPeakPositions(tasks, CHROM_SIZES, FLANK, mode="val")
+    pool = sorted(((c, s + m) for c, s, e, m in BACKGROUND),
+                  key=lambda locus: (locus[0], locus[1] + FLANK))
+    rows = np.random.RandomState(1).choice(len(pool), size=3, replace=False)
+    assert loci(df[df["weight"] == 0]) == [pool[i] for i in rows]
+
+
+def test_background_windows_must_fit_too(tasks, tmp_path):
+    rows = BACKGROUND + [("chr1", 0, 100, 50), ("chr2", 400, 500, 50)]
+    tasks[0]["background_loci"]["source"] = \
+        [write_bed(tmp_path / "background_edges.bed", rows)]
+    tasks[0]["background_loci"]["ratio"] = [1.0]
+    df = sequtils.getPeakPositions(tasks, CHROM_SIZES, FLANK, mode="val")
+    background = set(loci(df[df["weight"] == 0]))
+    # exactly the 6 loci that fit are available for the 6 requested
+    assert background == {(c, s + m) for c, s, e, m in BACKGROUND}
+
+
+def test_several_background_files_each_have_a_ratio(tasks, tmp_path):
+    first = write_bed(tmp_path / "bg_a.bed", BACKGROUND[:3])
+    second = write_bed(tmp_path / "bg_b.bed", BACKGROUND[3:])
+    tasks[0]["background_loci"] = {"source": [first, second],
+                                   "ratio": [0.5, 1.0 / 3]}
+    df = sequtils.getPeakPositions(tasks, CHROM_SIZES, FLANK, mode="val")
+    background = loci(df[df["weight"] == 0])
+    from_first = {(c, s + m) for c, s, e, m in BACKGROUND[:3]}
+    from_second = {(c, s + m) for c, s, e, m in BACKGROUND[3:]}
+    # 6 peaks: int(6 * 0.5) = 3 from the first file, int(6 / 3) = 2
+    # from the second
+    assert len([b for b in background if b in from_first]) == 3
+    assert len([b for b in background if b in from_second]) == 2
+
+
+def test_a_locus_listed_as_peak_and_background_is_kept_twice(tasks, tmp_path):
+    # same position, different weights: not a duplicate
+    overlap = [("chr1", 150, 250, 50)] + BACKGROUND[:2]
+    tasks[0]["background_loci"] = {
+        "source": [write_bed(tmp_path / "bg_overlap.bed", overlap)],
+        "ratio": [0.5]}
+    df = sequtils.getPeakPositions(tasks, CHROM_SIZES, FLANK, mode="val",
+                                   drop_duplicates=True)
+    assert len(df[df["weight"] == 0]) == 3
+    both = df[(df["chrom"] == "chr1") & (df["pos"] == 200)]
+    assert sorted(both["weight"].tolist()) == [0, 1]
+
+
+def test_background_count_with_several_peak_files(tasks, tmp_path):
+    """
+        With several peak files in a task, the background count is taken
+        from the peak file that was read last, not from the total
+    """
+
+    small = write_bed(tmp_path / "two_peaks.bed", PEAKS[5:7])
+    tasks[0]["loci"]["source"] = [tasks[0]["loci"]["source"][0], small]
+    tasks[0]["background_loci"]["ratio"] = [1.0]
+    df = sequtils.getPeakPositions(tasks, CHROM_SIZES, FLANK, mode="val")
+    assert (df["weight"] == 1).sum() == len(VALID_PEAKS) + 2
+    assert (df["weight"] == 0).sum() == 2
+
+
 def test_background_count_follows_the_chromosome_filter(tasks):
     df = sequtils.getPeakPositions(tasks, CHROM_SIZES, FLANK,
                                    chroms=["chr1"], mode="val")

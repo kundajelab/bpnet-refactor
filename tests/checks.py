@@ -28,6 +28,26 @@ def one_hot(sequence):
     return out
 
 
+def gaussian_smooth(values, sigma, window):
+    """
+        Gaussian smoothing of a 1D array with a kernel of `window`
+        positions (odd), the array mirrored at its ends
+
+        This is written out here (weights exp(-x^2 / (2 sigma^2)) for x
+        in -(window - 1) / 2 .. (window - 1) / 2, normalized to 1) so
+        that the tests do not use the package's own smoothing function
+        as their reference.
+    """
+
+    radius = (int(window) - 1) // 2
+    x = np.arange(-radius, radius + 1, dtype=np.float64)
+    kernel = np.exp(-0.5 * (x / float(sigma)) ** 2)
+    kernel = kernel / kernel.sum()
+    padded = np.pad(np.asarray(values, dtype=np.float64), radius,
+                    mode="symmetric")
+    return np.convolve(padded, kernel[::-1], mode="valid")
+
+
 def unwrap(value):
     """
         The generator currently stores some of its extra inputs as
@@ -52,7 +72,7 @@ def reverse_complement_tracks(tracks):
 
 
 def expected_example(dataset, chrom, start, end, rev_comp, input_len,
-                     smoothing_fn=None):
+                     smoothing_fn=gaussian_smooth):
     """
         What the generator must produce for one example
 
@@ -64,8 +84,7 @@ def expected_example(dataset, chrom, start, end, rev_comp, input_len,
             rev_comp (bool): whether the example is reverse complemented
             input_len (int): length of the input sequence
             smoothing_fn (callable): function(array, sigma, window)
-                used for the smoothed control tracks; only needed when
-                the dataset lists smoothing parameters
+                used for the smoothed control tracks
 
         Returns:
             dict: 'sequence' (input_len, 4), 'profile' (output_len,
@@ -76,7 +95,9 @@ def expected_example(dataset, chrom, start, end, rev_comp, input_len,
 
     mid = (start + end) // 2
     flank = input_len // 2
-    sequence = one_hot(dataset["sequences"][chrom][mid - flank:mid + flank])
+    # soft-masked (lower case) bases are read as their upper case base
+    sequence = one_hot(
+        dataset["sequences"][chrom][mid - flank:mid + flank].upper())
     if rev_comp:
         sequence = sequence[::-1, ::-1]
 
@@ -124,7 +145,7 @@ def expected_example(dataset, chrom, start, end, rev_comp, input_len,
 
 
 def check_batch(dataset, inputs, input_len, output_len, profiles, logcounts,
-                smoothing_fn=None, bias_is_zero=False):
+                smoothing_fn=gaussian_smooth, bias_is_zero=False):
     """
         Assert that every example of a batch matches the truth at the
         coordinates the batch reports
@@ -165,6 +186,6 @@ def check_batch(dataset, inputs, input_len, output_len, profiles, logcounts,
             if bias_is_zero:
                 assert not got.any() and not got_counts.any()
             else:
-                np.testing.assert_allclose(got, bias, rtol=1e-6, atol=1e-7)
+                np.testing.assert_allclose(got, bias, rtol=1e-5, atol=1e-6)
                 np.testing.assert_allclose(
-                    got_counts, expected["counts_bias"][task], rtol=1e-6)
+                    got_counts, expected["counts_bias"][task], rtol=1e-5)

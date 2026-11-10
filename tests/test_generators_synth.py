@@ -4,7 +4,12 @@
     checked against the arrays the dataset builder wrote.
 
     These tests describe the behaviour of the generator as it is, so
-    that a later change of the data path can be shown to keep it.
+    that a later change of the data path can be shown to keep it. Two
+    kinds of statements are made here: training semantics that any
+    replacement must keep (which loci form an epoch, what a batch
+    contains, jitter, reverse complement, weights), and details of
+    this class's interface (per epoch dataframes, tuple or array
+    types, float64 inputs) that only this legacy class has to keep.
 """
 
 import json
@@ -19,7 +24,7 @@ from bpnet.utils.exceptionhandler import NoTracebackException
 from bpnet.utils.misc import gaussian1D_smoothing
 
 from tests import synth
-from tests.checks import check_batch, unwrap
+from tests.checks import check_batch, gaussian_smooth, unwrap
 
 
 def make_generator(dataset, mode, chroms=("chr1",), rev_comp_aug=None,
@@ -140,6 +145,56 @@ def test_val_samples_are_the_same_every_epoch(synth_dataset):
     assert other.get_resized_samples()[0].equals(first)
 
 
+def test_val_trim_follows_random_state_1(synth_dataset):
+    """
+        The validation set must be the same in every run, so the choice
+        of which loci are trimmed is part of the behaviour: pandas
+        sample(n, random_state=1), i.e. RandomState(1).choice without
+        replacement
+    """
+
+    gen = make_generator(synth_dataset, "val", epochs=1)
+    samples = gen.get_samples()[0]
+    n = gen.get_resized_samples_len()
+    assert n < len(samples)
+    rows = np.random.RandomState(1).choice(len(samples), size=n,
+                                           replace=False)
+    assert gen.get_resized_samples()[0].equals(samples.iloc[rows])
+
+
+def test_train_trim_is_a_random_subset(synth_dataset):
+    gen = make_generator(synth_dataset, "train", epochs=12)
+    dropped_sets = []
+    for samples, resized in zip(gen.get_samples(),
+                                gen.get_resized_samples()):
+        dropped = samples.drop(resized.index)
+        assert len(dropped) == len(samples) - len(resized) > 0
+        # foreground loci are dropped as well (not just the tail of
+        # the table, where the background is)
+        assert (dropped["weight"] == 1).any()
+        dropped_sets.append(frozenset(zip(dropped["chrom"], dropped["pos"])))
+    assert len(set(dropped_sets)) == len(dropped_sets)
+
+
+def test_each_training_epoch_emits_its_own_samples(synth_dataset):
+    gen = make_generator(synth_dataset, "train", epochs=3)
+    emitted_background = []
+    for epoch in range(3):
+        samples = gen.get_samples()[epoch]
+        resized = gen.get_resized_samples()[epoch]
+        seen = []
+        for inputs, _, weights in gen.gen():
+            half = len(weights) // 2
+            seen.extend(unwrap(inputs["index"])[:half].tolist())
+        assert sorted(seen) == sorted(resized.index.tolist())
+        background = samples.loc[seen]
+        background = background[background["weight"] == 0]
+        emitted_background.append(
+            frozenset(zip(background["chrom"], background["pos"])))
+    # the background that reaches the model changes from epoch to epoch
+    assert len(set(emitted_background)) == 3
+
+
 def test_test_mode_uses_no_background(synth_dataset):
     gen = make_generator(synth_dataset, "test")
     samples = gen.get_samples()[0]
@@ -177,6 +232,26 @@ def test_trim_rule(synth_dataset, num_threads, batch_size):
     # this dataset has 114 samples on chr1: 2 x 64 and 4 x 64 do not fit
     if num_threads * batch_size > n:
         assert expected_batch < batch_size
+
+
+def test_thread_count_is_reduced_when_batch_size_one_does_not_fit(tmp_path):
+    dataset = synth.make_dataset(str(tmp_path), chrom_len=20000, n_peaks=9,
+                                 n_background=9)
+    gen = make_generator(dataset, "val", chroms=["chr1"], num_threads=8,
+                         batch_size=4)
+    n = gen.get_samples_len()
+    assert 0 < n < 8
+    # batch size goes 4 -> 2 -> 1, then threads go down until
+    # threads * 1 <= number of samples
+    assert gen._batch_size == 1
+    assert gen._num_threads == n
+    assert gen.get_resized_samples_len() == n
+    batches = list(gen.gen())
+    assert len(batches) == n
+    for inputs, outputs, weights in batches:
+        check_batch(dataset, inputs, dataset["input_len"],
+                    dataset["output_len"], outputs["profile_predictions"],
+                    outputs["logcounts_predictions"])
 
 
 def test_no_samples_raises(synth_dataset):
@@ -256,6 +331,47 @@ def test_jitter_covers_the_range(synth_dataset):
             values.update(jitters[weights != 0].tolist())
     # both ends of the range are included
     assert values == set(range(-max_jitter, max_jitter + 1))
+
+
+def test_forward_and_reverse_copies_are_jittered_independently(synth_dataset):
+    """
+        Every combination of (forward jitter, reverse complement jitter)
+        occurs, which rules out a fixed relation between the two (equal,
+        mirrored, shifted); and the two are uncorrelated
+    """
+
+    max_jitter = 2
+    gen = make_generator(synth_dataset, "train", max_jitter=max_jitter,
+                         epochs=8)
+    pairs = []
+    for _ in range(8):
+        for inputs, _, weights in gen.gen():
+            jitters = unwrap(inputs["jitters"])
+            half = len(weights) // 2
+            keep = weights[:half] != 0
+            pairs.extend(zip(jitters[:half][keep].tolist(),
+                             jitters[half:][keep].tolist()))
+    values = range(-max_jitter, max_jitter + 1)
+    assert set(pairs) == {(a, b) for a in values for b in values}
+    forward, reverse = np.array(pairs).T
+    assert abs(np.corrcoef(forward, reverse)[0, 1]) < 0.25
+
+
+@pytest.mark.parametrize("mode", ["val", "test"])
+def test_no_jitter_outside_training(synth_dataset, mode):
+    """
+        A jitter setting is ignored in val and test mode: windows are
+        centred on the peak positions
+    """
+
+    gen = make_generator(synth_dataset, mode, max_jitter=16, epochs=1)
+    expected = set(zip(gen.get_resized_samples()[0]["chrom"],
+                       gen.get_resized_samples()[0]["pos"]))
+    seen = set()
+    for batch in gen.gen():
+        inputs = batch if mode == "test" else batch[0]
+        seen.update(positions(inputs, synth_dataset["output_len"]))
+    assert seen == expected
 
 
 def test_reverse_complement_copy_without_jitter(synth_dataset):
@@ -357,9 +473,29 @@ def test_sample_weights_are_configurable(synth_dataset):
         jitters = unwrap(inputs["jitters"])
         if jitters[weights == 0.5].any():
             jittered_background = True
+        # status is -1 only for weight 0
+        assert (unwrap(inputs["status"]) == 1).all()
     assert values == {2.0, 0.5}
     # jitter applies to every locus whose weight is not zero
     assert jittered_background
+
+
+def test_status_and_jitter_follow_the_weight_not_the_class(synth_dataset):
+    # foreground loci with weight 0 are treated like background: status
+    # -1 and no jitter
+    gen = make_generator(synth_dataset, "train", epochs=1,
+                         foreground_weight=0.0, background_weight=3.0)
+    samples = gen.get_samples()[0]
+    peaks = set(loci_on(synth_dataset, "peak_rows", ["chr1"]))
+    for inputs, _, weights in gen.gen():
+        index = unwrap(inputs["index"])
+        jitters = unwrap(inputs["jitters"])
+        status = unwrap(inputs["status"])
+        is_peak = np.array([p in peaks for p in zip(
+            samples.loc[index, "chrom"], samples.loc[index, "pos"])])
+        assert np.array_equal(weights, np.where(is_peak, 0.0, 3.0))
+        assert np.array_equal(status, np.where(is_peak, -1, 1))
+        assert not jitters[is_peak].any()
 
 
 def test_order_without_shuffle_single_thread(synth_dataset):
@@ -413,17 +549,37 @@ SMALL = dict(chrom_len=20000, n_peaks=60, n_background=60)
 
 
 def all_batches_match(dataset, mode, **kwargs):
-    smoothing_fn = kwargs.pop("smoothing_fn", None)
+    """
+        Every batch of one epoch over all chromosomes matches the truth;
+        in train mode every batch holds each of its loci forward and
+        reverse complemented. Returns the last batch's inputs and
+        profiles.
+    """
+
     gen = make_generator(dataset, mode, chroms=None, batch_size=8,
                          epochs=1, **kwargs)
-    n = 0
+    resized = gen.get_resized_samples()[0]
+    n, seen = 0, []
     for batch in gen.gen():
-        inputs, profiles, logcounts, _ = targets(batch, mode)
+        inputs, profiles, logcounts, weights = targets(batch, mode)
         check_batch(dataset, inputs, dataset["input_len"],
-                    dataset["output_len"], profiles, logcounts,
-                    smoothing_fn=smoothing_fn)
+                    dataset["output_len"], profiles, logcounts)
+        if mode == "train":
+            assert len(profiles) == 2 * gen._batch_size
+            half = gen._batch_size
+            assert unwrap(inputs["rev_comp"]).tolist() == \
+                [0] * half + [1] * half
+            assert np.array_equal(unwrap(inputs["index"])[:half],
+                                  unwrap(inputs["index"])[half:])
+            seen.extend(positions(inputs, dataset["output_len"],
+                                  unwrap(inputs["jitters"]))[:half])
+        else:
+            assert len(profiles) == gen._batch_size
+            seen.extend(positions(inputs, dataset["output_len"]))
         n += 1
     assert n == gen.len() > 0
+    # the loci of the epoch, each as often as the plan says
+    assert sorted(seen) == sorted(zip(resized["chrom"], resized["pos"]))
     return inputs, profiles
 
 
@@ -479,11 +635,56 @@ def test_smoothed_control_tracks(tmp_path, smoothing):
 
     n_channels = 2 + sum(1 for s in smoothing if s is not None)
     for mode in ("train", "test"):
-        inputs, _ = all_batches_match(
-            dataset, mode, input_json=input_json,
-            smoothing_fn=gaussian1D_smoothing)
+        inputs, _ = all_batches_match(dataset, mode, input_json=input_json)
         assert inputs["profile_bias_input_0"].shape[2] == n_channels
         assert inputs["counts_bias_input_0"].shape[1] == n_channels
+        # the smoothed channel is not a copy of the raw one
+        assert not np.array_equal(inputs["profile_bias_input_0"][:, :, 2],
+                                  inputs["profile_bias_input_0"][:, :, 0])
+
+
+@pytest.mark.parametrize("sigma,window", [(7.0, 81), (3.0, 21), (5.0, 41),
+                                          (2.0, 40), (1.0, 5)])
+def test_smoothing_function_matches_an_independent_kernel(sigma, window):
+    rng = np.random.RandomState(0)
+    values = rng.poisson(2.0, size=300).astype(np.float32)
+    np.testing.assert_allclose(
+        gaussian1D_smoothing(values, sigma, window),
+        gaussian_smooth(values, sigma, window), rtol=1e-5, atol=1e-6)
+    # smoothing keeps the mean level and mirrors the array at its ends
+    assert abs(gaussian1D_smoothing(values, sigma, window).mean()
+               - values.mean()) < 0.05 * values.mean()
+
+
+def test_soft_masked_genome_is_read_as_upper_case(tmp_path):
+    dataset = synth.make_dataset(str(tmp_path), **SMALL)
+    # lower-case two thirds of every chromosome, as in a soft-masked
+    # genome; the index stays valid because the layout is unchanged
+    masked = {}
+    for chrom, sequence in dataset["sequences"].items():
+        n = len(sequence)
+        masked[chrom] = sequence[:n // 3].lower() + sequence[n // 3:2 * n // 3] \
+            + sequence[2 * n // 3:].lower()
+    synth.write_fasta(dataset["fasta"], masked)
+    dataset["sequences"] = masked
+    for mode in ("train", "test"):
+        inputs, _ = all_batches_match(dataset, mode)
+        # all bases are known, so every position is one hot
+        assert inputs["sequence"].sum() == inputs["sequence"].shape[0] * \
+            dataset["input_len"]
+
+
+def test_fractional_coverage(tmp_path):
+    dataset = synth.make_dataset(str(tmp_path), **SMALL)
+    sizes = {c: dataset["chrom_len"] for c in dataset["chroms"]}
+    for path in dataset["signal"] + dataset["control"]:
+        # multiples of 0.25 are exact in the bigWig's float32
+        scaled = {c: v * 0.25 for c, v in dataset["tracks"][path].items()}
+        synth.write_bigwig(path, sizes, scaled)
+        dataset["tracks"][path] = scaled
+    for mode in ("train", "test"):
+        _, profiles = all_batches_match(dataset, mode)
+        assert (profiles % 1 != 0).any()
 
 
 # --------------------------------------------------------------------
@@ -533,7 +734,7 @@ def test_accessors(synth_dataset):
 # --------------------------------------------------------------------
 
 def test_generator_names():
-    assert generators.list_generator_names() == ["BPNet"]
+    assert "BPNet" in generators.list_generator_names()
     assert generators.find_generator_by_name("BPNet") == \
         "MBPNetSequenceGenerator"
     assert generators.find_generator_by_name("NoSuchGenerator") is None
@@ -580,6 +781,12 @@ def test_more_than_two_signal_files_is_an_error(tmp_path):
                    "flank only, so jitter can move a window of a locus "
                    "near a chromosome end outside the chromosome")
 def test_jittered_windows_stay_inside_the_chromosome(tmp_path):
+    """
+        Whatever a fix does with a locus that is closer to a chromosome
+        end than input flank + jitter (drop it, or limit its jitter), no
+        window that reaches the model may leave the chromosome
+    """
+
     import random
     import pandas as pd
 
@@ -587,9 +794,12 @@ def test_jittered_windows_stay_inside_the_chromosome(tmp_path):
     flank = dataset["input_len"] // 2
     max_jitter = 16
 
-    # one locus whose unjittered input window starts 5 bases into chr1
+    # the safe peaks of the dataset plus one whose unjittered input
+    # window starts 5 bases into chr1
+    rows = list(dataset["peak_rows"]) + \
+        [("chr1", flank - 45, flank + 55, 1.0, 50)]
     edge_bed = os.path.join(str(tmp_path), "edge.bed")
-    synth.write_narrowpeak(edge_bed, [("chr1", flank - 45, flank + 55, 1.0, 50)])
+    synth.write_narrowpeak(edge_bed, rows)
     tasks = json.loads(json.dumps(dataset["input_data"]))
     tasks["0"]["loci"]["source"] = [edge_bed]
     del tasks["0"]["background_loci"]
@@ -601,12 +811,15 @@ def test_jittered_windows_stay_inside_the_chromosome(tmp_path):
                          rev_comp_aug=False, num_threads=1, batch_size=1,
                          epochs=1, input_json=input_json)
     samples = gen.get_samples()[0]
+    near_end = samples[samples["pos"] < flank + max_jitter]
     random.seed(0)
     for _ in range(100):
+        if len(near_end) == 0:
+            break
         coords = pd.DataFrame({
-            "chrom": samples["chrom"].values, "pos": samples["pos"].values,
-            "weight": samples["weight"].values, "status": 1,
-            "idx": samples.index.values})
+            "chrom": near_end["chrom"].values, "pos": near_end["pos"].values,
+            "weight": near_end["weight"].values, "status": 1,
+            "idx": near_end.index.values})
         inputs, _, _ = gen._generate_batch(coords)
         for chrom, start, end in inputs["coordinates"]:
             mid = (int(start) + int(end)) // 2
