@@ -67,44 +67,11 @@ import pyfaidx
 import re
 
 from bpnet.generators import sequtils
+from bpnet.generators import windows
 from bpnet.utils.exceptionhandler import NoTracebackException
 from bpnet.utils.misc import gaussian1D_smoothing
 from queue import Queue
 from threading import Thread
-
-
-def interval_values(bigwig, chrom, start, end):
-    """
-        The values of a bigWig file in an interval, with zero at the 
-        positions that have no data
-        
-        pyBigWig hands the values over as a float32 array (the type 
-        they have in the file) when it was built with numpy; without, 
-        it returns a Python list of floats that numpy converts again, 
-        which takes several times longer. Both give the same numbers 
-        once they are stored in a float32 array.
-        
-        Args:
-            bigwig (pyBigWig.bigWigFile): an open bigWig file
-            chrom (str): chromosome
-            start (int): start of the interval
-            end (int): end of the interval (exclusive)
-            
-        Returns:
-            numpy.ndarray: one value per position
-    """
-    
-    if pyBigWig.numpy:
-        values = bigwig.values(chrom, start, end, numpy=True)
-        # a file without any data has nothing to return: pyBigWig 
-        # 0.3.22 then hands back an array without dimensions and with 
-        # arbitrary content. Anything but a row of values is read the 
-        # other way, which gives an empty result as it always did
-        if values.ndim == 1:
-            values[np.isnan(values)] = 0.0
-            return values
-    
-    return np.nan_to_num(bigwig.values(chrom, start, end))
 
 
 class MSequenceGenerator:
@@ -972,6 +939,54 @@ class MBPNetSequenceGenerator(MSequenceGenerator):
         """
         return self.name
 
+    def _open_files(self):
+        """
+            The readers of the signal and control bigWig files of 
+            every task and the reference genome, opened the first time 
+            a process generates a batch and kept for its later batches
+            (a worker process generates all its batches of an epoch; 
+            opening the files for every batch costs time, and a file 
+            that was opened in the parent must not be read from a 
+            forked process)
+            
+            The files must not change while batches are generated 
+            from them: a process keeps reading the files it opened. 
+            (Before, every batch opened them again, so that a file 
+            replaced in the middle of an epoch went into the rest of 
+            that epoch.) The worker processes of gen() end with their 
+            epoch, and the next epoch opens the files again.
+            
+            Returns:
+                tuple: (dict task -> windows.WindowReader of its 
+                    signal files, dict task -> windows.WindowReader of 
+                    its control files, pyfaidx.Fasta)
+        """
+        
+        opened = getattr(self, '_opened_files', None)
+        if opened is None or opened[0] != os.getpid():
+            signal_readers = {}
+            bias_readers = {}
+            for task in self._tasks:
+                signal_readers[task] = windows.WindowReader(
+                    self._tasks[task]['signal']['source'])
+                bias_readers[task] = windows.WindowReader(
+                    self._tasks[task]['bias']['source'])
+            opened = (os.getpid(), signal_readers, bias_readers, 
+                      pyfaidx.Fasta(self._reference))
+            self._opened_files = opened
+        return opened[1:]
+    
+    def __getstate__(self):
+        """
+            What is pickled of a generator (for a worker process that 
+            is spawned instead of forked, for example): everything 
+            but the open files, which every process opens for itself
+        """
+        
+        state = self.__dict__.copy()
+        state.pop('_opened_files', None)
+        return state
+    
     def _generate_batch(self, coords):
         """
             Generate one batch of inputs and outputs for training BPNet
@@ -1058,31 +1073,26 @@ class MBPNetSequenceGenerator(MSequenceGenerator):
         # sample weights
         weights = coords['weight'].astype(float).values
 
-        # open all the signal and bias bigwig files and store the  
-        # file objects in a dictionary
-        signal_files = {}
-        bias_files = {}
-        for task in self._tasks:
-            signal_files[task] = []
-            for signal_file in self._tasks[task]['signal']['source']:
-                signal_files[task].append(pyBigWig.open(signal_file))
-
-            bias_files[task] = []
-            for bias_file in self._tasks[task]['bias']['source']:
-                bias_files[task].append(pyBigWig.open(bias_file))
-        
-        # reference file to fetch sequences
-        fasta_ref = pyfaidx.Fasta(self._reference)
+        # the signal and control bigWig files and the reference, opened
+        # once per process
+        signal_readers, bias_readers, fasta_ref = self._open_files()
                                           
-        # iterate over the batch
-        rowCnt = 0
-        for _, row in coords.iterrows():
+        # First pass over the batch: jitters (drawn in the order of the
+        # rows, as they always were), sequences and output windows
+        chroms = []
+        starts = []
+        rev_comp_rows = coords['rev_comp'].values
+        for chrom, pos, weight, rev_comp in zip(
+                coords['chrom'].values, coords['pos'].values, 
+                coords['weight'].values, rev_comp_rows):
+            pos = int(pos)
+            
             # randomly set a jitter value to move the peak summit 
             # slightly away from the exact center (only for samples 
             # whose weight is not 0)
             jitter = 0
             if self._mode == "train" and self._max_jitter and \
-                row['weight'] != 0:
+                weight != 0:
                 
                 jitter = random.randint(-self._max_jitter, self._max_jitter)
             
@@ -1090,60 +1100,68 @@ class MBPNetSequenceGenerator(MSequenceGenerator):
             jitters.append(jitter)
                                           
             # Step 1. get the sequence 
-            chrom = row['chrom']
             # we use self._input_flank here and not self._output_flank because
             # input_seq_len is different from output_len
-            start = row['pos'] - self._input_flank + jitter
-            end = row['pos'] + self._input_flank + jitter
+            start = pos - self._input_flank + jitter
+            end = pos + self._input_flank + jitter
             seq = fasta_ref[chrom][start:end].seq.upper()
             
-            if row['rev_comp']==1:
+            if rev_comp == 1:
                 seq = sequtils.reverse_complement_of_sequences([seq])[0]
 
             # collect all the sequences into a list
             sequences.append(seq)
             
-            start = row['pos'] - self._output_flank + jitter
-            end = row['pos'] + self._output_flank + jitter
+            start = pos - self._output_flank + jitter
+            end = pos + self._output_flank + jitter
             
             # record the start/end coordinates for this sample
             coordinates.append((chrom, start, end))
-                                    
-            # track profile tracks across all tasks
-            profile_track_idx = 0
+            chroms.append(chrom)
+            starts.append(start)
+            
+        # Second pass: the values of all windows of the batch, read 
+        # task by task, then reverse complemented and smoothed row by 
+        # row
+        num_rows = len(chroms)
+        output_len = self._output_flank * 2
+        
+        # track profile tracks across all tasks
+        profile_track_idx = 0
 
-            # iterate over each task and read the signal and bias
-            # values from the bigWig files
-            for i in range(self._num_tasks):
-                
-                cur_num_signal_files = len(signal_files[i])
-
-                # Step 2. get the profile signal value
-                for signal_file in signal_files[i]:
-                    profile_predictions[rowCnt, :, profile_track_idx] = \
-                        interval_values(signal_file, chrom, start, end)
-                        
-                    profile_track_idx += 1
-
-                if row['rev_comp']==1:
+        # iterate over each task and read the signal and bias
+        # values from the bigWig files
+        for i in range(self._num_tasks):
+            
+            cur_num_signal_files = len(signal_readers[i].paths)
+            
+            # Step 2. get the profile signal values: (rows, files, 
+            # positions) -> (rows, positions, files)
+            profile_predictions[
+                :, :, profile_track_idx:profile_track_idx + cur_num_signal_files] = \
+                signal_readers[i].read(chroms, starts, output_len).transpose(
+                    0, 2, 1)
+            profile_track_idx += cur_num_signal_files
+            
+            for rowCnt in range(num_rows):
+                if rev_comp_rows[rowCnt] == 1:
                     profile_predictions[rowCnt, :, profile_track_idx-cur_num_signal_files:profile_track_idx] = \
                         sequtils.reverse_complement_of_profiles(profile_predictions[rowCnt:rowCnt+1, :, 
                                                                                     profile_track_idx-cur_num_signal_files:profile_track_idx],
                                                                 stranded=(cur_num_signal_files==2))
+            
+            cur_num_bias_files = len(bias_readers[i].paths)
+            # Step 3. get the bias values
+            #skip setting the bias values. Initialization value of zero will be used
+            if not self._set_bias_as_zero and cur_num_bias_files>0:
+                assert(cur_num_bias_files <= 2)
                 
-                cur_num_bias_files = len(bias_files[i])
-                # Step 3. get the bias values
-                #skip setting the bias values. Initialization value of zero will be used
-                if not self._set_bias_as_zero and cur_num_bias_files>0:
-                    assert(cur_num_bias_files <= 2)
-                    bias_track_idx = 0 
+                profile_bias_input[i][:, :, 0:cur_num_bias_files] = \
+                    bias_readers[i].read(chroms, starts, output_len).transpose(
+                        0, 2, 1)
 
-                    for j in range(cur_num_bias_files):
-                        bias_file = bias_files[i][j]
-                        profile_bias_input[i][rowCnt, :, bias_track_idx] = \
-                            interval_values(bias_file, chrom, start, end)
-
-                        bias_track_idx += 1                    
+                for rowCnt in range(num_rows):
+                    bias_track_idx = cur_num_bias_files
                     
                     cur_num_smoothed_bias_files = 0
                     # add the smoothed track if 'smoothing' has been
@@ -1167,7 +1185,7 @@ class MBPNetSequenceGenerator(MSequenceGenerator):
                             bias_track_idx += 1
                             cur_num_smoothed_bias_files += 1
                     
-                    if row['rev_comp']==1:
+                    if rev_comp_rows[rowCnt] == 1:
                         profile_bias_input[i][rowCnt, :, 0:cur_num_bias_files] = \
                             sequtils.reverse_complement_of_profiles(profile_bias_input[i][rowCnt:rowCnt+1, :, 
                                                                                         0:cur_num_bias_files],
@@ -1178,10 +1196,6 @@ class MBPNetSequenceGenerator(MSequenceGenerator):
                                sequtils.reverse_complement_of_profiles(profile_bias_input[i][rowCnt:rowCnt+1, :, 
                                                                                         cur_num_bias_files:cur_num_bias_files+cur_num_smoothed_bias_files],
                                                                                         stranded=(cur_num_smoothed_bias_files==2))
-
-            rowCnt += 1
-
-        fasta_ref.close()
 
         # Step 4. one hot encode all the sequences in the batch 
         if len(sequences) == profile_predictions.shape[0]:
