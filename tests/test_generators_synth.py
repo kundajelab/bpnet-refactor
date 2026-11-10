@@ -674,17 +674,26 @@ def test_soft_masked_genome_is_read_as_upper_case(tmp_path):
             dataset["input_len"]
 
 
-def test_fractional_coverage(tmp_path):
+@pytest.mark.parametrize("factor", [0.25, 0.12345678])
+def test_fractional_coverage(tmp_path, factor):
+    """
+        Values that are not whole numbers come through exactly as the
+        bigWig holds them (float32), for signal and control tracks
+    """
+
     dataset = synth.make_dataset(str(tmp_path), **SMALL)
     sizes = {c: dataset["chrom_len"] for c in dataset["chroms"]}
     for path in dataset["signal"] + dataset["control"]:
-        # multiples of 0.25 are exact in the bigWig's float32
-        scaled = {c: v * 0.25 for c, v in dataset["tracks"][path].items()}
+        scaled = {c: (v * factor).astype(np.float32)
+                  for c, v in dataset["tracks"][path].items()}
         synth.write_bigwig(path, sizes, scaled)
         dataset["tracks"][path] = scaled
     for mode in ("train", "test"):
         _, profiles = all_batches_match(dataset, mode)
         assert (profiles % 1 != 0).any()
+        if factor != 0.25:
+            # values with more digits than a rounded copy would keep
+            assert (np.round(profiles, 4) != profiles).any()
 
 
 # --------------------------------------------------------------------

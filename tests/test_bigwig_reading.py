@@ -109,6 +109,31 @@ def test_intervals_that_cannot_be_read_fail_as_before(bigwig, chrom, start,
         generators.interval_values(bigwig, chrom, start, end)
 
 
+def test_file_without_data(tmp_path):
+    """
+        A bigWig with a header and no entries has no values to return.
+        The previous reading gave an empty array, which cannot be
+        stored into a batch; the present one must do the same (pyBigWig
+        0.3.22 returns an array without dimensions for such a file,
+        which numpy would broadcast into the batch without complaint).
+    """
+
+    path = str(tmp_path / "empty.bw")
+    bw = pyBigWig.open(path, "w")
+    bw.addHeader(CHROM_SIZES)
+    bw.close()
+    bw = pyBigWig.open(path)
+    try:
+        old = interval_values_v0(bw, "chr1", 0, 10)
+        new = generators.interval_values(bw, "chr1", 0, 10)
+        assert old.shape == new.shape == (0,)
+        for values in (old, new):
+            with pytest.raises(ValueError):
+                np.zeros(10, dtype=np.float32)[:] = values
+    finally:
+        bw.close()
+
+
 def test_pybigwig_without_numpy(bigwig, monkeypatch):
     # a pyBigWig that was built without numpy returns lists; the
     # values are the same once stored

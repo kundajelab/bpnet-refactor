@@ -96,8 +96,13 @@ def interval_values(bigwig, chrom, start, end):
     
     if pyBigWig.numpy:
         values = bigwig.values(chrom, start, end, numpy=True)
-        values[np.isnan(values)] = 0.0
-        return values
+        # a file without any data has nothing to return: pyBigWig 
+        # 0.3.22 then hands back an array without dimensions and with 
+        # arbitrary content. Anything but a row of values is read the 
+        # other way, which gives an empty result as it always did
+        if values.ndim == 1:
+            values[np.isnan(values)] = 0.0
+            return values
     
     return np.nan_to_num(bigwig.values(chrom, start, end))
 
