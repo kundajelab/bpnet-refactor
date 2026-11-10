@@ -99,6 +99,13 @@ class WorkerFailure(object):
 #: delivered a batch is still running
 WORKER_POLL_SECONDS = 1.0
 
+#: seconds between two looks of a thread that collects batches, and 
+#: waits for room in the queue of the consumer, at whether the epoch 
+#: was stopped. A stop waits for these threads (with unbounded queues 
+#: they never waited for room): with WORKER_POLL_SECONDS an 
+#: interrupted or failed training could end up to a second later.
+COLLECTOR_POLL_SECONDS = 0.1
+
 #: seconds the worker processes of an epoch get to end after they were 
 #: asked to, before they are killed
 WORKER_STOP_SECONDS = 10.0
@@ -1201,7 +1208,7 @@ class MSequenceGenerator:
                     break
             while True:
                 try:
-                    q.put(item, timeout=WORKER_POLL_SECONDS)
+                    q.put(item, timeout=COLLECTOR_POLL_SECONDS)
                     break
                 except Full:
                     if epoch is not None and epoch.stopped:

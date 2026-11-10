@@ -254,6 +254,39 @@ def stops_when_the_queues_are_full(generator, queue):
                generator.curr_epoch))
 
 
+def stops_soon_when_the_queues_are_full(generator, queue):
+    generator.made = multiprocessing.Value("i", 0)
+    batches = generator.gen()
+    next(batches)
+    made, waiting = until_the_queues_are_full(generator)
+    start = time.monotonic()
+    generator.stop()
+    queue.put((waiting, time.monotonic() - start))
+    batches.close()
+
+
+def test_stop_does_not_wait_for_the_polls_of_the_workers(synth_dataset,
+                                                         monkeypatch):
+    """
+        A stop waits for the threads that collect batches, which wait
+        for room in the queue of the consumer. They look at whether
+        the epoch was stopped every COLLECTOR_POLL_SECONDS, not every
+        WORKER_POLL_SECONDS: an interrupted or failed training ends
+        that much sooner
+    """
+
+    monkeypatch.setattr(generators, "WORKER_POLL_SECONDS", 30.0)
+    # (so that a stop would wait for threads that look every 30 s)
+    monkeypatch.setattr(generators, "WORKER_STOP_SECONDS", 60.0)
+    generator = counted_generator(synth_dataset)
+    result = outcome(generator, stops_soon_when_the_queues_are_full)
+    assert len(result) == 2, result
+    waiting, seconds = result
+    assert waiting
+    # (the workers end at once when they are asked to)
+    assert seconds < 10.0, seconds
+
+
 @pytest.mark.parametrize("scenario", [closes_when_the_queues_are_full,
                                       stops_when_the_queues_are_full])
 def test_epoch_ends_early_although_everything_waits(synth_dataset, scenario):
