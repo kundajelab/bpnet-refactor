@@ -298,7 +298,33 @@ _ONE_HOT_ROWS = np.zeros((256, 4), dtype=np.int8)
 for _column, _base in enumerate("ACGT"):
     _ONE_HOT_ROWS[ord(_base), _column] = 1
     _ONE_HOT_ROWS[ord(_base.lower()), _column] = 1
+    # the implementation this one replaced turned the letters into the
+    # digits 0 to 4 before encoding them, and so read a digit in the
+    # input as a base as well; that is kept
+    _ONE_HOT_ROWS[ord(str(_column)), _column] = 1
 _ONE_HOT_WORDS = _ONE_HOT_ROWS.view(np.uint32).reshape(256).copy()
+
+
+def _ascii_codes(text):
+    """
+        The characters of a string as bytes. Characters outside ASCII
+        become '?' (an unknown base), except decimal digits of other
+        scripts, which become the ASCII digit of the same value: the
+        implementation this one replaced read those as digits too.
+        
+        Args:
+            text (str): the joined sequences
+            
+        Returns:
+            bytes: one byte per character
+    """
+    
+    try:
+        return text.encode('ascii')
+    except UnicodeEncodeError:
+        return ''.join(
+            c if c < '\x80' else (str(int(c)) if c.isdecimal() else '?')
+            for c in text).encode('ascii')
 
 
 def one_hot_encode(sequences, seq_length, dtype=np.float64):
@@ -309,7 +335,8 @@ def one_hot_encode(sequences, seq_length, dtype=np.float64):
        A, C, G and T (in either case) are encoded in columns 0 to 3;
        every other character (N, other IUPAC ambiguity codes) is
        encoded as a row of zeros. Sequences shorter than seq_length
-       are padded with N, longer ones are truncated.
+       are padded with N, longer ones are truncated. (The digits 0 to
+       3 are read as A, C, G and T, as they always were.)
        
        Args:
            sequences (list): python list of strings
@@ -335,16 +362,13 @@ def one_hot_encode(sequences, seq_length, dtype=np.float64):
     sequences = list(map(
         fix_sequence_length, sequences, [seq_length] * len(sequences)))
 
-    # Step 1. all sequences as one array of bytes. A character outside
-    # ASCII becomes '?', which is encoded as zeros like any other
-    # unknown character
-    codes = np.frombuffer(
-        ''.join(sequences).encode('ascii', 'replace'), dtype=np.uint8)
+    # Step 1. all sequences as one array of bytes
+    codes = np.frombuffer(_ascii_codes(''.join(sequences)), dtype=np.uint8)
 
     # Step 2. look up the four columns of every base as one word, then
     # read the words as rows of four int8 values
     X = _ONE_HOT_WORDS[codes].view(np.int8).reshape(
-        len(sequences), seq_length, 4)
+        len(sequences), len(sequences[0]), 4)
 
     if np.dtype(dtype) == np.int8:
         return X

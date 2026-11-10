@@ -4,16 +4,20 @@
     code returns the same values.
 """
 
+import logging
+
 import numpy as np
 
 
 def one_hot_encode_v0(sequences, seq_length):
     """
         one_hot_encode as it was before the lookup table version
-        (bpnet/generators/sequtils.py at main@0b11a7c). It builds a
-        Python list of integers through str.translate and supports the
-        letters A C G T N Y R M S W K only; any other character raises
-        ValueError.
+        (bpnet/generators/sequtils.py at main@0b11a7c), with its helper
+        fix_sequence_length. It turns the letters A C G T N Y R M S W K
+        into the digits 0 to 4 with str.translate, converts every
+        character with int() and indexes a five row matrix with the
+        result. Any character int() does not accept raises ValueError;
+        a digit above 4 raises IndexError.
     """
 
     def fix_sequence_length(sequence, length):
@@ -22,6 +26,10 @@ def one_hot_encode_v0(sequences, seq_length):
         elif len(sequence) > length:
             sequence = sequence[:length]
         return sequence
+
+    if len(sequences) == 0:
+        logging.error("'sequences' is empty")
+        return None
 
     sequences = list(map(
         fix_sequence_length, sequences, [seq_length] * len(sequences)))

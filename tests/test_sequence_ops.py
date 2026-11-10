@@ -58,11 +58,15 @@ def test_fix_sequence_length():
     assert sequtils.fix_sequence_length("", 2) == "NN"
 
 
-@pytest.mark.parametrize("letter", list("BDHVUX-*.?") + ["\u00e9"])
+@pytest.mark.parametrize("letter", list("BDHVUX-*.? \n56789") + [
+    "\u00e9", "\u00b2", "\u0665"])
 def test_one_hot_encode_any_other_character_is_zeros(letter):
-    # the remaining IUPAC codes and anything else: zeros, like N
+    # the remaining IUPAC codes and anything else: zeros, like N. The
+    # previous implementation raised ValueError or IndexError for these
     result = sequtils.one_hot_encode(["A" + letter + "T"], 3)
     assert np.array_equal(result[0], one_hot("ANT"))
+    with pytest.raises((ValueError, IndexError)):
+        one_hot_encode_v0(["A" + letter + "T"], 3)
 
 
 def test_one_hot_encode_lower_case_bases():
@@ -71,16 +75,63 @@ def test_one_hot_encode_lower_case_bases():
     assert np.array_equal(result[1], one_hot("ACGTN"))
 
 
+#: every character the previous implementation accepted: the letters
+#: it knew, and the digits 0 to 4 (it encoded a digit like the letter
+#: it would have translated to that digit), in ASCII or as a decimal
+#: digit of another script
+PREVIOUSLY_ACCEPTED = list("ACGTNYRMSWK01234") + [
+    "\u0660", "\u0661", "\u0662", "\u0663", "\u0664",   # Arabic-Indic
+    "\uff10", "\uff13", "\uff14",                       # fullwidth
+    "\U0001d7ce", "\U0001d7d1"]                          # mathematical bold
+
+
+@pytest.mark.parametrize("character", PREVIOUSLY_ACCEPTED)
+def test_one_hot_encode_of_every_previously_accepted_character(character):
+    new = sequtils.one_hot_encode(["A" + character + "T", character], 3)
+    old = one_hot_encode_v0(["A" + character + "T", character], 3)
+    assert np.array_equal(new, old)
+    assert new.dtype == old.dtype
+
+
+def test_one_hot_encode_digits_are_bases():
+    result = sequtils.one_hot_encode(["01234", "\u0660\u0661\u0662\u0663\u0664"], 5)
+    assert np.array_equal(result[0], one_hot("ACGTN"))
+    assert np.array_equal(result[1], one_hot("ACGTN"))
+
+
+@pytest.mark.parametrize("sequences,length", [
+    ([], 4), (["", ""], 0), ([""], 0), ([""], 3), (["AC"], 2.0),
+    ([np.str_("ACGT"), np.str_("NN")], 4), (("ACG", "T"), 3),
+    (["ACGT"], 0)])
+def test_one_hot_encode_unusual_arguments_as_before(sequences, length):
+    new = sequtils.one_hot_encode(sequences, length)
+    old = one_hot_encode_v0(sequences, length)
+    if old is None:
+        assert new is None
+    else:
+        assert new.shape == old.shape and new.dtype == old.dtype
+        assert np.array_equal(new, old)
+
+
+@pytest.mark.parametrize("sequences,length", [
+    ([b"ACGT"], 4), (["AC"], 3.5), ([None], 2), ("ACGT", None)])
+def test_one_hot_encode_arguments_rejected_as_before(sequences, length):
+    with pytest.raises(TypeError):
+        one_hot_encode_v0(sequences, length)
+    with pytest.raises(TypeError):
+        sequtils.one_hot_encode(sequences, length)
+
+
 @pytest.mark.parametrize("seed", range(3))
 def test_one_hot_encode_equals_the_previous_implementation(seed):
     """
         Same values and same type as the implementation it replaced, on
-        every letter that one supported, with sequences shorter and
+        every character that one accepted, with sequences shorter and
         longer than the requested length
     """
 
     rng = np.random.RandomState(seed)
-    letters = list("ACGTNYRMSWK")
+    letters = PREVIOUSLY_ACCEPTED
     sequences = ["".join(rng.choice(letters, size=rng.randint(1, 400)))
                  for _ in range(50)]
     for length in (1, 50, 200, 400, 450):
@@ -114,7 +165,9 @@ def test_one_hot_encode_has_at_most_one_base_per_position():
     assert set(np.unique(result)) <= {0.0, 1.0}
     assert result.sum(axis=2).max() == 1
     for i, sequence in enumerate(sequences):
-        assert np.array_equal(result[i], one_hot(sequence.upper()))
+        # lower case letters and the digits 0 to 3 are bases
+        assert np.array_equal(result[i], one_hot(
+            sequence.upper().translate(str.maketrans("0123", "ACGT"))))
 
 
 # --------------------------------------------------------------------

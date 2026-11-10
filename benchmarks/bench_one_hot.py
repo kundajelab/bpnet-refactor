@@ -5,7 +5,9 @@
 
     Run from the repository root. Batches have the shape used in
     training: 128 sequences (64 loci and their reverse complements) of
-    2,114 bases.
+    2,114 bases. This times the encoder alone; what it means for the
+    time a worker spends on a batch is measured on real data by
+    bench_batch_generation.py.
 """
 
 import os
@@ -34,7 +36,9 @@ def main():
         report(name + ", float64 (default)", compare(
             lambda: one_hot_encode_v0(sequences, length),
             lambda: one_hot_encode(sequences, length)))
-        report(name + ", int8", compare(
+        # not like for like: the previous implementation could only
+        # return float64
+        report(name + ", int8 (old: float64)", compare(
             lambda: one_hot_encode_v0(sequences, length),
             lambda: one_hot_encode(sequences, length, dtype=np.int8)))
 
