@@ -743,39 +743,34 @@ def test_generator_names():
     assert gen_class is generators.MBPNetSequenceGenerator
 
 
+def test_extra_train_inputs_are_arrays(synth_dataset):
+    gen = make_generator(synth_dataset, "train", epochs=1)
+    batches = list(gen.gen())
+    for inputs, _, weights in batches:
+        for key in ("jitters", "index", "status", "rev_comp"):
+            assert isinstance(inputs[key], np.ndarray), key
+            assert inputs[key].shape == weights.shape, key
+
+
+@pytest.mark.parametrize("n_files", [0, 3, 4])
+def test_a_task_needs_one_or_two_signal_files(tmp_path, n_files):
+    dataset = synth.make_dataset(str(tmp_path), **SMALL)
+    tasks = json.loads(json.dumps(dataset["input_data"]))
+    tasks["0"]["signal"]["source"] = \
+        (tasks["0"]["signal"]["source"] * 2)[:n_files]
+    input_json = os.path.join(str(tmp_path), "input_tracks.json")
+    with open(input_json, "w") as fh:
+        json.dump(tasks, fh)
+    # rejected when the generator is built, before any worker starts
+    with pytest.raises(NoTracebackException, match="signal"):
+        make_generator(dataset, "test", chroms=None, epochs=1,
+                       input_json=input_json)
+
+
 # --------------------------------------------------------------------
 # known defects, written as the behaviour we want; each is expected to
 # fail until its fix lands, and then must pass
 # --------------------------------------------------------------------
-
-@pytest.mark.xfail(strict=True, reason="'jitters', 'index' and 'status' are "
-                   "stored as 1-tuples because of trailing commas")
-def test_extra_train_inputs_are_arrays(synth_dataset):
-    gen = make_generator(synth_dataset, "train", epochs=1)
-    inputs, _, _ = next(iter(gen.gen()))
-    try:
-        for key in ("jitters", "index", "status", "rev_comp"):
-            assert isinstance(inputs[key], np.ndarray), key
-    finally:
-        # let the worker processes of this epoch finish
-        for child in mp.active_children():
-            child.join()
-
-
-@pytest.mark.xfail(strict=True, reason="more than two signal files per task "
-                   "are only reported through the log")
-def test_more_than_two_signal_files_is_an_error(tmp_path):
-    dataset = synth.make_dataset(str(tmp_path), **SMALL)
-    tasks = json.loads(json.dumps(dataset["input_data"]))
-    tasks["0"]["signal"]["source"] = tasks["0"]["signal"]["source"] * 2
-    input_json = os.path.join(str(tmp_path), "input_four_tracks.json")
-    with open(input_json, "w") as fh:
-        json.dump(tasks, fh)
-    with pytest.raises(NoTracebackException):
-        gen = make_generator(dataset, "test", chroms=None, epochs=1,
-                             input_json=input_json)
-        list(gen.gen())
-
 
 @pytest.mark.xfail(strict=True, reason="loci are filtered by the input "
                    "flank only, so jitter can move a window of a locus "
