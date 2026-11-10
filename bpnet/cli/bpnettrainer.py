@@ -84,6 +84,7 @@ def main():
     hyper_params['reduce_lr_on_plateau_patience'] = args.reduce_lr_on_plateau_patience
     hyper_params['lr_reduction_factor'] = \
         args.lr_reduction_factor
+    hyper_params['seed'] = args.seed
     
     # parallelization parms
     parallelization_params = {}

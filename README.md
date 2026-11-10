@@ -248,6 +248,12 @@ bpnet-train \
 
 Note: It might take a few minutes for the training to begin once the above command has been issued, be patient and you should see the training eventually start. 
 
+#### Initial weights and `--seed`
+
+Every training run starts from the same initial weights: the weights of seed 1234, which are the weights that TensorFlow 2.4.1 (the version the ENCODE models were trained with) draws for the architecture. They no longer depend on the TensorFlow version: under 2.4.1 TensorFlow draws them itself as before, under newer versions the package assigns the same arrays. Newer TensorFlow versions would otherwise start every run from different random weights, which can lower the counts performance of experiments with few peaks: such an experiment trains for too few steps to recover from an unlucky start of the two weights that combine the count prediction with the control counts.
+
+`--seed N` selects other initial weights, and also seeds the sampling of background regions, the trimming and the shuffling of the training and validation loci. It does not make a run exactly reproducible: the jitter is drawn in worker processes and stays random, and batches arrive in varying order. The seed and a checksum of the initial weights are written to the training log (`Initial weights: seed ..., sha256 ..., drawn by ...`) and to `config_split*.json` under `initial_weights`.
+
 ### 2. Model Prediction
 
 Once the training is complete we can generate predictions on the test set chromosomes to understand how well the model performs on regions not seen during training. 

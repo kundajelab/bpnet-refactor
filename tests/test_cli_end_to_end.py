@@ -7,6 +7,7 @@
     The tools run as subprocesses, as a user runs them.
 """
 
+import hashlib
 import json
 import os
 import subprocess
@@ -37,6 +38,28 @@ HISTORY_KEYS = [
     "start_time", "val_batch_loss", "val_logcounts_predictions_loss",
     "val_loss", "val_profile_predictions_loss"]
 
+
+# sha256 over the initial kernels and biases of the synthetic dataset's
+# architecture for three seeds. The one of seed 1234 is what the
+# unmodified trainer (upstream main at 0b11a7c) started from on this
+# dataset under TensorFlow 2.4.1; under that version all are the
+# weights Keras draws itself after tf.random.set_seed(seed) (see
+# test_initialization_tf.py). Every TensorFlow version must start there
+INITIAL_WEIGHTS_SHA256 = {
+    1234: "56a4b9e7de8f3a4363f0b3b4b08e24289fe9cd7f43204053f2a71c9c52199be6",
+    7: "df30f8c0cc3c46ca982edec4ee1c79c0dd391c09ff6f5dad55cfacbe4b08af72",
+    0: "e44c42849f007e53b798b9d2e864564b4a59587f75edcf04607b7f643bd73785"}
+
+#: TensorFlow 2.4 draws the initial weights from the global seed
+#: itself; from 2.10 on the trainer assigns them (see
+#: test_initialization_tf.py for the versions in between)
+DRAWN_BY = "tensorflow" if tuple(
+    int(x) for x in tf.__version__.split(".")[:2]) < (2, 10) else "bpnet"
+
+#: the layers with weights in the order the model creates them
+LAYERS = ["main_conv_0", "main_dil_conv_1", "main_dil_conv_2",
+          "main_profile_head", "main_counts_head", "profile_predictions",
+          "logcounts_predictions"]
 
 #: seconds after which a command line tool is considered hung (a worker
 #: process that dies leaves the batch generator waiting forever)
@@ -70,16 +93,14 @@ def run_cli(module, args, cwd):
     return proc.returncode, output
 
 
-@pytest.fixture(scope="module")
-def trained(synth_dataset, tmp_path_factory):
+def run_trainer(d, workdir, epochs=EPOCHS, max_jitter=8,
+                learning_rate=0.001, extra=()):
     """
-        One bpnet-train run of a few epochs on the synthetic dataset
+        Run bpnet-train on the synthetic dataset `d` in `workdir`
     """
 
-    workdir = tmp_path_factory.mktemp("train")
     model_dir = workdir / "model"
     model_dir.mkdir()
-    d = synth_dataset
     code, output = run_cli("bpnet.cli.bpnettrainer", [
         "--input-data", d["input_json"], "--output-dir", model_dir,
         "--reference-genome", d["fasta"], "--chroms"] + d["chroms"] + [
@@ -89,12 +110,53 @@ def trained(synth_dataset, tmp_path_factory):
         "--sequence-generator-name", "BPNet",
         "--model-output-filename", "model",
         "--input-seq-len", d["input_len"], "--output-len", d["output_len"],
-        "--max-jitter", 8, "--shuffle", "--threads", 2,
-        "--epochs", EPOCHS, "--batch-size", 16,
-        "--reverse-complement-augmentation", "--learning-rate", 0.001],
-        cwd=str(workdir))
+        "--max-jitter", max_jitter, "--shuffle", "--threads", 2,
+        "--epochs", epochs, "--batch-size", 16,
+        "--reverse-complement-augmentation",
+        "--learning-rate", learning_rate] + list(extra), cwd=str(workdir))
     return {"code": code, "output": output, "dir": str(model_dir),
             "model": str(model_dir / "model_split000")}
+
+
+def read_json(path):
+    with open(path) as fh:
+        return json.load(fh)
+
+
+def initial_weights_log_lines(run):
+    with open(os.path.join(run["dir"], "trainer_split000.log")) as fh:
+        return [line.split("Initial weights: ")[1].strip()
+                for line in fh if "Initial weights: " in line]
+
+
+@pytest.fixture(scope="module")
+def trained(synth_dataset, tmp_path_factory):
+    """
+        One bpnet-train run of a few epochs on the synthetic dataset
+    """
+
+    return run_trainer(synth_dataset, tmp_path_factory.mktemp("train"))
+
+
+@pytest.fixture(scope="module")
+def frozen(synth_dataset, tmp_path_factory):
+    """
+        bpnet-train runs of one epoch with a learning rate of zero,
+        without jitter, and with background regions that count in the
+        profile loss like peaks. The weights that are saved are the
+        weights the model started from, and the training loss is the
+        mean loss of that model over the examples of the epoch, however
+        they were grouped into batches.
+    """
+
+    runs = {}
+    for name, extra in [("default", []), ("seed 7", ["--seed", 7]),
+                        ("seed 0", ["--seed", 0])]:
+        runs[name] = run_trainer(
+            synth_dataset, tmp_path_factory.mktemp("frozen"), epochs=1,
+            max_jitter=0, learning_rate=0,
+            extra=["--mnll-loss-background-sample-weight", 1] + extra)
+    return runs
 
 
 @pytest.fixture(scope="module")
@@ -224,6 +286,131 @@ def test_last_validation_loss_is_the_saved_models_loss(synth_dataset, trained):
     # 1% on these data
     np.testing.assert_allclose(np.mean(losses),
                                history["val_loss"][str(EPOCHS)], rtol=0.03)
+
+
+def test_trainer_reports_the_initial_weights(trained):
+    assert trained["code"] == 0, trained["output"][-3000:]
+    config = read_json(os.path.join(trained["dir"], "config_split000.json"))
+    assert config["initial_weights"] == {
+        "seed": 1234, "sha256": INITIAL_WEIGHTS_SHA256[1234],
+        "drawn_by": DRAWN_BY}
+    assert config["hyper_params"]["seed"] is None
+    assert initial_weights_log_lines(trained) == [
+        "seed 1234, sha256 {}, drawn by {}".format(
+            INITIAL_WEIGHTS_SHA256[1234], DRAWN_BY)]
+
+
+@pytest.mark.parametrize("run,seed", [("default", 1234), ("seed 7", 7),
+                                      ("seed 0", 0)])
+def test_training_starts_from_the_seeded_weights(frozen, run, seed):
+    """
+        With a learning rate of zero the saved weights are the initial
+        weights: Glorot uniform kernels of the seeded stream and zero
+        biases, on every TensorFlow version. Without --seed they are
+        the weights of seed 1234.
+    """
+
+    from bpnet.model import initialization
+
+    assert frozen[run]["code"] == 0, frozen[run]["output"][-3000:]
+    weights = weights_by_layer_name(frozen[run]["model"])
+    assert sorted(weights) == sorted(LAYERS)
+    digest = hashlib.sha256()
+    for name in LAYERS:
+        kernel, bias = weights[name]
+        assert kernel.dtype == bias.dtype == np.float32
+        assert not bias.any(), name
+        digest.update(kernel.tobytes() + bias.tobytes())
+    assert digest.hexdigest() == INITIAL_WEIGHTS_SHA256[seed]
+
+    kernels = initialization.initial_kernels(
+        [weights[name][0].shape for name in LAYERS], seed)
+    for name, kernel in zip(LAYERS, kernels):
+        assert np.array_equal(weights[name][0], kernel), name
+
+    config = read_json(os.path.join(frozen[run]["dir"],
+                                    "config_split000.json"))
+    assert config["initial_weights"] == {
+        "seed": seed, "sha256": INITIAL_WEIGHTS_SHA256[seed],
+        "drawn_by": DRAWN_BY}
+    assert config["hyper_params"]["seed"] == (None if run == "default"
+                                              else seed)
+    assert initial_weights_log_lines(frozen[run]) == [
+        "seed {}, sha256 {}, drawn by {}".format(
+            seed, INITIAL_WEIGHTS_SHA256[seed], DRAWN_BY)]
+
+
+def epoch_loss(d, weights, numpy_seed):
+    """
+        The mean loss of a model with the given weights over the
+        training epoch of a generator that is set up right after
+        np.random.seed(numpy_seed), the way the trainer sets its
+        generator up. Which background regions are sampled and which
+        rows are trimmed follows from that state. All examples have
+        weight 1 and all batches the same size, so the mean does not
+        depend on the grouping into batches.
+    """
+
+    from bpnet.generators import generators
+
+    params = {"sequence_generator_name": "BPNet",
+              "input_seq_len": d["input_len"], "output_len": d["output_len"],
+              "rev_comp_aug": True, "max_jitter": 0, "shuffle": True,
+              "mode": "train"}
+    state = np.random.get_state()
+    try:
+        np.random.seed(numpy_seed)
+        gen = generators.MBPNetSequenceGenerator(
+            d["input_json"], params, d["fasta"], d["chrom_sizes"],
+            d["splits"]["0"]["train"], num_threads=2, batch_size=16,
+            epochs=1, foreground_weight=1.0, background_weight=1.0)
+        losses = []
+        for inputs, outputs, sample_weights in gen.gen():
+            assert len(sample_weights) == 32 and (sample_weights == 1).all()
+            profile, counts = reference_model.forward(
+                weights, d["params"], inputs["sequence"],
+                inputs["profile_bias_input_0"],
+                inputs["counts_bias_input_0"])
+            losses.append(reference_model.loss(
+                outputs["profile_predictions"],
+                outputs["logcounts_predictions"], sample_weights, profile,
+                counts, d["params"]["loss_weights"])[0])
+    finally:
+        np.random.set_state(state)
+    assert len(losses) == gen.len() > 1
+    return float(np.mean(losses))
+
+
+def test_seed_governs_the_choice_of_training_loci(synth_dataset, frozen):
+    """
+        The background regions an epoch samples and the rows it trims
+        follow from --seed: the training loss of each run (of a model
+        that does not change) is the loss over the epoch that a
+        generator yields after numpy is seeded with the run's seed.
+        Without --seed that is the 1234 the package sets when it is
+        imported.
+    """
+
+    losses, weights = {}, {}
+    for name, run in frozen.items():
+        assert run["code"] == 0, run["output"][-3000:]
+        history = read_json(run["model"] + ".history.json")
+        assert sorted(history["loss"]) == ["1"]
+        losses[name] = history["loss"]["1"]
+        weights[name] = weights_by_layer_name(run["model"])
+
+    expected = epoch_loss(synth_dataset, weights["seed 7"], 7)
+    assert losses["seed 7"] == pytest.approx(expected, rel=2e-4)
+    assert losses["seed 0"] == pytest.approx(
+        epoch_loss(synth_dataset, weights["seed 0"], 0), rel=2e-4)
+    assert losses["default"] == pytest.approx(
+        epoch_loss(synth_dataset, weights["default"], 1234), rel=2e-4)
+
+    # the comparison tells the epochs of two seeds apart: the same
+    # model on the epoch of another seed is far outside the tolerance
+    for other_seed in (1234, 0):
+        other = epoch_loss(synth_dataset, weights["seed 7"], other_seed)
+        assert abs(other - expected) > 2e-3 * expected
 
 
 def test_saved_weights_are_readable_by_layer_name(trained):

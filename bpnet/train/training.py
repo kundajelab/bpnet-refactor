@@ -50,12 +50,17 @@ import logging
 import multiprocessing as mp
 import os
 import pandas as pd
+import random
 import time
+
+import numpy as np
+import tensorflow as tf
 
 from bpnet.utils.datetime_custom import *
 from bpnet.utils.exceptionhandler import NoTracebackException
 from bpnet.utils import logger
 from bpnet.model import arch
+from bpnet.model import initialization
 from tensorflow.keras.optimizers import Adam
 from bpnet.generators import generators 
 
@@ -135,6 +140,91 @@ def reduce_lr_on_plateau(losses, current_lr, factor=0.5, patience=2,
         return current_lr
     
     return new_lr
+
+
+def global_seed():
+    """
+        TensorFlow's global seed: the package sets 1234 when it is 
+        imported; --seed or a caller may have set another
+        
+        Returns:
+            int: the seed, None if no global seed is set
+    """
+    
+    from tensorflow.python.eager import context
+    
+    seed = context.global_seed()
+    return None if seed is None else int(seed)
+
+
+#: seed of the graph in which _initializer_takes_tensorflow_seeds looks 
+#: at an initializer; no operation carries this number by chance
+_PROBE_SEED = 987654
+
+
+def _initializer_takes_tensorflow_seeds():
+    """
+        Whether the random operation that an unseeded keras 
+        initializer creates gets its seeds from TensorFlow
+        
+        The initializer is called in a graph of its own whose seed is 
+        set to a known number. Where initial weights follow 
+        TensorFlow's seed, the random operation it creates carries 
+        that number. Nothing is run. No operation seed is taken from 
+        the global stream, the random kernels of earlier operations 
+        are left alone, and the state of Python's random module is 
+        put back. (Where keras was given a seed generator of its own 
+        with tf.keras.utils.set_random_seed, which only versions that 
+        answer no have, one seed is taken from that generator.)
+        
+        Returns:
+            bool
+    """
+    
+    state = random.getstate()
+    graph = tf.Graph()
+    try:
+        with graph.as_default():
+            tf.compat.v1.set_random_seed(_PROBE_SEED)
+            tf.keras.initializers.GlorotUniform()(
+                shape=(8,), dtype=tf.float32)
+    finally:
+        random.setstate(state)
+        
+    for operation in graph.get_operations():
+        if 'seed' in operation.node_def.attr and \
+                operation.get_attr('seed') == _PROBE_SEED:
+            return True
+    return False
+
+
+def initializers_follow_global_seed():
+    """
+        Whether TensorFlow itself derives the initial weights of new 
+        layers from its global seed. It does in TensorFlow 2.4 (and, 
+        from reading the sources, up to 2.9); later versions draw 
+        them from seeds that keras makes up.
+        
+        - TensorFlow 2.4, the version the released models were 
+          trained with: yes, without looking any further. 
+        - Outside eager execution: yes. Initial weights in a 
+          TensorFlow 1 style graph are left to TensorFlow. 
+        - Otherwise the answer is found by looking at what an 
+          initializer does (_initializer_takes_tensorflow_seeds), not 
+          from the version number.
+        
+        Returns:
+            bool
+    """
+    
+    if not tf.executing_eagerly():
+        return True
+    
+    version = tuple(int(part) for part in tf.__version__.split('.')[:2])
+    if version < (2, 5):
+        return True
+    
+    return _initializer_takes_tensorflow_seeds()
 
 
 def train_and_validate(
@@ -276,6 +366,15 @@ def train_and_validate(
     # we need to initialize the logger for each process
     logger.init_logger(logfname)
     
+    # a requested seed replaces the seeds set when the package was 
+    # imported: numpy's for the random choices made while the batch 
+    # generators are set up (background sampling, trimming, shuffling)
+    # and tensorflow's global seed, which the initial weights follow
+    seed = hyper_params.get('seed')
+    if seed is not None:
+        np.random.seed(seed)
+        set_seed(seed)
+
     # parameters that are specific to the training batch generation
     # process
     train_batch_gen_params = batch_gen_params
@@ -341,6 +440,20 @@ def train_and_validate(
                         orig_multi_loss=orig_multi_loss, 
                         name_prefix="main")
     
+    # Initial weights. Under TensorFlow 2.4.1 the global seed fixes the 
+    # initial weights; newer versions draw them differently on every 
+    # run, which hurts experiments with few peaks (they train for too 
+    # few steps to recover from an unlucky start of the layers that 
+    # combine the predictions with the control tracks). Where 
+    # TensorFlow does not draw initial weights from the seed, the 
+    # weights of the seed are assigned here; where it does, they are 
+    # left as they are.
+    initial_weights = initialization.initialize(
+        model, global_seed(), initializers_follow_global_seed())
+    logging.info("Initial weights: seed {}, sha256 {}, drawn by {}".format(
+        initial_weights['seed'], initial_weights['sha256'], 
+        initial_weights['drawn_by']))
+
     # print out the model summary
     model.summary()
         
@@ -529,6 +642,9 @@ def train_and_validate(
         config['batch_gen_params'] = batch_gen_params
         config['hyper_params'] = hyper_params
         config['parallelization_params'] = parallelization_params
+        
+        # what the model started from
+        config['initial_weights'] = initial_weights
         
         # the number of epochs the training lasted
         config['training_epochs'] = epoch + 1

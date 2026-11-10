@@ -8,6 +8,12 @@ from tensorflow.keras import Model
 
 class CustomModel(Model):
 
+    #: names of the layers that have weights, in the order arch.BPNet
+    #: created them (the order in which the seeded initial weights are
+    #: assigned). Declared on the class so that keras neither tracks 
+    #: nor saves it with the model
+    weight_layer_names = ()
+
     def __init__(self, num_tasks, num_output_tracks, tracks_for_each_task, output_profile_len, loss_weights,counts_loss, orig_multi_loss=False, **kwargs):
 
         # call the base class with inputs and outputs

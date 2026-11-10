@@ -3,6 +3,9 @@
     bpnet network architectures
 """
 
+import functools
+import threading
+
 from numpy.random import seed
 seed(1234)
 from tensorflow.random import set_seed 
@@ -18,6 +21,61 @@ from tensorflow.keras.backend import int_shape
 
 import tensorflow as tf
 from bpnet.model import bpnetdefaults
+
+# names of the layers that have weights, in the order BPNet() creates
+# them; the seeded initial weights (bpnet.model.initialization) are
+# assigned in this order. Each build records into a list of its own 
+# (see _records_weight_layers); the list of the build in progress is 
+# kept per thread
+_build = threading.local()
+
+
+def _weighted(layer):
+    """
+        Record a layer that has a kernel and a bias
+        
+        Args:
+            layer (tensorflow.keras.layers.Layer): Conv1D or Dense layer
+                
+        Returns:
+            the same layer
+    """
+    names = getattr(_build, 'weight_layer_names', None)
+    if names is not None:
+        names.append(layer.name)
+    return layer
+
+
+def _records_weight_layers(build):
+    """
+        Decorator for a function that builds a model: the model it 
+        returns gets `weight_layer_names`, the names of the layers 
+        that _weighted saw while the function ran, in order.
+        
+        The list belongs to the call. A build that starts while 
+        another is in progress in the same thread (a model built 
+        inside a callable that the outer build invokes) records into 
+        its own list, and the outer list is put back when it ends, 
+        whether it succeeds or fails. Layers that were created while 
+        the function ran but are not part of the model it returns 
+        are left out.
+    """
+    
+    @functools.wraps(build)
+    def wrapper(*args, **kwargs):
+        enclosing = getattr(_build, 'weight_layer_names', None)
+        names = _build.weight_layer_names = []
+        try:
+            model = build(*args, **kwargs)
+        finally:
+            _build.weight_layer_names = enclosing
+        in_model = set(layer.name for layer in model.layers)
+        model.weight_layer_names = tuple(
+            name for name in names if name in in_model)
+        return model
+    
+    return wrapper
+
 
 def _crop_layer(layer, new_size):
     """
@@ -131,18 +189,18 @@ def motif_module(
     motif_module_out = one_hot_input
     # n-1 conv layers with activation (n = len(kernel_sizes))
     for i in range(len(kernel_sizes)-1):
-        motif_module_out = layers.Conv1D(
+        motif_module_out = _weighted(layers.Conv1D(
             filters[i], kernel_size=kernel_sizes[i], padding=padding, 
             activation='relu', 
-            name='{}_conv_{}'.format(name_prefix, i))(motif_module_out)
+            name='{}_conv_{}'.format(name_prefix, i)))(motif_module_out)
         
     # The activation of the last conv in the motif module is done
     # in the syntax module. The reason for this is to accommodate 
     # the 'pre_activation_residual_unit' option in the syntax module
-    return layers.Conv1D(
+    return _weighted(layers.Conv1D(
         filters[-1], kernel_size=kernel_sizes[-1], padding=padding, 
         name='{}_conv_{}'.format(
-            name_prefix, len(filters) - 1))(motif_module_out)
+            name_prefix, len(filters) - 1)))(motif_module_out)
     
 
 def syntax_module(
@@ -192,10 +250,10 @@ def syntax_module(
         x_activated = layers.ReLU(name=x.name.split('/')[0]+'_relu')(x)
             
         # dilated convolution
-        conv_output_without_activation = layers.Conv1D(
+        conv_output_without_activation = _weighted(layers.Conv1D(
             filters=filters, kernel_size=kernel_size, padding=padding, 
             dilation_rate=2**i,
-            name='{}_dil_conv_{}'.format(name_prefix, i))(x_activated)
+            name='{}_dil_conv_{}'.format(name_prefix, i)))(x_activated)
 
         if pre_activation_residual_unit:
             # If padding is 'valid' we need to crop layer to match 
@@ -247,9 +305,9 @@ def profile_head(
 
     """
     
-    return layers.Conv1D(
+    return _weighted(layers.Conv1D(
         filters=filters, kernel_size=kernel_size, padding=padding, 
-        name='{}_profile_head'.format(name_prefix))(syntax_module_out)
+        name='{}_profile_head'.format(name_prefix)))(syntax_module_out)
 
 
 def counts_head(
@@ -289,12 +347,14 @@ def counts_head(
         if activations[i] != 'leakyrelu':
             # we can use this formulation for all activations that 
             # have a string name representation
-            x = layers.Dense(units[i], name='counts_dense_{}'.format(i),
-                             activation=activations[i])(x)
+            x = _weighted(layers.Dense(
+                units[i], name='counts_dense_{}'.format(i),
+                activation=activations[i]))(x)
         else:
             # add a separate leaky relu layer since keras doesnt 
             # have a string name for leaky relu
-            x = layers.Dense(units[i], name='counts_dense_{}'.format(i))(x)
+            x = _weighted(layers.Dense(
+                units[i], name='counts_dense_{}'.format(i)))(x)
             x = layers.LeakyReLU(name='counts_dense_LReLU_{}'.format(i))(x)
         
         #add dropout layer
@@ -303,7 +363,7 @@ def counts_head(
                                name='counts_dropout_{}'.format(i))(x)
             
     # the final Dense layer with linear activation and no dropout
-    return layers.Dense(units[-1], name=name)(x)
+    return _weighted(layers.Dense(units[-1], name=name))(x)
 
 
 def profile_bias_module(
@@ -373,9 +433,9 @@ def profile_bias_module(
                 name = "profile_predictions"
             else:
                 name = "profile_predictions_{}".format(i)
-            profile_outputs.append(layers.Conv1D(
+            profile_outputs.append(_weighted(layers.Conv1D(
                 filters=num_task_tracks, kernel_size=kernel_sizes[i], 
-                name=name)(concat_with_profile_bias_input))
+                name=name))(concat_with_profile_bias_input))
 
     # profile output
     if len(profile_outputs) == 1:
@@ -464,13 +524,13 @@ def counts_bias_module(counts_head, counts_bias_inputs, tasks_info,
             #     units=num_task_tracks, 
             #     name=name)(concat_with_counts_bias_input))
             if orig_multi_loss:
-                counts_outputs.append(layers.Dense(
+                counts_outputs.append(_weighted(layers.Dense(
                     units=num_task_tracks, 
-                    name=name)(concat_with_counts_bias_input))
+                    name=name))(concat_with_counts_bias_input))
             else: 
-                counts_outputs.append(layers.Dense(
+                counts_outputs.append(_weighted(layers.Dense(
                     units=num_tasks, 
-                    name=name)(concat_with_counts_bias_input))
+                    name=name))(concat_with_counts_bias_input))
 
     # counts output
     if len(counts_outputs) == 1:
@@ -539,6 +599,7 @@ def load_params(params):
             loss_weights, counts_loss)
 
     
+@_records_weight_layers
 def BPNet(
     tasks, bpnet_params, orig_multi_loss=False,
     name_prefix=None):
@@ -734,5 +795,4 @@ def BPNet(
                         orig_multi_loss,
                         inputs=inputs, 
                         outputs=[profile_outputs, logcounts_outputs])
-
 
