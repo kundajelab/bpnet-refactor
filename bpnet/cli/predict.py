@@ -915,7 +915,13 @@ def predict_main():
     logger.init_logger(logfname)
 
     # predict
-    predict(args, pred_dir)
+    try:
+        predict(args, pred_dir)
+    except BaseException:
+        # the workers of the batch generator would go on making 
+        # batches that nobody takes, and keep this process from ending
+        generators.stop_after_failure()
+        raise
     
 if __name__ == '__main__':
     predict_main()
