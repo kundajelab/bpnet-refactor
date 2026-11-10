@@ -29,6 +29,11 @@ Tests run on the CPU. Set `BPNET_TEST_GPU=1` to let TensorFlow use a GPU.
 | `test_custommodel.py` | the training objective against the numpy reference (masking by weight, joint two-strand multinomial, log(total + 2) count target), gradients against finite differences, the Adam update rule, train / test step bookkeeping |
 | `test_training_helpers.py` | early stopping and learning-rate-on-plateau rules |
 | `test_optimizer.py` | the Adam update on prescribed gradients (40 steps, magnitudes around epsilon, a learning-rate change) |
+| `test_metrics.py` | the per-region metrics of `bpnet-predict` (correlations, normalized likelihood, cross entropy and Jensen-Shannon scores, MSE) against formulas written out in the test |
+| `test_bigwig_writing.py` | both bigWig writers: region order, the split of overlapping regions between their centres, the statistics file |
+| `test_counts_loss_weight.py` | `bpnet-counts-loss-weight` |
+| `saved_weights.py` | reads a SavedModel's weights by layer name from its checkpoint |
+| `test_cli_end_to_end.py` | (slow) `bpnet-train` then `bpnet-predict` as subprocesses on the synthetic dataset; predictions, metric files and bigWigs recomputed from the saved weights with the numpy reference |
 | `data/` | small hand-made input files |
 
 ## Known defects
