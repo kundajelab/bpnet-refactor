@@ -43,7 +43,7 @@ def test_sequences_are_float64_unless_asked_otherwise(synth_dataset):
 
 
 @pytest.mark.parametrize("dtype", ["int8", "uint8", "float32", "bool",
-                                   "float64"])
+                                   "float64", "float16", ">f4", "uint64"])
 @pytest.mark.parametrize("mode", ["train", "val", "test"])
 def test_only_the_type_of_the_sequences_differs(synth_dataset, mode, dtype):
     """
@@ -120,8 +120,15 @@ def test_batches_from_the_worker_processes(synth_dataset, mode):
                 assert same_bits(a, b), name
 
 
-@pytest.mark.parametrize("dtype", ["S1", "complex64", "object", "U4",
-                                   "one hot", 7.5])
-def test_type_that_cannot_hold_the_encoding(synth_dataset, dtype):
+@pytest.mark.parametrize("dtype", [
+    "S1", "complex64", "object", "U4", "timedelta64[ns]", "datetime64[s]",
+    # not the name of a type
+    "one hot", 7.5,
+    # specifications of structured types that numpy refuses
+    {"names": ["x"], "formats": []}, [("a", "i1"), ("a", "i1")],
+    # a structured type
+    [("a", "i1")]])
+def test_types_other_than_boolean_integer_and_floating_point(synth_dataset,
+                                                             dtype):
     with pytest.raises(NoTracebackException, match="sequence_dtype"):
         make_generator(synth_dataset, sequence_dtype=dtype)

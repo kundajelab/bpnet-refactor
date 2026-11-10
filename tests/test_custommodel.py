@@ -584,7 +584,8 @@ def test_training_does_not_depend_on_the_type_of_the_one_hot_input(case):
                                     steps, n_bias)
             for x in (inputs, inputs, as_int8)]
     repeats = runs[1][0] == runs[0][0] and all(
-        a.tobytes() == b.tobytes() for a, b in zip(runs[1][1], runs[0][1]))
+        a.tobytes() == b.tobytes()
+        for a, b in zip(runs[1][1] + runs[1][2], runs[0][1] + runs[0][2]))
     if not repeats and tf.config.list_physical_devices("GPU"):
         # GPU kernels of newer TensorFlow versions do not repeat to
         # the last bit unless tf.config.experimental

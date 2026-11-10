@@ -388,14 +388,15 @@ class MSequenceGenerator:
         try:
             self._sequence_dtype = np.dtype(
                 batch_gen_params.get('sequence_dtype', 'float64'))
-        except TypeError:
+        except (TypeError, ValueError):
             self._sequence_dtype = None
+        # boolean, integer and floating point types
         if self._sequence_dtype is None or \
                 self._sequence_dtype.kind not in 'biuf':
             raise NoTracebackException(
-                "sequence_dtype must be a numeric numpy type such as "
-                "'float64' or 'int8', not {!r}".format(
-                    batch_gen_params.get('sequence_dtype')))
+                "sequence_dtype must be a boolean, integer or floating "
+                "point numpy type such as 'float64' or 'int8', not "
+                "{!r}".format(batch_gen_params.get('sequence_dtype')))
         
         # list of loci dataframes for each epoch
         self._loci = []

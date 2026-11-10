@@ -21,6 +21,16 @@
     A timing starts after the first batches of an epoch have arrived
     and covers the next `--batches`; the epoch is then ended early.
     The two types are timed in alternating order.
+
+    What the number is and is not: the rate at which batches come out
+    of the generator once it runs, which is set by the slower of the
+    workers (constructing and pickling) and the consuming process
+    (reading and unpickling, one thread per worker under one
+    interpreter lock). The queues have no bound, so batches that the
+    workers finished before a timing starts are part of what arrives
+    during it. The two generators do not draw the same background
+    loci or jitters. Starting the workers of an epoch and ending them
+    are not timed.
 """
 
 import argparse

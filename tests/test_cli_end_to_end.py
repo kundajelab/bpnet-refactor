@@ -66,7 +66,7 @@ LAYERS = ["main_conv_0", "main_dil_conv_1", "main_dil_conv_2",
 TIMEOUT = 900
 
 
-def run_cli(module, args, cwd, code=None):
+def run_cli(module, args, cwd, code=None, env=None):
     """
         Run `python -m <module> <args>` in its own process group;
         returns (return code, output). The whole group is killed when
@@ -74,12 +74,12 @@ def run_cli(module, args, cwd, code=None):
 
         With `code`, `python -c <code> <args>` is run instead (a
         script that changes something and then calls the tool's
-        main()).
+        main()). `env` holds further environment variables.
     """
 
     import signal
 
-    env = dict(os.environ)
+    env = dict(os.environ, **(env or {}))
     env["PYTHONPATH"] = REPO + os.pathsep + env.get("PYTHONPATH", "")
     if not env.get("BPNET_TEST_GPU"):
         env["CUDA_VISIBLE_DEVICES"] = ""
@@ -99,7 +99,8 @@ def run_cli(module, args, cwd, code=None):
 
 
 def run_trainer(d, workdir, epochs=EPOCHS, max_jitter=8,
-                learning_rate=0.001, extra=(), threads=2, code=None):
+                learning_rate=0.001, extra=(), threads=2, code=None,
+                env=None):
     """
         Run bpnet-train on the synthetic dataset `d` in `workdir`
     """
@@ -119,7 +120,7 @@ def run_trainer(d, workdir, epochs=EPOCHS, max_jitter=8,
         "--epochs", epochs, "--batch-size", 16,
         "--reverse-complement-augmentation",
         "--learning-rate", learning_rate] + list(extra), cwd=str(workdir),
-        code=code)
+        code=code, env=env)
     return {"code": code, "output": output, "dir": str(model_dir),
             "model": str(model_dir / "model_split000")}
 
@@ -265,29 +266,34 @@ bpnettrainer.main()
 """
 
 
+#: one thread for every pool, so that the arithmetic of two runs is
+#: done in the same order
+ONE_THREAD = {"TF_NUM_INTRAOP_THREADS": "1", "TF_NUM_INTEROP_THREADS": "1",
+              "OMP_NUM_THREADS": "1", "OPENBLAS_NUM_THREADS": "1"}
+
+
 @pytest.fixture(scope="module")
 def trained_with_either_type(synth_dataset, tmp_path_factory):
     """
-        Two bpnet-train runs that see the same batches in the same
-        order: one worker process and no jitter. (With more workers
-        the order of the batches depends on which worker is done
-        first, and the jitter comes from a random generator that
-        Python seeds anew in every worker process.) One run as the
-        tool is, one with the sequences as float64.
+        bpnet-train runs that see the same batches in the same order:
+        one worker process and no jitter. (With more workers the order
+        of the batches depends on which worker is done first, and the
+        jitter comes from a random generator that Python seeds anew in
+        every worker process.) One run as the tool is, and two with
+        the sequences as float64, which show whether a run repeats
+        exactly on this machine at all.
     """
 
     runs = {}
     for name, code in [("int8", None),
-                       ("float64", TRAIN_WITH_FLOAT64_SEQUENCES)]:
+                       ("float64", TRAIN_WITH_FLOAT64_SEQUENCES),
+                       ("float64 again", TRAIN_WITH_FLOAT64_SEQUENCES)]:
         runs[name] = run_trainer(
-            synth_dataset, tmp_path_factory.mktemp(name), epochs=2,
-            max_jitter=0, threads=1, code=code)
+            synth_dataset, tmp_path_factory.mktemp("sequences"), epochs=2,
+            max_jitter=0, threads=1, code=code, env=ONE_THREAD)
     return runs
 
 
-@pytest.mark.skipif(
-    bool(os.environ.get("BPNET_TEST_GPU")),
-    reason="two training runs on a GPU do not repeat to the last bit")
 def test_trained_model_does_not_depend_on_the_type_of_the_sequences(
         trained_with_either_type):
     """
@@ -297,31 +303,34 @@ def test_trained_model_does_not_depend_on_the_type_of_the_sequences(
     """
 
     runs = trained_with_either_type
+    timing = {"start_time", "end_time", "elapsed"}
     histories, weights = {}, {}
     for name, run in runs.items():
         assert run["code"] == 0, run["output"][-3000:]
         config = read_json(os.path.join(run["dir"], "config_split000.json"))
-        assert config["batch_gen_params"]["sequence_dtype"] == name
+        assert config["batch_gen_params"]["sequence_dtype"] == name.split()[0]
         assert config["training_epochs"] == 2
-        histories[name] = read_json(run["model"] + ".history.json")
-        weights[name] = weights_by_layer_name(run["model"])
-
-    timing = {"start_time", "end_time", "elapsed"}
-    assert set(histories["int8"]) == set(HISTORY_KEYS)
-    compared = 0
-    for key in sorted(set(HISTORY_KEYS) - timing):
-        assert histories["int8"][key] == histories["float64"][key], key
-        compared += 1
-    assert compared == len(HISTORY_KEYS) - 3 >= 9
+        history = read_json(run["model"] + ".history.json")
+        assert set(history) == set(HISTORY_KEYS)
+        histories[name] = {key: history[key]
+                           for key in set(HISTORY_KEYS) - timing}
+        saved = weights_by_layer_name(run["model"])
+        assert sorted(saved) == sorted(LAYERS)
+        weights[name] = [array.tobytes() for layer in LAYERS
+                         for array in saved[layer]]
+    assert len(histories["int8"]) == len(HISTORY_KEYS) - 3 >= 9
+    assert len(weights["int8"]) == 2 * len(LAYERS)
     # the model was trained: the loss moved
     assert histories["int8"]["loss"]["2"] != histories["int8"]["loss"]["1"]
 
-    assert sorted(weights["int8"]) == sorted(weights["float64"]) == \
-        sorted(LAYERS)
-    for layer in LAYERS:
-        for a, b in zip(weights["int8"][layer], weights["float64"][layer]):
-            assert a.dtype == b.dtype == np.float32
-            assert a.tobytes() == b.tobytes(), layer
+    if histories["float64"] != histories["float64 again"] or \
+            weights["float64"] != weights["float64 again"]:
+        pytest.skip("two bpnet-train runs with float64 sequences differ: "
+                    "training does not repeat to the last bit on this "
+                    "machine (as on a GPU), so runs cannot be compared")
+
+    assert histories["int8"] == histories["float64"]
+    assert weights["int8"] == weights["float64"]
 
 
 def test_last_validation_loss_is_the_saved_models_loss(synth_dataset, trained):
