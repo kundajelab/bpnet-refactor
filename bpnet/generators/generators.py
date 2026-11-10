@@ -55,7 +55,6 @@ from numpy.random import seed
 seed(1234)
 
 import hashlib
-import itertools
 import json
 import logging
 import multiprocessing as mp
@@ -73,12 +72,10 @@ from bpnet.generators import windows
 from bpnet.utils.exceptionhandler import NoTracebackException
 from bpnet.utils.misc import gaussian1D_smoothing
 from contextlib import contextmanager
-from multiprocessing.connection import Connection
 from queue import Empty, Full, Queue
 from threading import RLock, Thread
 import time
 import traceback
-import weakref
 
 
 class WorkerFailure(object):
@@ -154,30 +151,10 @@ class Epoch(object):
         self.stopped = False
         #: held while the workers of the epoch are being stopped
         self.lock = RLock()
-        #: a pipe that nothing is written to. The consumer holds the 
-        #: writing end (a file descriptor) for as long as the epoch 
-        #: lasts, and no other process does: a process that is 
-        #: forked from the consumer gives up its copy (see 
-        #: _CONSUMER_PIPES). Every worker gets the reading end, and 
-        #: finds the end of the data there once the consumer is gone 
-        #: (see Consumer).
-        self._alive = object()
-        # (also when the record of the epoch is dropped without 
-        # close())
-        self._give_up = weakref.finalize(
-            self, _close_consumer_pipe, self._alive)
-        self._give_up.atexit = False
-        reading, self.alive_writer = _make_consumer_pipe(self._alive)
-        self.alive_reader = Connection(reading, writable=False)
-
-    def close(self):
-        """
-            Give up the pipe that shows the workers that their 
-            consumer is there (after the workers have ended)
-        """
-        
-        self._give_up()
-        self.alive_reader.close()
+        #: what tells the workers whether their consumer is still 
+        #: there (see Consumer): its process id and the time it was 
+        #: started
+        self.consumer = process_identity()
 
 
 #: the epochs that are under way in this process, and the lock for 
@@ -188,105 +165,20 @@ _EPOCHS = []
 _EPOCHS_LOCK = RLock()
 
 
-#: The pipes that stand for this process as the consumer of an epoch 
-#: (see Epoch): a token of the epoch -> (reading end, writing end), 
-#: as file descriptors. A process that is forked from this one finds 
-#: all of them here and closes its copies of the writing ends: 
-#: otherwise the workers of this process would take it for their 
-#: consumer once this process is gone. For that, no fork may fall 
-#: between making a pipe and recording it:
-#: 
-#: - a fork takes the lock under which pipes are made and recorded 
-#:   (_before_a_fork), so that one from another thread waits;
-#: - a pipe is made and recorded by one call that runs no Python 
-#:   code (_make_consumer_pipe), so that no signal handler of the 
-#:   same thread, which could fork, runs in between.
-_CONSUMER_PIPES = {}
-_CONSUMER_PIPES_LOCK = RLock()
-
-
-def _pipes():
-    """
-        Returns:
-            iterator: its only item is a new pipe, (reading end, 
-                writing end), made when the item is taken
-    """
-    
-    return itertools.starmap(os.pipe, [()])
-
-
-def _make_consumer_pipe(token):
-    """
-        Make a pipe and record it in _CONSUMER_PIPES
-        
-        Args:
-            token: the key of the record
-        
-        Returns:
-            tuple: (reading end, writing end)
-    """
-    
-    with _CONSUMER_PIPES_LOCK:
-        # dict.update() takes the item from the iterators and stores 
-        # it without returning to Python code: signal handlers run 
-        # between Python instructions only
-        _CONSUMER_PIPES.update(zip([token], _pipes()))
-    return _CONSUMER_PIPES[token]
-
-
-def _close_consumer_pipe(token):
-    """
-        Forget a pipe of _CONSUMER_PIPES and close its writing end 
-        (no error if it was forgotten before)
-        
-        The record goes first. A process that is forked right after 
-        that keeps a writing end of an epoch whose workers have 
-        ended, which harms nobody. In the other order it could close 
-        a descriptor that was closed here and given to another file 
-        since.
-    """
-    
-    with _CONSUMER_PIPES_LOCK:
-        fds = _CONSUMER_PIPES.pop(token, None)
-        if fds is not None:
-            try:
-                os.close(fds[1])
-            except OSError:  # pragma: no cover
-                pass
-
-
-def _before_a_fork():
-    _CONSUMER_PIPES_LOCK.acquire()
-
-
-def _after_a_fork():
-    _CONSUMER_PIPES_LOCK.release()
-
-
 def _forget_the_epochs_of_the_parent():
     """
         In a forked process: the epochs of the parent are not this 
-        process's to stop, and the locks may be held by threads that 
-        do not exist here. The process is not the consumer of those 
-        epochs either: it closes its copies of the writing ends of 
-        their pipes.
+        process's to stop, and the lock may have been held by a 
+        thread that does not exist here
     """
     
-    global _EPOCHS_LOCK, _CONSUMER_PIPES_LOCK
+    global _EPOCHS_LOCK
     _EPOCHS_LOCK = RLock()
     del _EPOCHS[:]
-    for reading, writing in list(_CONSUMER_PIPES.values()):
-        try:
-            os.close(writing)
-        except OSError:  # pragma: no cover
-            pass
-    _CONSUMER_PIPES.clear()
-    _CONSUMER_PIPES_LOCK = RLock()
 
 
 if hasattr(os, 'register_at_fork'):
-    os.register_at_fork(before=_before_a_fork, after_in_parent=_after_a_fork,
-                        after_in_child=_forget_the_epochs_of_the_parent)
+    os.register_at_fork(after_in_child=_forget_the_epochs_of_the_parent)
 
 
 def close_writing_end(mpq):
@@ -344,6 +236,55 @@ def close_reading_end(mpq):
     return True
 
 
+def process_start(pid):
+    """
+        When a process was started, as the kernel records it. With 
+        the process id it identifies a process: an id is given to 
+        another process later, the time is not.
+        
+        Args:
+            pid (int): process id
+        
+        Returns:
+            int: the start time in clock ticks since the system was 
+                started, or None if there is no such process any 
+                more (also when it has ended and only waits to be 
+                collected by its parent)
+        
+        Raises:
+            OSError, ValueError, IndexError: when that cannot be 
+                told (a system without /proc raises 
+                NotADirectoryError)
+    """
+    
+    if not os.path.isdir("/proc/self"):
+        raise NotADirectoryError("/proc")
+    try:
+        with open("/proc/{}/stat".format(pid), "rb") as stat:
+            fields = stat.read()
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    # "pid (name) state parent ...": the name may hold anything
+    fields = fields.rsplit(b")", 1)[1].split()
+    if fields[0] in (b"Z", b"X"):
+        return None
+    return int(fields[19])
+
+
+def process_identity():
+    """
+        Returns:
+            tuple: (id of this process, its start time or None where 
+                that cannot be told)
+    """
+    
+    try:
+        started = process_start(os.getpid())
+    except (OSError, ValueError, IndexError):
+        started = None
+    return os.getpid(), started
+
+
 class Consumer(object):
     """
         In a worker process: the process that takes its batches, and 
@@ -356,21 +297,28 @@ class Consumer(object):
         - its parent process is no longer the one that started it. 
           With the "fork" and "spawn" start methods of 
           multiprocessing the parent is the consumer.
-        - the pipe of the epoch (Epoch.alive_reader) is at its end: 
-          the consumer, the only process with the writing end, is 
-          gone. This also works with the "forkserver" start method, 
-          where the parent of a worker is the fork server, which 
-          outlives the consumer.
+        - the process with the id of the consumer is gone, or is 
+          another process (it was started at another time). This 
+          also works with the "forkserver" start method, where the 
+          parent of a worker is the fork server, which outlives the 
+          consumer. Where the start time cannot be read (no /proc), 
+          only the existence of a process with that id is checked; 
+          a consumer that has ended and is not collected by its 
+          parent then still counts as there.
+        
+        Nothing here depends on what a process inherits when it is 
+        forked: a process that was forked from the consumer is 
+        another process.
         
         Args:
-            alive (multiprocessing.connection.Connection): the 
-                reading end of the pipe of the epoch (None: only the 
+            identity (tuple): (process id of the consumer, its start 
+                time or None), see process_identity (None: only the 
                 parent process is looked at)
     """
     
-    def __init__(self, alive=None):
+    def __init__(self, identity=None):
         self.parent = os.getppid()
-        self.alive = alive
+        self.pid, self.started = identity or (None, None)
     
     def gone(self):
         """
@@ -380,14 +328,22 @@ class Consumer(object):
         
         if os.getppid() != self.parent:
             return True
-        if self.alive is None:
+        if self.pid is None:
             return False
+        if self.started is not None:
+            try:
+                return process_start(self.pid) != self.started
+            except (OSError, ValueError, IndexError):
+                # (cannot be told now: the consumer counts as there)
+                return False
         try:
-            # nothing is ever written to the pipe: what can be read 
-            # from it is its end
-            return bool(self.alive.poll())
-        except (EOFError, OSError):
+            os.kill(self.pid, 0)
+        except ProcessLookupError:
             return True
+        except OSError:
+            # (not allowed to signal it: there is such a process)
+            return False
+        return False
 
 
 def stop_workers(epoch):
@@ -1064,7 +1020,7 @@ class MSequenceGenerator:
         """
         raise NotImplementedError("Method not implemented.")
 
-    def _proc_target(self, coords_df, mpq, proc_idx, alive=None):
+    def _proc_target(self, coords_df, mpq, proc_idx, consumer=None):
         """
             Function that will be executed in a separate process.
             Takes a dataframe of peak coordinates and parses them in 
@@ -1080,13 +1036,11 @@ class MSequenceGenerator:
                 
                 proc_idx (int): number of the worker
                 
-                alive (multiprocessing.connection.Connection): the 
-                    reading end of the pipe that shows whether the 
-                    process that takes the batches is still there 
-                    (see Consumer)
+                consumer (tuple): the identity of the process that 
+                    takes the batches (see Consumer)
         """
         
-        consumer = Consumer(alive)
+        consumer = Consumer(consumer)
         close_reading_end(mpq)
         
         # divide the coordinates dataframe into batches
@@ -1314,7 +1268,7 @@ class MSequenceGenerator:
                 # recorded before it is started, so that the epoch 
                 # can end it whatever happens right after the start.
                 p = mp.Process(target=self._proc_target, 
-                               args=[df, mpq, i, epoch.alive_reader])
+                               args=[df, mpq, i, epoch.consumer])
                 procs.append(p)
                 mp_queues.append(mpq)
                 p.start()
@@ -1410,7 +1364,6 @@ class MSequenceGenerator:
         for mpq in epoch.mp_queues:
             if mpq is not None:
                 mpq.close()
-        epoch.close()
 
         logging.debug(
             "{} Finished join for epoch".format(self._mode))
