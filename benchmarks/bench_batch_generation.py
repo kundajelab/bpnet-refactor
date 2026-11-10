@@ -30,7 +30,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from benchmarks.timing import compare, report
-from bpnet.generators import generators, sequtils
+from bpnet.generators import generators, sequtils, windows
 from tests import legacy_reference
 
 
@@ -69,6 +69,17 @@ def main():
         # Python list, all files opened for every batch
         legacy_reference.generate_batch_v0(gen, rows_of_batch)
 
+    def row_by_row_with_array_reads(rows_of_batch):
+        # the same, with every read handing over a float32 array: the
+        # construction right before all windows of a batch were read
+        # in one call
+        through_lists = legacy_reference.interval_values_v0
+        legacy_reference.interval_values_v0 = windows.interval_values
+        try:
+            legacy_reference.generate_batch_v0(gen, rows_of_batch)
+        finally:
+            legacy_reference.interval_values_v0 = through_lists
+
     def with_previous_encoder(construct):
         def run(rows_of_batch):
             present = sequtils.one_hot_encode
@@ -81,7 +92,8 @@ def main():
 
     comparisons = [
         ("everything as it was", with_previous_encoder(previous_construction)),
-        ("previous reading of the bigWigs", previous_construction),
+        ("bigWigs read row by row through lists", previous_construction),
+        ("bigWigs read row by row as arrays", row_by_row_with_array_reads),
         ("previous one hot encoder",
          with_previous_encoder(gen._generate_batch)),
     ]

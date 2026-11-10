@@ -4,8 +4,10 @@
     read them before (tests/legacy_reference.py)
 """
 
+import json
 import multiprocessing
 import os
+import pickle
 import random
 
 import numpy as np
@@ -38,9 +40,9 @@ def bigwig_path(tmp_path_factory):
                   ends=[int(p) + 1 for p in positions],
                   values=[float(v) for v in rng.poisson(3.0, size=300)])
     # a run of fractional and negative values, zero, very large and
-    # very small values, infinities and a stored NaN
+    # very small values, infinities, a stored NaN and a negative zero
     special = [0.1, -2.5, 0.0, 3.4e38, 1e-38, float("inf"), float("-inf"),
-               float("nan"), 7.0]
+               float("nan"), 7.0, -0.0]
     bw.addEntries(["chr1"] * len(special),
                   [1000 + i for i in range(len(special))],
                   ends=[1001 + i for i in range(len(special))],
@@ -70,6 +72,17 @@ def as_stored(values, n):
     return out
 
 
+def same_bits(a, b):
+    """
+        Whether two arrays have the same type, shape and bytes. (Equal
+        values are not enough for "bit for bit": 0.0 equals -0.0.)
+    """
+
+    a, b = np.asarray(a), np.asarray(b)
+    return a.dtype == b.dtype and a.shape == b.shape and \
+        a.tobytes() == b.tobytes()
+
+
 INTERVALS = [
     ("chr1", 100, 900), ("chr1", 0, 2000), ("chr1", 0, 100),
     ("chr1", 900, 1000), ("chr1", 995, 1012), ("chr1", 1005, 1006),
@@ -84,7 +97,7 @@ def test_same_values_as_the_previous_way_of_reading(bigwig, chrom, start,
     new = windows.interval_values(bigwig, chrom, start, end)
     old = interval_values_v0(bigwig, chrom, start, end)
     assert len(new) == len(old) == n
-    assert np.array_equal(as_stored(new, n), as_stored(old, n))
+    assert same_bits(as_stored(new, n), as_stored(old, n))
     assert not np.isnan(as_stored(new, n)).any()
 
 
@@ -92,10 +105,14 @@ def test_positions_without_data_are_zero_and_infinities_stay(bigwig):
     values = windows.interval_values(bigwig, "chr1", 995, 1012)
     expected = np.array(
         [0, 0, 0, 0, 0, 0.1, -2.5, 0.0, 3.4e38, 1e-38, np.inf, -np.inf, 0,
-         7.0, 0, 0, 0], dtype=np.float32)
-    assert np.array_equal(values, expected)
+         7.0, -0.0, 0, 0], dtype=np.float32)
+    # the stored negative zero keeps its sign; a position without data
+    # and the stored NaN become positive zeros
+    assert same_bits(values, expected)
+    assert np.flatnonzero(np.signbit(values)).tolist() == [6, 11, 14]
     # nothing but gaps
-    assert not windows.interval_values(bigwig, "chr2", 200, 300).any()
+    gaps = windows.interval_values(bigwig, "chr2", 200, 300)
+    assert same_bits(gaps, np.zeros(100, dtype=np.float32))
 
 
 def test_values_are_a_float32_array_of_the_callers(bigwig):
@@ -152,7 +169,7 @@ def test_pybigwig_without_numpy(bigwig, monkeypatch):
         n = end - start
         slow = windows.interval_values(bigwig, chrom, start, end)
         assert slow.dtype == np.float64
-        assert np.array_equal(
+        assert same_bits(
             as_stored(slow, n),
             as_stored(interval_values_v0(bigwig, chrom, start, end), n))
 
@@ -269,8 +286,7 @@ def test_windows_of_a_batch(two_files, case):
         for channel, bw in enumerate(files):
             expected = as_stored(
                 interval_values_v0(bw, chrom, start, start + width), width)
-            assert np.array_equal(values[row, channel], expected), \
-                (row, channel)
+            assert same_bits(values[row, channel], expected), (row, channel)
 
 
 def test_many_random_windows(two_files):
@@ -289,8 +305,8 @@ def test_many_random_windows(two_files):
         for channel, bw in enumerate(files):
             expected = as_stored(interval_values_v0(
                 bw, "chr1", starts[row], starts[row] + 100), 100)
-            assert np.array_equal(values[row, channel], expected)
-    assert np.array_equal(again, values[:5])
+            assert same_bits(values[row, channel], expected)
+    assert same_bits(again, values[:5])
 
 
 @pytest.mark.parametrize("chroms,starts,width", [
@@ -319,8 +335,42 @@ def test_reader_of_a_file_without_data(two_files, tmp_path):
     try:
         with pytest.raises(ValueError, match="empty.bw holds no data"):
             reader.read(["chr1"], [0], 10)
+        # every time, not only at the first read
+        with pytest.raises(ValueError, match="empty.bw holds no data"):
+            reader.read(["chr1", "chr2"], [100, 0], 10)
     finally:
         reader.close()
+
+
+def test_reader_of_a_file_whose_first_chromosome_is_empty(tmp_path):
+    """
+        Whether a file holds data is seen from what a read returns,
+        not by trying its first chromosome: that one may have length
+        zero, or no entries, while the windows are elsewhere
+    """
+
+    path = str(tmp_path / "first_chromosome_of_length_zero.bw")
+    bw = pyBigWig.open(path, "w")
+    bw.addHeader([("zero", 0), ("gap", 50), ("chr1", 100)], maxZooms=0)
+    bw.addEntries(["chr1"], [10], ends=[20], values=[2.0])
+    bw.close()
+
+    bw = pyBigWig.open(path)
+    reader = windows.WindowReader([path])
+    try:
+        expected = as_stored(interval_values_v0(bw, "chr1", 5, 25), 20)
+        assert expected.tolist() == [0.0] * 5 + [2.0] * 10 + [0.0] * 5
+        values = reader.read(["chr1", "gap"], [5, 0], 20)
+        assert same_bits(values[0, 0], expected)
+        assert same_bits(values[1, 0], np.zeros(20, dtype=np.float32))
+        # the chromosome of length zero has no window that can be read
+        with pytest.raises(RuntimeError):
+            interval_values_v0(bw, "zero", 0, 1)
+        with pytest.raises(RuntimeError):
+            reader.read(["zero"], [0], 1)
+    finally:
+        reader.close()
+        bw.close()
 
 
 def test_reader_without_windows_or_files(two_files):
@@ -373,6 +423,10 @@ DATASETS = {
     "unstranded": dict(stranded=False),
     "without control": dict(with_control=False),
     "two tasks": dict(num_tasks=2),
+    # the first task with one track, the second with two, the third
+    # with one: the tracks of a task do not start at a multiple of
+    # anything
+    "tasks with one and two tracks": dict(num_tasks=3, one_track=["0", "2"]),
     "smoothed control": dict(smoothing=[[7.0, 81], [7.0, 81]]),
     "one smoothed control": dict(smoothing=[None, [3.0, 21]]),
 }
@@ -380,17 +434,21 @@ DATASETS = {
 
 @pytest.fixture(scope="module", params=sorted(DATASETS))
 def variant(request, tmp_path_factory):
-    import json
-
     options = dict(DATASETS[request.param])
     smoothing = options.pop("smoothing", None)
+    one_track = options.pop("one_track", [])
     directory = str(tmp_path_factory.mktemp("variant"))
     options.update(SMALL)
     dataset = synth.make_dataset(directory, **options)
-    if smoothing is not None:
+    if smoothing is not None or one_track:
         with open(dataset["input_json"]) as fh:
             tasks = json.load(fh)
-        tasks["0"]["bias"]["smoothing"] = smoothing
+        if smoothing is not None:
+            tasks["0"]["bias"]["smoothing"] = smoothing
+        for task in one_track:
+            for kind in ("signal", "bias"):
+                tasks[task][kind]["source"] = tasks[task][kind]["source"][:1]
+            tasks[task]["bias"]["smoothing"] = [None]
         with open(dataset["input_json"], "w") as fh:
             json.dump(tasks, fh)
     return dataset
@@ -468,7 +526,7 @@ def test_batches_equal_the_previous_batch_construction(variant, mode):
         assert [name for name, _ in new] == [name for name, _ in old]
         for (name, a), (_, b) in zip(new, old):
             assert a.dtype == b.dtype and a.shape == b.shape, name
-            assert np.array_equal(a, b), (name, start)
+            assert same_bits(a, b), (name, start)
             compared += 1
     assert compared >= 5 * (n_rows // 16) > 0
 
@@ -502,3 +560,35 @@ def test_files_are_opened_once_per_process(synth_dataset):
     assert queue.get(timeout=120) == (True, True)
     child.join()
     assert generator._opened_files is first
+
+
+def test_open_files_are_not_pickled(synth_dataset):
+    """
+        A generator that has read a batch can still be pickled (worker
+        processes that are spawned instead of forked get it that way);
+        the copy opens the files for itself
+    """
+
+    params = {"sequence_generator_name": "BPNet",
+              "input_seq_len": synth_dataset["input_len"],
+              "output_len": synth_dataset["output_len"],
+              "rev_comp_aug": False, "max_jitter": 0, "shuffle": False,
+              "mode": "val"}
+    generator = generators.MBPNetSequenceGenerator(
+        synth_dataset["input_json"], params, synth_dataset["fasta"],
+        synth_dataset["chrom_sizes"], synth_dataset["chroms"], num_threads=1,
+        batch_size=16, epochs=1)
+    fresh = pickle.loads(pickle.dumps(generator))
+    batch = generator._generate_batch(batch_rows(generator, 0, 16))
+    opened = generator._opened_files
+    assert opened is not None
+
+    copy = pickle.loads(pickle.dumps(generator))
+    assert generator._opened_files is opened
+    for other in (fresh, copy):
+        assert getattr(other, "_opened_files", None) is None
+        again = other._generate_batch(batch_rows(other, 0, 16))
+        assert other._opened_files[0] == os.getpid()
+        assert other._opened_files is not opened
+        for (name, a), (_, b) in zip(flat(again), flat(batch)):
+            assert same_bits(a, b), name

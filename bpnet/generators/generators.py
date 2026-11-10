@@ -949,6 +949,13 @@ class MBPNetSequenceGenerator(MSequenceGenerator):
             that was opened in the parent must not be read from a 
             forked process)
             
+            The files must not change while batches are generated 
+            from them: a process keeps reading the files it opened. 
+            (Before, every batch opened them again, so that a file 
+            replaced in the middle of an epoch went into the rest of 
+            that epoch.) The worker processes of gen() end with their 
+            epoch, and the next epoch opens the files again.
+            
             Returns:
                 tuple: (dict task -> windows.WindowReader of its 
                     signal files, dict task -> windows.WindowReader of 
@@ -968,6 +975,17 @@ class MBPNetSequenceGenerator(MSequenceGenerator):
                       pyfaidx.Fasta(self._reference))
             self._opened_files = opened
         return opened[1:]
+    
+    def __getstate__(self):
+        """
+            What is pickled of a generator (for a worker process that 
+            is spawned instead of forked, for example): everything 
+            but the open files, which every process opens for itself
+        """
+        
+        state = self.__dict__.copy()
+        state.pop('_opened_files', None)
+        return state
     
     def _generate_batch(self, coords):
         """

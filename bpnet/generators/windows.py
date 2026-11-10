@@ -69,8 +69,6 @@ class WindowReader(object):
     def __init__(self, paths):
         self.paths = list(paths)
         self._files = [pyBigWig.open(path) for path in self.paths]
-        #: whether the files were looked at for data (at the first read)
-        self._checked = False
 
     def close(self):
         """
@@ -87,7 +85,12 @@ class WindowReader(object):
 
             A window on a chromosome a file does not have, or one that
             reaches beyond the chromosome, raises RuntimeError (as
-            pyBigWig does for a single interval).
+            pyBigWig does for a single interval). A file with a header
+            and no entries returns nothing for any interval, which
+            cannot be stored into a batch: it raises ValueError, by
+            name, when it is read (not when it is opened: the control
+            files of a run whose control inputs are set to zero are
+            never read).
 
             Args:
                 chroms (list): chromosome of each window
@@ -107,32 +110,19 @@ class WindowReader(object):
         if len(chroms) == 0 or len(self.paths) == 0:
             return out
 
-        if not self._checked:
-            self._check_for_data()
-
         groups = _overlapping_windows(chroms, starts, width)
         for channel, bigwig in enumerate(self._files):
             for chrom, first, last, members in groups:
                 values = interval_values(bigwig, chrom, first, last)
+                if len(values) != last - first:
+                    raise ValueError(
+                        "The bigWig file {} holds no data (it has no "
+                        "values to return for {}:{}-{})".format(
+                            self.paths[channel], chrom, first, last))
                 for row in members:
                     offset = starts[row] - first
                     out[row, channel, :] = values[offset:offset + width]
         return out
-
-    def _check_for_data(self):
-        """
-            A file with a header and no entries returns nothing for
-            any interval, which cannot be stored into a batch. Such a
-            file is refused at the first read, by name.
-        """
-
-        for path, bigwig in zip(self.paths, self._files):
-            sizes = bigwig.chroms()
-            if len(sizes) == 0 or \
-                    len(bigwig.values(next(iter(sizes)), 0, 1)) != 1:
-                raise ValueError(
-                    "The bigWig file {} holds no data".format(path))
-        self._checked = True
 
 
 def _overlapping_windows(chroms, starts, width):
