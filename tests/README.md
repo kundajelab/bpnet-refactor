@@ -40,6 +40,7 @@ Tests run on the CPU. Set `BPNET_TEST_GPU=1` to let TensorFlow use a GPU.
 | `test_cli_end_to_end.py` | (slow) `bpnet-train` then `bpnet-predict` as subprocesses on the synthetic dataset, on every TensorFlow version; predictions, metric files and bigWigs recomputed from the saved weights with the numpy reference; the weights a run starts from and the loci `--seed` selects, from runs with a learning rate of zero |
 | `test_cli_failures.py` | (slow) failures inside `bpnet-train` reach the exit status |
 | `legacy_reference.py` | earlier implementations of functions that were replaced by faster ones, kept verbatim to prove equality |
+| `test_bigwig_reading.py` | how the batch generator reads a bigWig interval: same values as the previous way for every kind of value a file can hold (gaps, infinities, a stored NaN), same failures, and whole batches array by array |
 | `data/` | small hand-made input files; `data/saved_models/` holds small models saved by each supported TensorFlow version and the script that wrote them |
 
 ## Known defects
