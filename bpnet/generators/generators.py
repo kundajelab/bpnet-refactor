@@ -162,6 +162,11 @@ class MSequenceGenerator:
                 
                 *mode (str)*
                     'train', 'val' or 'test'
+                
+                *sequence_dtype (str)*
+                    optional: numpy type of the one hot encoded 
+                    sequences of a batch, 'float64' when not given. 
+                    With 'int8' a batch is about a third of the size
                  
             reference_genome (str): the path to the reference genome 
                 fasta file
@@ -374,6 +379,23 @@ class MSequenceGenerator:
         
         #: if True, shuffle the data before the beginning of the epoch
         self._shuffle = batch_gen_params['shuffle']
+        
+        #: type of the one hot encoded sequences in a batch. float64 
+        #: is what this class has always produced; the command line 
+        #: tools ask for int8, which is an eighth of the size to hand 
+        #: from the worker processes to the model (the model converts 
+        #: either to float32, with the same values)
+        try:
+            self._sequence_dtype = np.dtype(
+                batch_gen_params.get('sequence_dtype', 'float64'))
+        except TypeError:
+            self._sequence_dtype = None
+        if self._sequence_dtype is None or \
+                self._sequence_dtype.kind not in 'biuf':
+            raise NoTracebackException(
+                "sequence_dtype must be a numeric numpy type such as "
+                "'float64' or 'int8', not {!r}".format(
+                    batch_gen_params.get('sequence_dtype')))
         
         # list of loci dataframes for each epoch
         self._loci = []
@@ -1043,6 +1065,11 @@ class MBPNetSequenceGenerator(MSequenceGenerator):
                 
                 *mode (str)*
                     'train', 'val' or 'test'
+                
+                *sequence_dtype (str)*
+                    optional: numpy type of the one hot encoded 
+                    sequences of a batch, 'float64' when not given. 
+                    With 'int8' a batch is about a third of the size
                  
             reference_genome (str): the path to the reference genome 
                 fasta file
@@ -1361,7 +1388,8 @@ class MBPNetSequenceGenerator(MSequenceGenerator):
 
         # Step 4. one hot encode all the sequences in the batch 
         if len(sequences) == profile_predictions.shape[0]:
-            X = sequtils.one_hot_encode(sequences, self._input_flank * 2)
+            X = sequtils.one_hot_encode(
+                sequences, self._input_flank * 2, self._sequence_dtype)
         else:
             raise NoTracebackException(
                 "Unable to generate enough sequences for the batch")

@@ -72,6 +72,10 @@ def main():
     batch_gen_params['rev_comp_aug'] = args.reverse_complement_augmentation
     batch_gen_params['max_jitter'] = args.max_jitter
     batch_gen_params['shuffle'] = args.shuffle
+    # one hot sequences leave the worker processes as int8: the model 
+    # turns them into the same float32 values as it did the float64 
+    # arrays, and a batch is a third of the size to hand over
+    batch_gen_params['sequence_dtype'] = 'int8'
     
     # hyper parameters
     hyper_params = {}

@@ -200,6 +200,47 @@ def forward_case(case):
             "n_signal": n_signal}
 
 
+@pytest.mark.parametrize("case,dtype", [
+    (case, "int8") for case in sorted(FORWARD_CASES)] + [
+    ("two strands with control", dtype)
+    for dtype in ("uint8", "bool", "float32", "int64")])
+def test_type_of_the_one_hot_input_does_not_matter(case, dtype):
+    """
+        bpnet-train and bpnet-predict hand the sequences to the model
+        as int8. The model computes from them, bit for bit, what it
+        computes from the float64 arrays it was given before: both
+        become the same float32 input.
+    """
+
+    made = forward_case(case)
+    model, inputs = made["model"], made["inputs"]
+    assert inputs["sequence"].dtype == np.float64
+    other = dict(inputs, sequence=inputs["sequence"].astype(dtype))
+    assert np.array_equal(other["sequence"], inputs["sequence"])
+
+    expected = predict(model, inputs)
+    found = predict(model, other)
+    assert len(found) == len(expected) == 2
+    for a, b in zip(found, expected):
+        assert a.dtype == b.dtype == np.float32
+        assert a.tobytes() == b.tobytes()
+    # the way bpnet-predict calls the model
+    for a, b in zip(model.predict(other), model.predict(inputs)):
+        assert a.dtype == b.dtype == np.float32
+        assert a.tobytes() == b.tobytes()
+
+
+def test_int8_input_of_the_released_architecture():
+    model = build(copy.deepcopy(RELEASED_PARAMS))
+    randomize_weights(model, seed=5)
+    inputs, _, _ = random_batch(RELEASED_PARAMS, batch_size=3, seed=6)
+    assert inputs["sequence"].shape == (3, 2114, 4)
+    as_int8 = dict(inputs, sequence=inputs["sequence"].astype(np.int8))
+    for a, b in zip(model.predict(as_int8), model.predict(inputs)):
+        assert a.tobytes() == b.tobytes()
+    assert as_int8["sequence"].nbytes * 8 == inputs["sequence"].nbytes
+
+
 @pytest.mark.parametrize("case", sorted(FORWARD_CASES))
 def test_forward_pass_matches_the_reference(case):
     made = forward_case(case)

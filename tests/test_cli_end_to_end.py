@@ -66,11 +66,15 @@ LAYERS = ["main_conv_0", "main_dil_conv_1", "main_dil_conv_2",
 TIMEOUT = 900
 
 
-def run_cli(module, args, cwd):
+def run_cli(module, args, cwd, code=None):
     """
         Run `python -m <module> <args>` in its own process group;
         returns (return code, output). The whole group is killed when
         the tool does not finish in time.
+
+        With `code`, `python -c <code> <args>` is run instead (a
+        script that changes something and then calls the tool's
+        main()).
     """
 
     import signal
@@ -79,8 +83,9 @@ def run_cli(module, args, cwd):
     env["PYTHONPATH"] = REPO + os.pathsep + env.get("PYTHONPATH", "")
     if not env.get("BPNET_TEST_GPU"):
         env["CUDA_VISIBLE_DEVICES"] = ""
+    command = ["-m", module] if code is None else ["-c", code]
     proc = subprocess.Popen(
-        [sys.executable, "-m", module] + [str(a) for a in args], cwd=cwd,
+        [sys.executable] + command + [str(a) for a in args], cwd=cwd,
         env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         universal_newlines=True, start_new_session=True)
     try:
@@ -94,7 +99,7 @@ def run_cli(module, args, cwd):
 
 
 def run_trainer(d, workdir, epochs=EPOCHS, max_jitter=8,
-                learning_rate=0.001, extra=()):
+                learning_rate=0.001, extra=(), threads=2, code=None):
     """
         Run bpnet-train on the synthetic dataset `d` in `workdir`
     """
@@ -110,10 +115,11 @@ def run_trainer(d, workdir, epochs=EPOCHS, max_jitter=8,
         "--sequence-generator-name", "BPNet",
         "--model-output-filename", "model",
         "--input-seq-len", d["input_len"], "--output-len", d["output_len"],
-        "--max-jitter", max_jitter, "--shuffle", "--threads", 2,
+        "--max-jitter", max_jitter, "--shuffle", "--threads", threads,
         "--epochs", epochs, "--batch-size", 16,
         "--reverse-complement-augmentation",
-        "--learning-rate", learning_rate] + list(extra), cwd=str(workdir))
+        "--learning-rate", learning_rate] + list(extra), cwd=str(workdir),
+        code=code)
     return {"code": code, "output": output, "dir": str(model_dir),
             "model": str(model_dir / "model_split000")}
 
@@ -234,6 +240,88 @@ def test_train_writes_model_history_and_config(synth_dataset, trained):
     assert config["model_filename"] == trained["model"]
     assert config["hyper_params"]["batch_size"] == 16
     assert config["batch_gen_params"]["max_jitter"] == 8
+    # the sequences go from the worker processes to the model as int8
+    assert config["batch_gen_params"]["sequence_dtype"] == "int8"
+
+
+#: bpnet-train with the one hot sequences of the batches as float64,
+#: the type they had before the tool asked the generator for int8
+TRAIN_WITH_FLOAT64_SEQUENCES = """
+from bpnet.cli import bpnettrainer
+
+train = bpnettrainer.training.train_and_validate_ksplits
+
+
+def with_float64_sequences(*args, **kwargs):
+    settings = [value for value in list(args) + list(kwargs.values())
+                if isinstance(value, dict) and 'sequence_dtype' in value]
+    assert len(settings) == 1 and settings[0]['sequence_dtype'] == 'int8'
+    settings[0]['sequence_dtype'] = 'float64'
+    return train(*args, **kwargs)
+
+
+bpnettrainer.training.train_and_validate_ksplits = with_float64_sequences
+bpnettrainer.main()
+"""
+
+
+@pytest.fixture(scope="module")
+def trained_with_either_type(synth_dataset, tmp_path_factory):
+    """
+        Two bpnet-train runs that see the same batches in the same
+        order: one worker process and no jitter. (With more workers
+        the order of the batches depends on which worker is done
+        first, and the jitter comes from a random generator that
+        Python seeds anew in every worker process.) One run as the
+        tool is, one with the sequences as float64.
+    """
+
+    runs = {}
+    for name, code in [("int8", None),
+                       ("float64", TRAIN_WITH_FLOAT64_SEQUENCES)]:
+        runs[name] = run_trainer(
+            synth_dataset, tmp_path_factory.mktemp(name), epochs=2,
+            max_jitter=0, threads=1, code=code)
+    return runs
+
+
+@pytest.mark.skipif(
+    bool(os.environ.get("BPNET_TEST_GPU")),
+    reason="two training runs on a GPU do not repeat to the last bit")
+def test_trained_model_does_not_depend_on_the_type_of_the_sequences(
+        trained_with_either_type):
+    """
+        The whole of bpnet-train with int8 sequences against the same
+        run with float64 sequences: the same losses in every epoch and
+        the same saved weights, bit for bit
+    """
+
+    runs = trained_with_either_type
+    histories, weights = {}, {}
+    for name, run in runs.items():
+        assert run["code"] == 0, run["output"][-3000:]
+        config = read_json(os.path.join(run["dir"], "config_split000.json"))
+        assert config["batch_gen_params"]["sequence_dtype"] == name
+        assert config["training_epochs"] == 2
+        histories[name] = read_json(run["model"] + ".history.json")
+        weights[name] = weights_by_layer_name(run["model"])
+
+    timing = {"start_time", "end_time", "elapsed"}
+    assert set(histories["int8"]) == set(HISTORY_KEYS)
+    compared = 0
+    for key in sorted(set(HISTORY_KEYS) - timing):
+        assert histories["int8"][key] == histories["float64"][key], key
+        compared += 1
+    assert compared == len(HISTORY_KEYS) - 3 >= 9
+    # the model was trained: the loss moved
+    assert histories["int8"]["loss"]["2"] != histories["int8"]["loss"]["1"]
+
+    assert sorted(weights["int8"]) == sorted(weights["float64"]) == \
+        sorted(LAYERS)
+    for layer in LAYERS:
+        for a, b in zip(weights["int8"][layer], weights["float64"][layer]):
+            assert a.dtype == b.dtype == np.float32
+            assert a.tobytes() == b.tobytes(), layer
 
 
 def test_last_validation_loss_is_the_saved_models_loss(synth_dataset, trained):
@@ -417,6 +505,47 @@ def test_saved_weights_are_readable_by_layer_name(trained):
 # --------------------------------------------------------------------
 # bpnet-predict
 # --------------------------------------------------------------------
+
+#: bpnet-predict, with a note of the type of the sequences in every
+#: batch the model is given
+PREDICT_AND_NOTE_SEQUENCE_TYPES = """
+import tensorflow as tf
+from bpnet.cli import predict
+
+model_predict = tf.keras.Model.predict
+
+
+def noted(self, batch, *args, **kwargs):
+    with open('sequence_types.txt', 'a') as note:
+        note.write(str(batch['sequence'].dtype) + chr(10))
+    return model_predict(self, batch, *args, **kwargs)
+
+
+tf.keras.Model.predict = noted
+predict.predict_main()
+"""
+
+
+def test_predict_gives_the_model_int8_sequences(synth_dataset, trained,
+                                                tmp_path):
+    assert trained["code"] == 0, trained["output"][-3000:]
+    d = synth_dataset
+    code, output = run_cli("bpnet.cli.predict", [
+        "--model", trained["model"], "--chrom-sizes", d["chrom_sizes"],
+        "--chroms"] + d["splits"]["0"]["test"] + [
+        "--test-indices-file", "None", "--reference-genome", d["fasta"],
+        "--output-dir", tmp_path, "--input-data", d["input_json"],
+        "--sequence-generator-name", "BPNet",
+        "--input-seq-len", d["input_len"], "--output-len", d["output_len"],
+        "--output-window-size", d["output_len"], "--batch-size", 16,
+        "--threads", 1], cwd=str(tmp_path),
+        code=PREDICT_AND_NOTE_SEQUENCE_TYPES)
+    assert code == 0, output[-3000:]
+    with open(str(tmp_path / "sequence_types.txt")) as fh:
+        types = fh.read().split()
+    assert len(types) >= 2 and set(types) == {"int8"}
+    assert os.path.isfile(str(tmp_path / "model_split000_predictions.h5"))
+
 
 def test_predict_output_files(predicted):
     files = set(os.listdir(predicted["dir"]))
