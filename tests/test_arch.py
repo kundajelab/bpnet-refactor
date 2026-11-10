@@ -156,8 +156,16 @@ FORWARD_CASES = {
 }
 
 
-@pytest.mark.parametrize("case", sorted(FORWARD_CASES))
-def test_forward_pass_matches_the_reference(case):
+def forward_case(case):
+    """
+        The model of a case with random weights, and a random batch
+        for it
+
+        Returns:
+            dict: 'model', 'weights' (by layer name), 'params',
+                'inputs', 'orig_multi_loss', 'n_signal'
+    """
+
     options = dict(FORWARD_CASES[case])
     params = small_params(**options.pop("params", {}))
     n_signal = options.pop("n_signal", 2)
@@ -187,18 +195,26 @@ def test_forward_pass_matches_the_reference(case):
             params["output_profile_len"]
         inputs["profile_bias_input_0"] = \
             inputs["profile_bias_input_0"][:, :params["output_profile_len"]]
+    return {"model": model, "weights": weights, "params": params,
+            "inputs": inputs, "orig_multi_loss": orig_multi_loss,
+            "n_signal": n_signal}
 
-    profile, counts = predict(model, inputs)
+
+@pytest.mark.parametrize("case", sorted(FORWARD_CASES))
+def test_forward_pass_matches_the_reference(case):
+    made = forward_case(case)
+    inputs = made["inputs"]
+    profile, counts = predict(made["model"], inputs)
     expected_profile, expected_counts = reference_model.forward(
-        weights, params, inputs["sequence"],
+        made["weights"], made["params"], inputs["sequence"],
         inputs.get("profile_bias_input_0"), inputs.get("counts_bias_input_0"),
-        orig_multi_loss=orig_multi_loss)
+        orig_multi_loss=made["orig_multi_loss"])
 
     assert profile.shape == expected_profile.shape
     assert counts.shape == expected_counts.shape
     np.testing.assert_allclose(profile, expected_profile, rtol=1e-4, atol=1e-4)
     np.testing.assert_allclose(counts, expected_counts, rtol=1e-4, atol=1e-4)
-    assert profile.shape[2] == n_signal
+    assert profile.shape[2] == made["n_signal"]
 
 
 def test_forward_pass_of_the_released_architecture():

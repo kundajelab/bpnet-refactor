@@ -282,6 +282,17 @@ bpnet-predict \
 This script will output test metrics and also output bigwig tracks if the 
 `--generate-predicted-profile-bigWigs` is specified
 
+`--model` takes a model saved by `bpnet-train` under any supported TensorFlow version (a SavedModel directory, or an HDF5 file from older releases), whatever TensorFlow version is installed now; the released ENCODE models, which were saved under TensorFlow 2.4.1, load under newer versions too. To load a model in Python:
+
+```
+from bpnet.model import loading
+model = loading.load_model("models/model_split000")
+profile_logits, log_counts = model.predict(
+    {"sequence": one_hot_sequences,
+     "profile_bias_input_0": control_profiles,
+     "counts_bias_input_0": control_log_counts})
+```
+
 It is usefull to also make predictions on all the peaks as the model predictions provide denoised version of the observed signal.
 ```
 bpnet-predict \
