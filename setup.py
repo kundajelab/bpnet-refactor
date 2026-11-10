@@ -11,7 +11,7 @@ setup(
     author="Surag Nair, Vivekanandan Ramalingam, Zahoor Zafrulla",
     author_email="zahoor@stanford.edu",
     url="https://github.com/kundajelab/bpnet",
-    packages=find_packages(exclude=["docs", "docs-build"]),
+    packages=find_packages(exclude=["docs", "docs-build", "tests", "tests.*"]),
     install_requires=["tensorflow==2.4.1", 
                       "tensorflow-probability==0.12.2","pysam==0.18.0","py2bit==0.3.0",
                       "tqdm", "scikit-learn",
