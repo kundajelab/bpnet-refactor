@@ -41,6 +41,11 @@ def expected_tracks(header, regions, data):
         regions overlap, the first one supplies the positions before
         the midpoint between the two regions' centres (the 4th element
         of a region) and the second one the rest.
+
+        This states the rule for what both writers are given: regions
+        of one width, so that centres are ordered like starts. It is
+        not a specification for arbitrary intervals; the writers do not
+        handle a region nested inside a longer one.
     """
 
     order = {c: i for i, (c, _) in enumerate(header)}
@@ -109,6 +114,10 @@ def test_disjoint_regions_in_any_order(tmp_path):
                ("chr10", 0, 40, 20), ("chr1", 10, 60, 35),
                ("chr1", 940, 1000, 970)]
     run_write_bigwig(tmp_path, regions)
+
+
+def test_single_region(tmp_path):
+    run_write_bigwig(tmp_path, [("chr2", 700, 800, 750)])
 
 
 def test_chromosomes_follow_the_header_order(tmp_path):

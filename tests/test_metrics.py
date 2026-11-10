@@ -7,7 +7,7 @@
 import numpy as np
 import pytest
 from scipy.special import gammaln
-from scipy.stats import rankdata
+from scipy.stats import multinomial, rankdata
 
 pytest.importorskip("tensorflow")
 
@@ -96,17 +96,13 @@ def expected_metrics(true, pred):
                                rankdata(pred_prob))[0, 1]
 
     best_mnll = mnll(true, fix_sum(true_prob))
-    if not np.isfinite(best_mnll):
+    if best_bound_collapses(true):
         best_mnll = 0.0
     return {
         "profile_pearsonrs": pearson,
         "profile_spearmanrs": spearman,
         "profile_mnlls": normalize(mnll(true, pred_prob), best_mnll,
                                    mnll(true, uniform)),
-        # see assert_metrics_equal: the value the package reports when
-        # its best-case bound collapses to 0
-        "profile_mnlls_collapsed_bound": normalize(
-            mnll(true, pred_prob), 0.0, mnll(true, uniform)),
         "profile_cross_entropys": normalize(
             cross_entropy(true, pred_prob), cross_entropy(true, true_prob),
             cross_entropy(true, uniform)),
@@ -116,30 +112,30 @@ def expected_metrics(true, pred):
     }
 
 
+def best_bound_collapses(true):
+    """
+        Whether the likelihood score's best-case bound is replaced by 0
+        for this profile in this environment.
+
+        The bound is the likelihood of the observed profile under its
+        own proportions, computed with scipy.stats.multinomial. Some
+        scipy versions recompute the last probability as 1 minus the
+        sum of the others; when the last position has no reads,
+        round-off can make that a tiny negative number, scipy returns
+        NaN, and the package then uses 0 as the bound. This is a quirk
+        of the implementation, not part of the metric's definition
+        (see test_likelihood_bound_does_not_depend_on_round_off); the
+        check is made with scipy itself so that the tests state the
+        mathematical value wherever the quirk does not strike.
+    """
+
+    probs = fix_sum(true / true.sum())
+    value = multinomial(true.sum(), probs).logpmf(true)
+    return not np.isfinite(value)
+
+
 def assert_metrics_equal(got, expected, rtol=1e-8):
-    """
-        Compare reported metrics with the formulas.
-
-        The likelihood score has two admissible values. Its best-case
-        bound is the likelihood of the observed profile under its own
-        proportions, computed with scipy.stats.multinomial, which
-        recomputes the last probability as 1 minus the sum of the
-        others. When the last position has no reads, round-off decides
-        whether that comes out as 0 or as a tiny negative number; in
-        the second case scipy returns NaN and the package uses 0 as the
-        bound. Which case occurs depends on the profile and on the
-        scipy version (see test_likelihood_bound_does_not_depend_on_
-        round_off).
-    """
-
     for key, value in expected.items():
-        if key == "profile_mnlls_collapsed_bound":
-            continue
-        if key == "profile_mnlls":
-            candidates = [value, expected["profile_mnlls_collapsed_bound"]]
-            assert any(np.isclose(got[key], c, rtol=rtol, atol=1e-10)
-                       for c in candidates), (key, got[key], candidates)
-            continue
         np.testing.assert_allclose(got[key], value, rtol=rtol, atol=1e-10,
                                    err_msg=key)
 
@@ -179,6 +175,31 @@ def test_metrics_match_the_formulas(seed, noise):
     assert_metrics_equal(got, expected_metrics(true, pred))
     assert got["all_true_logcounts"] == 3.0
     assert got["all_pred_logcounts"] == 2.5
+
+
+def test_likelihood_score_with_exactly_representable_proportions():
+    """
+        128 reads: every proportion is a multiple of 1/128 and they add
+        up to exactly 1, so no round-off is involved and the score is
+        the mathematical one in every environment
+    """
+
+    rng = np.random.RandomState(13)
+    for _ in range(20):
+        true = np.bincount(rng.randint(0, 100, size=128),
+                           minlength=100).astype(np.float64)
+        true[-1] = 0.0
+        true[0] += 128 - true.sum()
+        assert not best_bound_collapses(true)
+        pred = true + rng.uniform(0.5, 1.5, size=100)
+        got = run_update(true, pred)
+        n = len(true)
+        value = mnll(true, fix_sum(pred / pred.sum()))
+        best = mnll(true, true / true.sum())
+        worst = mnll(true, np.ones(n) / n)
+        np.testing.assert_allclose(
+            got["profile_mnlls"], normalize(value, best, worst), rtol=1e-9)
+        assert 0.0 < got["profile_mnlls"] < 1.0
 
 
 def test_metrics_of_a_random_prediction_match_the_formulas():

@@ -16,6 +16,7 @@ import h5py
 import numpy as np
 import pytest
 from scipy.special import logsumexp
+from scipy.stats import rankdata
 
 tf = pytest.importorskip("tensorflow")
 
@@ -37,20 +38,36 @@ HISTORY_KEYS = [
     "val_loss", "val_profile_predictions_loss"]
 
 
+#: seconds after which a command line tool is considered hung (a worker
+#: process that dies leaves the batch generator waiting forever)
+TIMEOUT = 900
+
+
 def run_cli(module, args, cwd):
     """
-        Run `python -m <module> <args>`; returns (return code, output)
+        Run `python -m <module> <args>` in its own process group;
+        returns (return code, output). The whole group is killed when
+        the tool does not finish in time.
     """
+
+    import signal
 
     env = dict(os.environ)
     env["PYTHONPATH"] = REPO + os.pathsep + env.get("PYTHONPATH", "")
     if not env.get("BPNET_TEST_GPU"):
         env["CUDA_VISIBLE_DEVICES"] = ""
-    proc = subprocess.run(
+    proc = subprocess.Popen(
         [sys.executable, "-m", module] + [str(a) for a in args], cwd=cwd,
         env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        universal_newlines=True)
-    return proc.returncode, proc.stdout
+        universal_newlines=True, start_new_session=True)
+    try:
+        output, _ = proc.communicate(timeout=TIMEOUT)
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        output, _ = proc.communicate()
+        pytest.fail("{} did not finish within {} s\n{}".format(
+            module, TIMEOUT, output[-3000:]))
+    return proc.returncode, output
 
 
 @pytest.fixture(scope="module")
@@ -101,10 +118,13 @@ def predicted(synth_dataset, trained, tmp_path_factory):
         "--output-window-size", d["output_len"], "--batch-size", 16,
         "--reverse-complement-average", "--threads", 2,
         "--generate-predicted-profile-bigWigs"], cwd=str(out_dir))
-    if code != 0 and "__init__() missing" in output and \
-            "required positional argument" in output:
+    legacy_stack = tuple(int(x) for x in tf.__version__.split(".")[:2]) \
+        < (2, 5)
+    if code != 0 and not legacy_stack and "__init__() missing" in output \
+            and "required positional argument" in output:
         # TF 2.11: "CustomModel.__init__() missing 6 required positional
-        # arguments"; TF 2.15: "Functional.__init__() missing 2 ..."
+        # arguments"; TF 2.15: "Functional.__init__() missing 2 ...".
+        # On the TF 2.4 stack the prediction tests must run.
         pytest.xfail("bpnet-predict cannot load a saved model with this "
                      "TensorFlow version (keras cannot rebuild the "
                      "CustomModel class from the saved configuration)")
@@ -317,9 +337,8 @@ def test_metric_files_follow_from_the_predictions(predicted):
     n = len(a["chrom"])
 
     expected = {key: np.zeros((n, 2)) for key in (
-        "profile_jsds", "profile_mnlls", "profile_mnlls_collapsed_bound",
-        "profile_cross_entropys", "profile_mses", "profile_pearsonrs",
-        "profile_spearmanrs")}
+        "profile_jsds", "profile_mnlls", "profile_cross_entropys",
+        "profile_mses", "profile_pearsonrs", "profile_spearmanrs")}
     for i in range(n):
         for track in (0, 1):
             metrics = expected_metrics(a["true_profs"][i, :, track],
@@ -333,14 +352,8 @@ def test_metric_files_follow_from_the_predictions(predicted):
              "spearman": "profile_spearmanrs"}
     for name, key in files.items():
         got = np.load(os.path.join(out, name + ".npz"))[name]
-        matches = np.isclose(got, expected[key], rtol=1e-7, atol=1e-9)
-        if name == "mnll":
-            # two admissible values, see
-            # tests/test_metrics.py::assert_metrics_equal
-            matches |= np.isclose(got,
-                                  expected["profile_mnlls_collapsed_bound"],
-                                  rtol=1e-7, atol=1e-9)
-        assert matches.all(), name
+        np.testing.assert_allclose(got, expected[key], rtol=1e-7,
+                                   atol=1e-9, err_msg=name)
 
     # counts correlations per strand, across regions
     for track in (0, 1):
@@ -364,8 +377,12 @@ def test_metric_files_follow_from_the_predictions(predicted):
     assert summary("pearson.txt") == round(float(np.mean(pearson)), 3)
     assert summary("jsd.txt") == round(
         float(np.median(expected["profile_jsds"])), 3)
-    spearman = np.load(
-        os.path.join(out, "counts_spearman.npz"))["counts_spearman"]
+    spearman = [np.corrcoef(rankdata(a["true_logcounts"][:, t]),
+                            rankdata(a["pred_logcounts"][:, t]))[0, 1]
+                for t in (0, 1)]
+    np.testing.assert_allclose(
+        np.load(os.path.join(out, "counts_spearman.npz"))["counts_spearman"],
+        spearman, rtol=1e-8)
     assert summary("spearman.txt") == round(float(np.mean(spearman)), 3)
 
 
