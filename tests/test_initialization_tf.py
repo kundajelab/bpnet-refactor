@@ -42,9 +42,11 @@ CONFIGURATIONS = {
 }
 
 
-#: TensorFlow 2.4 draws the kernels of a layer from the global seed;
-#: the later versions tested here do not
-SEEDED_BY_TENSORFLOW = TF_VERSION < (2, 5)
+#: Whether this TensorFlow draws the kernels of a layer from its global
+#: seed. Tested for 2.4.1 (yes), 2.11.0 and 2.15.1 (no). In between,
+#: from reading the keras sources: 2.5 to 2.9 still do, 2.10 is the
+#: first version that draws them from seeds keras makes up
+SEEDED_BY_TENSORFLOW = TF_VERSION < (2, 10)
 
 
 def build(name):
@@ -74,7 +76,7 @@ def fresh_seed():
 
 @pytest.mark.parametrize("seed,seed2,n", [
     (1234, 5678, 4096), (0, 1, 7), (2147483646, 3, 33), (17, 2147483646, 1),
-    (99, 0, 2050), (5, 6, 300001)])
+    (99, 0, 2050), (5, 6, 300001), (2 ** 32 + 3, 5, 9), (7, 2 ** 33 + 1, 9)])
 def test_random_uniform_equals_the_tensorflow_kernel(seed, seed2, n):
     expected = tf.raw_ops.RandomUniform(
         shape=[n], dtype=tf.float32, seed=seed, seed2=seed2).numpy()
@@ -177,8 +179,8 @@ def test_models_built_one_after_the_other_get_the_same_weights():
 
 needs_seeded_tensorflow = pytest.mark.skipif(
     not SEEDED_BY_TENSORFLOW,
-    reason="only TensorFlow 2.4 draws the initial weights from the global "
-    "seed")
+    reason="this TensorFlow version does not draw the initial weights from "
+    "the global seed")
 
 
 @needs_seeded_tensorflow
@@ -229,30 +231,87 @@ def test_equals_tensorflow_24_when_an_operation_seed_repeats():
 
 
 # --------------------------------------------------------------------
-# what the trainer does: seed_state() before the model is built,
-# initialize() after
+# what the trainer does after building its model
 # --------------------------------------------------------------------
 
-def test_seed_state():
+def seed_stream_state():
+    from tensorflow.python.eager import context
+
+    stream = getattr(context.context(), "_rng", None)
+    return None if stream is None else stream.getstate()
+
+
+def test_global_seed():
     tf.random.set_seed(4321)
-    seed, state = training.seed_state()
-    assert seed == 4321 and type(seed) is int
-    assert state == random.Random(4321).getstate()
-    # an operation without a seed of its own takes one from the stream
-    tf.random.uniform([1])
-    stream = random.Random(4321)
-    stream.randint(0, 2 ** 31 - 1)
-    assert training.seed_state() == (4321, stream.getstate())
-    # no global seed
+    assert training.global_seed() == 4321
+    assert type(training.global_seed()) is int
+    tf.random.set_seed(0)
+    assert training.global_seed() == 0
     tf.random.set_seed(None)
-    assert training.seed_state() == (None, None)
+    assert training.global_seed() is None
 
 
 def test_package_import_sets_seed_1234():
     # the fixture of this module sets the same seed again before every
     # test; the constant is the one the package modules set
     assert initialization.DEFAULT_SEED == 1234
-    assert training.seed_state()[0] == 1234
+    assert training.global_seed() == 1234
+
+
+@pytest.mark.parametrize("seed", [1234, 0, 77])
+def test_whether_tensorflow_draws_initial_weights_from_its_seed(seed):
+    tf.random.set_seed(seed)
+    assert training.initializers_follow_global_seed() is SEEDED_BY_TENSORFLOW
+    # asking again gives the same answer
+    assert training.initializers_follow_global_seed() is SEEDED_BY_TENSORFLOW
+
+
+def test_finding_out_leaves_no_trace():
+    """
+        Everything random after initializers_follow_global_seed() is
+        as if it had not been called: TensorFlow's stream of operation
+        seeds, the random kernels of earlier operations, Python's
+        random module and numpy's
+    """
+
+    def after(probe):
+        tf.random.set_seed(99)
+        random.seed(5)
+        np.random.seed(5)
+        first = tf.random.uniform([3], seed=9).numpy()
+        if probe:
+            training.initializers_follow_global_seed()
+        return (first, seed_stream_state(), random.random(),
+                np.random.rand(),
+                # a kernel that was used before continues its stream
+                tf.random.uniform([3], seed=9).numpy(),
+                # the next operation seed of the stream
+                tf.random.uniform([3]).numpy(),
+                stored_digest(build("no control")))
+
+    without, with_probe = after(False), after(True)
+    assert np.array_equal(without[0], with_probe[0])
+    assert without[1] == with_probe[1]
+    assert without[2:4] == with_probe[2:4]
+    assert np.array_equal(without[4], with_probe[4])
+    assert np.array_equal(without[5], with_probe[5])
+    if SEEDED_BY_TENSORFLOW:
+        assert without[6] == with_probe[6]
+
+
+def test_initial_weights_in_a_graph_are_left_to_tensorflow():
+    # TensorFlow 1 style graphs have a seed and operation seeds of
+    # their own; nothing is assigned there
+    with tf.Graph().as_default():
+        tf.compat.v1.set_random_seed(7)
+        assert training.initializers_follow_global_seed() is True
+        model = build("no control")
+        before = stored_digest(model)
+        report = initialization.initialize(
+            model, training.global_seed(),
+            training.initializers_follow_global_seed())
+        assert report["drawn_by"] == "tensorflow"
+        assert report["sha256"] == before == stored_digest(model)
 
 
 def initialized(name, seed, before_build=lambda: None):
@@ -261,28 +320,28 @@ def initialized(name, seed, before_build=lambda: None):
 
         Returns:
             tuple: (model, digest of the weights as TensorFlow drew
-                them, state of the operation seed stream before the
-                build, report of initialize)
+                them, report of initialize)
     """
 
     tf.random.set_seed(seed)
     before_build()
-    seed, state = training.seed_state()
     model = build(name)
     native = stored_digest(model)
-    report = initialization.initialize(model, seed, state)
-    return model, native, state, report
+    report = initialization.initialize(
+        model, training.global_seed(),
+        training.initializers_follow_global_seed())
+    return model, native, report
 
 
 @pytest.mark.parametrize("name", sorted(CONFIGURATIONS))
 def test_initialize_after_a_fresh_seed(name):
     """
         Every TensorFlow version ends up with the weights TensorFlow
-        2.4 draws for the seed; 2.4 because it drew them, the others
-        because they were assigned
+        2.4 draws for the seed: where TensorFlow follows the seed
+        because it drew them, elsewhere because they were assigned
     """
 
-    model, native, _, report = initialized(name, 1234)
+    model, native, report = initialized(name, 1234)
     expected = initialization.initial_kernels(
         [kernel.shape for kernel in kernels_of(model)], 1234)
     for n, kernel in zip(model.weight_layer_names, expected):
@@ -301,38 +360,36 @@ def test_initialize_after_a_fresh_seed(name):
         assert report["sha256"] != native
 
 
-def test_initialize_after_the_seed_stream_was_used():
+def a_random_operation():
+    tf.random.uniform([1])
+
+
+def another_model():
+    build("no control")
+
+
+def the_first_kernel_of_the_model_used_before():
+    # 1892932127 is the first operation seed after set_seed(1234): the
+    # model's first layer finds its random kernel already used
+    tf.random.uniform([7], seed=1892932127)
+
+
+@pytest.mark.parametrize("before_build", [
+    a_random_operation, another_model,
+    the_first_kernel_of_the_model_used_before])
+def test_initialize_when_the_process_used_random_numbers_before(before_build):
     """
-        A random operation (or another model) before the build moves
-        TensorFlow's stream of operation seeds. TensorFlow 2.4 then
+        Random operations or other models before the build move
+        TensorFlow's stream of operation seeds, or leave a random
+        kernel half used. Where TensorFlow follows the seed it then
         draws other weights than after a fresh seed, and they are left
-        exactly as drawn. Versions that ignore the seed get the
-        weights of the fresh seed.
+        exactly as drawn. Elsewhere the model gets the weights of the
+        fresh seed.
     """
 
-    model, native, state, report = initialized(
-        "released", 1234, before_build=lambda: tf.random.uniform([1]))
+    model, native, report = initialized("released", 1234, before_build)
     assert report["seed"] == 1234
     assert report["sha256"] == stored_digest(model)
-    if SEEDED_BY_TENSORFLOW:
-        assert report["drawn_by"] == "tensorflow"
-        assert report["sha256"] == native != RELEASED_SEED_1234_DIGEST
-        # what the stream gives from where it stood
-        expected = initialization.initial_kernels(
-            [kernel.shape for kernel in kernels_of(model)], 1234, state)
-        for a, b in zip(kernels_of(model), expected):
-            assert np.array_equal(a, b)
-    else:
-        assert report["drawn_by"] == "bpnet"
-        assert report["sha256"] == RELEASED_SEED_1234_DIGEST
-
-
-def test_initialize_after_another_model_was_built():
-    def another_model():
-        build("no control")
-
-    model, native, _, report = initialized(
-        "released", 1234, before_build=another_model)
     if SEEDED_BY_TENSORFLOW:
         assert report["drawn_by"] == "tensorflow"
         assert report["sha256"] == native != RELEASED_SEED_1234_DIGEST
@@ -341,21 +398,35 @@ def test_initialize_after_another_model_was_built():
                           "sha256": RELEASED_SEED_1234_DIGEST}
 
 
+@needs_seeded_tensorflow
+def test_weights_drawn_after_191_random_operations_are_left_alone():
+    # after 191 operations the stream of seed 33780 repeats an
+    # operation seed, so the model's first kernel continues the stream
+    # of an earlier operation
+    def operations():
+        for _ in range(191):
+            tf.random.uniform([1])
+
+    model, native, report = initialized("no control", 33780, operations)
+    assert report == {"seed": 33780, "sha256": native,
+                      "drawn_by": "tensorflow"}
+    assert stored_digest(model) == native
+
+
 def test_initialize_without_a_global_seed_keeps_the_random_weights():
-    model, native, state, report = initialized("released", None)
-    assert state is None
+    model, native, report = initialized("released", None)
     assert report == {"seed": None, "sha256": native,
                       "drawn_by": "tensorflow"}
     assert stored_digest(model) == native
     # random: another model has other weights
-    other, other_native, _, _ = initialized("released", None)
+    other, other_native, _ = initialized("released", None)
     assert other_native != native
 
 
 def test_initialize_leaves_a_float64_model_alone():
     tf.keras.backend.set_floatx("float64")
     try:
-        model, native, _, report = initialized("no control", 1234)
+        model, native, report = initialized("no control", 1234)
     finally:
         tf.keras.backend.set_floatx("float32")
     assert kernels_of(model)[0].dtype == np.float64
@@ -384,6 +455,62 @@ def test_a_build_that_fails_leaves_nothing_in_the_next_record():
                    for name in model.weight_layer_names)
     assert set(model.weight_layer_names) == {
         layer.name for layer in model.layers if layer.get_weights()}
+
+
+def test_a_model_built_while_another_is_being_built():
+    """
+        A callable activation that builds a model of its own: both
+        models get their own record
+    """
+
+    inner = []
+
+    @tf.autograph.experimental.do_not_convert
+    def activation(x):
+        if not inner:
+            inner.append(arch.BPNet(make_tasks(), small_params(),
+                                    name_prefix="inner"))
+        return tf.nn.relu(x)
+
+    params = small_params(counts_head_params={
+        "units": [8, 1], "dropouts": [0.0, 0.0],
+        "activations": [activation, "linear"]})
+    outer = arch.BPNet(make_tasks(), params, name_prefix="outer")
+    assert len(inner) == 1
+    for model, prefix in ((outer, "outer"), (inner[0], "inner")):
+        assert set(model.weight_layer_names) == {
+            layer.name for layer in model.layers if layer.get_weights()}
+        assert model.weight_layer_names[0] == prefix + "_conv_0"
+        assert initialization.set_initial_weights(model, 3) == \
+            stored_digest(model)
+    assert getattr(arch._build, "weight_layer_names", None) is None
+
+
+def test_a_build_that_fails_inside_another_build():
+    from bpnet.utils.exceptionhandler import NoTracebackException
+
+    failures = []
+
+    @tf.autograph.experimental.do_not_convert
+    def activation(x):
+        if not failures:
+            try:
+                arch.BPNet(make_tasks(), small_params(
+                    profile_bias_module_params={"kernel_sizes": [1, 1]}),
+                    name_prefix="failed")
+            except NoTracebackException as error:
+                failures.append(error)
+        return tf.nn.relu(x)
+
+    params = small_params(counts_head_params={
+        "units": [8, 1], "dropouts": [0.0, 0.0],
+        "activations": [activation, "linear"]})
+    outer = arch.BPNet(make_tasks(), params, name_prefix="outer")
+    assert len(failures) == 1
+    assert not any(name.startswith("failed")
+                   for name in outer.weight_layer_names)
+    assert set(outer.weight_layer_names) == {
+        layer.name for layer in outer.layers if layer.get_weights()}
 
 
 def test_models_built_in_two_threads_keep_separate_records():

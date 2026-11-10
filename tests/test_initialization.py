@@ -26,6 +26,11 @@ from bpnet.model import initialization
 RELEASED_SEED_1234_DIGEST = \
     "80359736a91cd5776a068eb5a1a0ee3554f31e32380141d7a9e9b7a268a17943"
 
+# tf.raw_ops.RandomUniform(shape=[3], seed=2**32 + 3, seed2=5) under
+# TensorFlow 2.4.1
+SEED_BEYOND_32_BITS = [0.4081333875656128, 0.30167901515960693,
+                       0.42189598083496094]
+
 # kernel shapes of the released architecture in creation order
 RELEASED_SHAPES = [(21, 4, 64)] + [(3, 64, 64)] * 8 + \
     [(75, 64, 2), (64, 1), (1, 4, 2), (2, 1)]
@@ -61,20 +66,6 @@ def test_operation_seeds_are_the_python_random_stream():
             [stream.randint(0, 2 ** 31 - 1) for _ in range(3)]
     assert initialization.operation_seeds(2 ** 32 + 9, 3) != \
         initialization.operation_seeds(9, 3)
-
-
-def test_operation_seeds_continue_from_a_state_of_the_stream():
-    stream = random.Random(1234)
-    first = [stream.randint(0, 2 ** 31 - 1) for _ in range(2)]
-    state = stream.getstate()
-    assert first == initialization.operation_seeds(1234, 2)
-    assert initialization.operation_seeds(1234, 2, state) == \
-        initialization.operation_seeds(1234, 4)[2:]
-    # the state decides, not the seed, and it is not consumed
-    assert initialization.operation_seeds(99, 2, state) == \
-        initialization.operation_seeds(1234, 4)[2:]
-    assert initialization.operation_seeds(1234, 2, state) == \
-        initialization.operation_seeds(1234, 4)[2:]
 
 
 def test_random_uniform_reference_values():
@@ -114,6 +105,11 @@ def test_random_uniform_from_a_position_in_the_stream():
         [0.10677707195281982, 0.6713669300079346, 0.5270742177963257]
     assert initialization.random_uniform(3, 5, 6, skip=70000).tolist() == \
         [0.5379114151000977, 0.638777494430542, 0.6014165878295898]
+    # a seed beyond 32 bits fills the second word of the key
+    assert initialization.random_uniform(3, 2 ** 32 + 3, 5).tolist() == \
+        SEED_BEYOND_32_BITS
+    assert not np.array_equal(initialization.random_uniform(3, 2 ** 32 + 3, 5),
+                              initialization.random_uniform(3, 3, 5))
     # a position beyond 32 bits moves into the next counter word
     far = initialization.random_uniform(8, 3, 4, skip=2 ** 32 - 1)
     assert np.array_equal(
@@ -190,7 +186,7 @@ def test_repeated_operation_seed_continues_the_kernels_stream(monkeypatch):
     """
 
     monkeypatch.setattr(initialization, "operation_seeds",
-                        lambda seed, n, state=None: [5, 9, 5, 5][:n])
+                        lambda seed, n: [5, 9, 5, 5][:n])
     shapes = [(3, 2, 4), (2, 2), (3, 2, 4), (5, 1)]
     kernels = initialization.initial_kernels(shapes, 77)
     assert np.array_equal(
@@ -217,13 +213,23 @@ def test_repeated_operation_seed_as_recorded_from_tensorflow_241():
     assert float(kernels[191].ravel()[0]) == -0.9455151557922363
 
 
-def test_initial_kernels_from_a_state_of_the_stream():
-    shapes = [(3, 4, 5), (5, 1), (2, 1)]
-    stream = random.Random(21)
-    stream.randint(0, 2 ** 31 - 1)
-    later = initialization.initial_kernels(shapes[1:], 21, stream.getstate())
-    whole = initialization.initial_kernels(shapes, 21)
-    assert all(np.array_equal(a, b) for a, b in zip(later, whole[1:]))
+def test_repeated_seed_pair_after_reduction(monkeypatch):
+    # the random kernel is identified by the seeds as TensorFlow
+    # reduces them: operation seeds 0 and 2**31 - 1 are the same
+    # kernel, and so are 3 and 2**31 + 2
+    monkeypatch.setattr(initialization, "operation_seeds",
+                        lambda seed, n: [0, 2 ** 31 - 1, 3, 2 ** 31 + 2][:n])
+    shapes = [(4, 3), (4, 3), (2, 5), (2, 5)]
+    kernels = initialization.initial_kernels(shapes, 2 ** 31 + 6)
+    assert initialization.kernel_seeds(2 ** 31 + 6, 0) == (7, 0)
+    assert np.array_equal(
+        kernels[0], initialization.glorot_uniform((4, 3), 7, 0))
+    assert np.array_equal(kernels[1], initialization.glorot_uniform(
+        (4, 3), 7, 0, skip=12 * 256))
+    assert np.array_equal(
+        kernels[2], initialization.glorot_uniform((2, 5), 7, 3))
+    assert np.array_equal(kernels[3], initialization.glorot_uniform(
+        (2, 5), 7, 3, skip=10 * 256))
 
 
 def test_initial_kernels_depend_on_seed_and_position():
@@ -336,92 +342,81 @@ def test_model_without_a_record_of_its_layers_is_rejected():
     # a model that arch.BPNet did not build, a loaded one for example
     with pytest.raises(ValueError, match="no record of its layers"):
         initialization.set_initial_weights(ModelStub({}), 1)
-    with pytest.raises(ValueError, match="no record of its layers"):
-        initialization.initialize(ModelStub({}), 1, None)
+    for drawn_from_seed in (False, True):
+        with pytest.raises(ValueError, match="no record of its layers"):
+            initialization.initialize(ModelStub({}), 1, drawn_from_seed)
 
 
 def test_only_float32_models_are_given_seeded_weights():
     model = stub_model(dtype=np.float64)
     before = stored_digest(model)
-    with pytest.raises(ValueError, match="dense|conv|mix"):
+    with pytest.raises(ValueError, match="only float32 models"):
         initialization.set_initial_weights(model, 1)
     assert stored_digest(model) == before
     # initialize leaves such a model as it was built
-    report = initialization.initialize(model, 1, None)
+    report = initialization.initialize(model, 1, False)
     assert report == {"seed": 1, "sha256": before, "drawn_by": "tensorflow"}
     assert stored_digest(model) == before
 
+    # also when only a later layer, or only a bias, is not float32
+    for name, index in (("mix", 0), ("dense", 1)):
+        model = stub_model()
+        weights = model.get_layer(name).weights
+        weights[index] = weights[index].astype(np.float64)
+        before = stored_digest(model)
+        report = initialization.initialize(model, 1, False)
+        assert report["drawn_by"] == "tensorflow"
+        assert stored_digest(model) == before == report["sha256"]
+        with pytest.raises(ValueError, match="only float32 models"):
+            initialization.set_initial_weights(model, 1)
+        assert stored_digest(model) == before
 
-def model_drawn_from(seed, state=None):
+
+def seeded_digest(seed):
     """
-        A stub model whose kernels are what TensorFlow 2.4 draws for
-        the seed from the given state of the operation seed stream
+        Digest of the stub model with the weights of the seed
     """
 
     model = stub_model()
     names = model.weight_layer_names
     kernels = initialization.initial_kernels(
-        [model.get_layer(n).get_weights()[0].shape for n in names], seed,
-        state)
+        [model.get_layer(n).get_weights()[0].shape for n in names], seed)
     for name, kernel in zip(names, kernels):
         model.get_layer(name).weights = [
             kernel, np.zeros(kernel.shape[-1], dtype=np.float32)]
-    return model
+    return stored_digest(model)
 
 
-def test_initialize_leaves_weights_that_follow_the_seed():
-    # as under TensorFlow 2.4: fresh seed
-    model = model_drawn_from(21)
-    state = random.Random(21).getstate()
+def test_initialize_leaves_weights_where_tensorflow_follows_the_seed():
+    # as under TensorFlow 2.4: whatever TensorFlow drew stays, also
+    # when it is not what a fresh seed gives (random operations or
+    # other models before the build move TensorFlow's seed stream)
+    model = stub_model(seed=3)
     before = stored_digest(model)
-    assert initialization.follows_seed(model, 21, state)
-    report = initialization.initialize(model, 21, state)
+    assert before != seeded_digest(21)
+    report = initialization.initialize(model, 21, True)
     assert report == {"seed": 21, "sha256": before, "drawn_by": "tensorflow"}
+    assert stored_digest(model) == before
     assert all(model.get_layer(n).assigned == 0
                for n in model.weight_layer_names)
 
-    # and a stream that other random operations have used before: the
-    # weights are not those of a fresh seed, and are left alone
-    stream = random.Random(21)
-    for _ in range(3):
-        stream.randint(0, 2 ** 31 - 1)
-    state = stream.getstate()
-    model = model_drawn_from(21, state)
-    before = stored_digest(model)
-    assert before != stored_digest(model_drawn_from(21))
-    report = initialization.initialize(model, 21, state)
-    assert report == {"seed": 21, "sha256": before, "drawn_by": "tensorflow"}
-    assert stored_digest(model) == before
 
-
-def test_initialize_assigns_where_the_weights_ignore_the_seed():
-    # as under newer TensorFlow versions: weights from elsewhere
+def test_initialize_assigns_where_tensorflow_ignores_the_seed():
+    # as under newer TensorFlow versions
     model = stub_model(seed=3)
-    state = random.Random(21).getstate()
-    assert not initialization.follows_seed(model, 21, state)
-    report = initialization.initialize(model, 21, state)
+    report = initialization.initialize(model, 21, False)
     assert report == {"seed": 21, "drawn_by": "bpnet",
-                      "sha256": stored_digest(model_drawn_from(21))}
+                      "sha256": seeded_digest(21)}
     assert stored_digest(model) == report["sha256"]
-
-    # also when the stream had been used: the weights of a fresh seed
-    stream = random.Random(21)
-    stream.randint(0, 2 ** 31 - 1)
-    model = stub_model(seed=4)
-    report = initialization.initialize(model, 21, stream.getstate())
-    assert report["sha256"] == stored_digest(model_drawn_from(21))
-
-    # and when the state of the stream is not known
-    model = stub_model(seed=5)
-    report = initialization.initialize(model, 21, None)
-    assert report["drawn_by"] == "bpnet"
-    assert report["sha256"] == stored_digest(model_drawn_from(21))
+    assert seeded_digest(21) != seeded_digest(22)
 
 
-def test_initialize_without_a_global_seed_leaves_the_weights():
+@pytest.mark.parametrize("drawn_from_seed", [False, True])
+def test_initialize_without_a_global_seed_leaves_the_weights(
+        drawn_from_seed):
     model = stub_model(seed=6)
     before = stored_digest(model)
-    report = initialization.initialize(model, None, None)
+    report = initialization.initialize(model, None, drawn_from_seed)
     assert report == {"seed": None, "sha256": before,
                       "drawn_by": "tensorflow"}
     assert stored_digest(model) == before

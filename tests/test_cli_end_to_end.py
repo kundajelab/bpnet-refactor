@@ -51,9 +51,10 @@ INITIAL_WEIGHTS_SHA256 = {
     0: "e44c42849f007e53b798b9d2e864564b4a59587f75edcf04607b7f643bd73785"}
 
 #: TensorFlow 2.4 draws the initial weights from the global seed
-#: itself; under later versions the trainer assigns them
+#: itself; from 2.10 on the trainer assigns them (see
+#: test_initialization_tf.py for the versions in between)
 DRAWN_BY = "tensorflow" if tuple(
-    int(x) for x in tf.__version__.split(".")[:2]) < (2, 5) else "bpnet"
+    int(x) for x in tf.__version__.split(".")[:2]) < (2, 10) else "bpnet"
 
 #: the layers with weights in the order the model creates them
 LAYERS = ["main_conv_0", "main_dil_conv_1", "main_dil_conv_2",

@@ -50,9 +50,11 @@ import logging
 import multiprocessing as mp
 import os
 import pandas as pd
+import random
 import time
 
 import numpy as np
+import tensorflow as tf
 
 from bpnet.utils.datetime_custom import *
 from bpnet.utils.exceptionhandler import NoTracebackException
@@ -140,25 +142,58 @@ def reduce_lr_on_plateau(losses, current_lr, factor=0.5, patience=2,
     return new_lr
 
 
-def seed_state():
+def global_seed():
     """
-        TensorFlow's global seed (the package sets 1234 when it is 
-        imported; --seed or a caller may have set another) and where 
-        the stream of operation seeds that follows from it stands
+        TensorFlow's global seed: the package sets 1234 when it is 
+        imported; --seed or a caller may have set another
         
         Returns:
-            tuple: (seed, state); the seed is None if no global seed is
-                set; the state is that of TensorFlow's random.Random 
-                of operation seeds (None if it cannot be read)
+            int: the seed, None if no global seed is set
     """
     
     from tensorflow.python.eager import context
     
     seed = context.global_seed()
-    if seed is None:
-        return None, None
-    stream = getattr(context.context(), '_rng', None)
-    return int(seed), (stream.getstate() if stream is not None else None)
+    return None if seed is None else int(seed)
+
+
+def initializers_follow_global_seed():
+    """
+        Whether TensorFlow itself derives the initial weights of new 
+        layers from its global seed. It does in TensorFlow 2.4 (and, 
+        from reading the sources, up to 2.9); later versions draw 
+        them from seeds that keras makes up.
+        
+        Found out by observation rather than from the version number:
+        two unseeded initializers are run, each in a function graph of 
+        its own. If the global seed determines what they draw, the two 
+        draw the same numbers. Running them takes no operation seed 
+        from the global stream, leaves the random kernels of earlier 
+        operations alone and restores the state of Python's random 
+        module, so that everything after it is as if it had not run.
+        
+        Outside eager execution the answer is always yes: initial 
+        weights in a TensorFlow 1 style graph are left to TensorFlow. 
+        
+        Returns:
+            bool
+    """
+    
+    if not tf.executing_eagerly():
+        return True
+    
+    state = random.getstate()
+    try:
+        draws = []
+        for _ in range(2):
+            @tf.function
+            def draw():
+                return tf.keras.initializers.GlorotUniform()(
+                    shape=(8,), dtype=tf.float32)
+            draws.append(draw().numpy())
+    finally:
+        random.setstate(state)
+    return bool(np.array_equal(draws[0], draws[1]))
 
 
 def train_and_validate(
@@ -369,9 +404,6 @@ def train_and_validate(
     logging.debug("New {} model".format(model_arch_name))
     get_model = getattr(arch, model_arch_name)
     
-    # where TensorFlow's seed stands before the model is built
-    initial_seed, initial_seed_stream = seed_state()
-    
     model = get_model(tasks, 
                         model_arch_params, 
                         orig_multi_loss=orig_multi_loss, 
@@ -382,11 +414,11 @@ def train_and_validate(
     # run, which hurts experiments with few peaks (they train for too 
     # few steps to recover from an unlucky start of the layers that 
     # combine the predictions with the control tracks). Where 
-    # TensorFlow did not draw the weights from the seed, the weights 
-    # of the seed are assigned here; where it did, they are left as 
-    # they are.
+    # TensorFlow does not draw initial weights from the seed, the 
+    # weights of the seed are assigned here; where it does, they are 
+    # left as they are.
     initial_weights = initialization.initialize(
-        model, initial_seed, initial_seed_stream)
+        model, global_seed(), initializers_follow_global_seed())
     logging.info("Initial weights: seed {}, sha256 {}, drawn by {}".format(
         initial_weights['seed'], initial_weights['sha256'], 
         initial_weights['drawn_by']))

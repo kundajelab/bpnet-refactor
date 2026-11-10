@@ -32,12 +32,12 @@
     can a PyTorch model.
 
     What it does not do. Where TensorFlow itself still draws the
-    weights from the global seed (2.4.1), `initialize` leaves them as
-    drawn, so nothing changes there in any situation, including a
-    process that used random operations or built other models before.
-    Weights are only assigned where TensorFlow no longer follows the
-    seed, and then they are the weights of a fresh seed. Only float32
-    models are handled.
+    initial weights from its global seed (2.4.1), `initialize` leaves
+    them as drawn: nothing changes there, whatever random operations
+    or model builds came before in the process. Weights are only
+    assigned where TensorFlow no longer follows the seed, and then
+    they are the weights of a fresh seed. Only float32 models are
+    handled.
 
     Only numpy and the standard library are used.
 """
@@ -181,26 +181,20 @@ def glorot_uniform(shape, seed, op_seed, skip=0):
     return (values * (maxval - minval) + minval).reshape(shape)
 
 
-def operation_seeds(seed, n, state=None):
+def operation_seeds(seed, n):
     """
-        The next n operation seeds TensorFlow hands out
+        The first n operation seeds TensorFlow hands out after
+        tf.random.set_seed(seed)
 
         Args:
             seed (int): what tf.random.set_seed was given
             n (int): number of operation seeds
-            state: state (random.Random.getstate) of TensorFlow's
-                stream of operation seeds; None for the stream right
-                after tf.random.set_seed(seed)
 
         Returns:
             list: n integers in [0, 2**31 - 1]
     """
 
-    if state is None:
-        stream = random.Random(seed)
-    else:
-        stream = random.Random()
-        stream.setstate(state)
+    stream = random.Random(seed)
     return [stream.randint(0, _MAX_OP_SEED) for _ in range(n)]
 
 
@@ -225,16 +219,15 @@ def kernel_seeds(seed, op_seed):
     return seeds
 
 
-def initial_kernels(shapes, seed=DEFAULT_SEED, state=None):
+def initial_kernels(shapes, seed=DEFAULT_SEED):
     """
         Kernels for the layers of a model, in the order the layers are
-        created
+        created, as TensorFlow 2.4.1 draws them for a model that is
+        built right after tf.random.set_seed(seed)
 
         Args:
             shapes (list): kernel shapes in creation order
             seed (int): the seed (what tf.random.set_seed was given)
-            state: where TensorFlow's stream of operation seeds stands
-                (see operation_seeds); None for a fresh seed
 
         Returns:
             list: one float32 array per shape
@@ -245,8 +238,7 @@ def initial_kernels(shapes, seed=DEFAULT_SEED, state=None):
     # stream hands out the same operation seed twice, the second layer
     # continues where the kernel stopped reserving for the first
     reserved = {}
-    for shape, op_seed in zip(
-            shapes, operation_seeds(seed, len(shapes), state)):
+    for shape, op_seed in zip(shapes, operation_seeds(seed, len(shapes))):
         pair = kernel_seeds(seed, op_seed)
         skip = reserved.get(pair, 0)
         kernels.append(glorot_uniform(shape, pair[0], pair[1], skip))
@@ -335,44 +327,16 @@ def set_initial_weights(model, seed=DEFAULT_SEED):
     return current_weights_digest(model)
 
 
-def follows_seed(model, seed, state):
-    """
-        Whether the model, as TensorFlow built it, already has the
-        initial weights of the global seed: true where Keras draws
-        kernels from tf.random.set_seed (TensorFlow 2.4), false where
-        it draws them from elsewhere
-
-        Args:
-            model: a freshly built model
-            seed (int): the global seed that was in effect when the
-                model was built (None if none was set)
-            state: state of TensorFlow's stream of operation seeds
-                right before the model was built (see operation_seeds)
-
-        Returns:
-            bool: True if the first kernel is the kernel that the seed
-                and the stream give
-    """
-
-    if seed is None or state is None:
-        return False
-    _, _, weights = _weight_layers(model)[0]
-    kernel = weights[0]
-    if kernel.dtype != np.float32:
-        return False
-    expected, = initial_kernels([kernel.shape], seed, state)
-    return bool(np.array_equal(kernel, expected))
-
-
-def initialize(model, seed, state):
+def initialize(model, seed, drawn_from_seed):
     """
         Make the initial weights of a freshly built model follow the
         global seed, whatever the TensorFlow version
 
-        - The weights are left as TensorFlow drew them when they
-          already follow the seed (TensorFlow 2.4: nothing changes
-          there), when no global seed is set (random weights were
-          asked for), and when the model is not float32.
+        - The weights are left as TensorFlow drew them where TensorFlow
+          draws initial weights from its global seed itself
+          (TensorFlow 2.4: nothing changes there), when no global seed
+          is set (random weights were asked for), and when the model is
+          not float32.
         - Otherwise (newer TensorFlow versions, whose initializers
           ignore the global seed) the weights of the seed are
           assigned: the weights TensorFlow 2.4.1 draws for the model
@@ -380,11 +344,10 @@ def initialize(model, seed, state):
 
         Args:
             model: a model just built by bpnet.model.arch.BPNet
-            seed (int): the global seed in effect when the model was
-                built, None if none was set
-            state: state of TensorFlow's stream of operation seeds
-                right before the model was built (see operation_seeds);
-                None if it is not known
+            seed (int): TensorFlow's global seed, None if none is set
+            drawn_from_seed (bool): whether TensorFlow derives the
+                initial weights of new layers from its global seed
+                (bpnet.train.training.initializers_follow_global_seed)
 
         Returns:
             dict: 'seed', 'sha256' (digest of the initial weights, see
@@ -396,7 +359,7 @@ def initialize(model, seed, state):
     float32 = all(w.dtype == np.float32
                   for _, _, weights in _weight_layers(model)
                   for w in weights)
-    if seed is None or not float32 or follows_seed(model, seed, state):
+    if seed is None or drawn_from_seed or not float32:
         return {'seed': seed, 'sha256': current_weights_digest(model),
                 'drawn_by': 'tensorflow'}
     return {'seed': seed, 'sha256': set_initial_weights(model, seed),

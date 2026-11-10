@@ -3,6 +3,7 @@
     bpnet network architectures
 """
 
+import functools
 import threading
 
 from numpy.random import seed
@@ -23,8 +24,9 @@ from bpnet.model import bpnetdefaults
 
 # names of the layers that have weights, in the order BPNet() creates
 # them; the seeded initial weights (bpnet.model.initialization) are
-# assigned in this order. One list per thread, so that models built at
-# the same time in different threads do not record into each other's
+# assigned in this order. Each build records into a list of its own 
+# (see _records_weight_layers); the list of the build in progress is 
+# kept per thread
 _build = threading.local()
 
 
@@ -42,6 +44,33 @@ def _weighted(layer):
     if names is not None:
         names.append(layer.name)
     return layer
+
+
+def _records_weight_layers(build):
+    """
+        Decorator for a function that builds a model: the model it 
+        returns gets `weight_layer_names`, the names of the layers 
+        that _weighted saw while the function ran, in order.
+        
+        The list belongs to the call. A build that starts while 
+        another is in progress in the same thread (a model built 
+        inside a callable that the outer build invokes) records into 
+        its own list, and the outer list is put back when it ends, 
+        whether it succeeds or fails.
+    """
+    
+    @functools.wraps(build)
+    def wrapper(*args, **kwargs):
+        enclosing = getattr(_build, 'weight_layer_names', None)
+        names = _build.weight_layer_names = []
+        try:
+            model = build(*args, **kwargs)
+        finally:
+            _build.weight_layer_names = enclosing
+        model.weight_layer_names = tuple(names)
+        return model
+    
+    return wrapper
 
 
 def _crop_layer(layer, new_size):
@@ -566,6 +595,7 @@ def load_params(params):
             loss_weights, counts_loss)
 
     
+@_records_weight_layers
 def BPNet(
     tasks, bpnet_params, orig_multi_loss=False,
     name_prefix=None):
@@ -607,9 +637,6 @@ def BPNet(
             tensorflow.keras.layers.Model
     """
     
-    # the layers with weights are recorded as they are created
-    _build.weight_layer_names = []
-
     # load params, override defaults
     (input_len, 
      output_profile_len, 
@@ -755,7 +782,7 @@ def BPNet(
     #        'output_profile_len':output_profile_len,\
     #        'loss_weights':loss_weights,\
     #        'inputs':inputs, 'outputs':[profile_outputs, logcounts_outputs]})
-    model = CustomModel(num_tasks,
+    return CustomModel(num_tasks,
                         total_tracks, 
                         tracks_for_each_task, 
                         output_profile_len, 
@@ -765,8 +792,3 @@ def BPNet(
                         inputs=inputs, 
                         outputs=[profile_outputs, logcounts_outputs])
 
-    # names of the layers with weights, in creation order
-    model.weight_layer_names = tuple(_build.weight_layer_names)
-    _build.weight_layer_names = None
-
-    return model
