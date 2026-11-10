@@ -86,6 +86,116 @@ def test_multinomial_nll_gradient():
     np.testing.assert_allclose(gradient, expected, rtol=1e-4, atol=1e-5)
 
 
+def tensorflow_probability_nll(true_counts, logits):
+    """
+        multinomial_nll as it was while the package used
+        tensorflow-probability (bpnet/model/losses.py at main@0b11a7c)
+    """
+
+    import tensorflow_probability as tfp
+
+    counts_per_example = tf.reduce_sum(true_counts, axis=-1)
+    dist = tfp.distributions.Multinomial(total_count=counts_per_example,
+                                         logits=logits)
+    return (-tf.reduce_sum(dist.log_prob(true_counts)) /
+            tf.cast(tf.shape(true_counts)[0], dtype=tf.float32))
+
+
+def value_and_gradient(function, counts, logits, compiled):
+    variable = tf.Variable(logits)
+
+    def run():
+        with tf.GradientTape() as tape:
+            value = function(tf.constant(counts), variable)
+        return value, tape.gradient(value, variable)
+
+    if compiled:
+        run = tf.function(run)
+    value, gradient = run()
+    return value.numpy(), gradient.numpy()
+
+
+NLL_CASES = {
+    "profile of a batch": dict(rows=64, positions=2000, rate=0.3),
+    "few positions": dict(rows=5, positions=7, rate=2.0),
+    "one row": dict(rows=1, positions=1000, rate=0.1),
+    "deep coverage": dict(rows=3, positions=2000, rate=400.0),
+    "one position": dict(rows=4, positions=1, rate=3.0),
+}
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+@pytest.mark.parametrize("case", sorted(NLL_CASES))
+def test_multinomial_nll_equals_the_tensorflow_probability_version(
+        case, compiled):
+    """
+        The loss gives the value and the gradient that the version
+        built on tensorflow-probability gave, bit for bit, eagerly and
+        in a compiled function (the trainer's train step is compiled)
+    """
+
+    pytest.importorskip("tensorflow_probability")
+    for seed in range(3):
+        counts, logits = random_counts_and_logits(seed, **NLL_CASES[case])
+        # some rows and positions without any counts, and some very
+        # unlikely positions
+        counts[0] = 0
+        counts[:, 1::3] = 0
+        logits[:, -1] = -80.0
+        new = value_and_gradient(losses.multinomial_nll, counts, logits,
+                                 compiled)
+        old = value_and_gradient(tensorflow_probability_nll, counts, logits,
+                                 compiled)
+        assert new[0].dtype == old[0].dtype == np.float32
+        assert np.array_equal(new[0], old[0]), (case, seed)
+        assert np.array_equal(new[1], old[1]), (case, seed)
+        assert np.isfinite(new[0]) and np.isfinite(new[1]).all()
+
+
+def test_multinomial_log_prob_per_row():
+    counts, logits = random_counts_and_logits(21, rows=6, positions=40)
+    log_prob = losses.multinomial_log_prob(
+        tf.constant(counts), tf.constant(logits)).numpy()
+    assert log_prob.shape == (6,)
+    for i in range(6):
+        p = np.exp(logits[i].astype(np.float64))
+        expected = multinomial.logpmf(counts[i], n=counts[i].sum(),
+                                      p=p / p.sum())
+        np.testing.assert_allclose(log_prob[i], expected, rtol=1e-4)
+    # leading dimensions are kept
+    stacked = losses.multinomial_log_prob(
+        tf.constant(counts.reshape(2, 3, 40)),
+        tf.constant(logits.reshape(2, 3, 40))).numpy()
+    assert np.array_equal(stacked, log_prob.reshape(2, 3))
+
+
+def test_multinomial_nll_position_with_zero_probability_and_no_counts():
+    # log softmax is -inf at such a position; it has no counts, so it
+    # contributes nothing (and no nan)
+    counts = np.array([[3.0, 0.0, 2.0]], dtype=np.float32)
+    logits = np.array([[0.0, -np.inf, 0.0]], dtype=np.float32)
+    expected = -multinomial.logpmf([3, 2], n=5, p=[0.5, 0.5])
+    assert nll(counts, logits) == pytest.approx(expected, rel=1e-6)
+
+
+def test_multinomial_nll_needs_counts_and_logits_of_one_type():
+    counts, logits = random_counts_and_logits(22)
+    with pytest.raises((TypeError, ValueError,
+                        tf.errors.InvalidArgumentError)):
+        losses.multinomial_nll(tf.constant(counts.astype(np.float64)),
+                               tf.constant(logits))
+
+
+def test_the_model_code_does_not_import_tensorflow_probability():
+    import subprocess
+    import sys
+
+    code = ("import sys; import bpnet.model.losses, bpnet.model.custommodel, "
+            "bpnet.model.arch, bpnet.train.training; "
+            "sys.exit('tensorflow_probability' in sys.modules)")
+    assert subprocess.call([sys.executable, "-c", code]) == 0
+
+
 def test_multinomial_nll_large_counts():
     rng = np.random.RandomState(15)
     counts = rng.poisson(300.0, size=(4, 2000)).astype(np.float32)

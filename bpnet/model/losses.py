@@ -1,5 +1,4 @@
 import tensorflow as tf
-import tensorflow_probability as tfp
 
 
 def mse_loss_function(y_log_true, y_log_pred):
@@ -24,14 +23,50 @@ def poisson_loss_function(y_log_true, y_log_pred):
 
     return loss
 
+def multinomial_log_prob(true_counts, logits):
+    """
+        Log probability of the observed counts under a multinomial 
+        distribution over the last axis whose probabilities are 
+        softmax(logits) and whose total is the sum of the counts
+        
+        log(n!) - sum_i log(x_i!) + sum_i x_i * log_softmax(logits)_i
+        
+        This is the log_prob of tensorflow-probability's Multinomial
+        (which this package used until it stopped depending on that
+        library), written with the same operations in the same order, 
+        so that values and gradients are the same to the last bit.
+        
+        Args:
+            true_counts (tensorflow.Tensor): observed counts, 
+                (..., positions)
+            logits (tensorflow.Tensor): predicted logits of the same 
+                shape and type
+                
+        Returns:
+            tensorflow.Tensor: log probabilities, (...)
+    """
+    true_counts = tf.convert_to_tensor(true_counts)
+    logits = tf.convert_to_tensor(logits)
+    counts_per_example = tf.reduce_sum(true_counts, axis=-1)
+
+    # positions without counts contribute nothing, whatever their 
+    # log probability (also when it is -inf)
+    log_p = tf.math.log_softmax(logits)
+    log_unnormalized = tf.reduce_sum(
+        tf.math.multiply_no_nan(log_p, true_counts), axis=-1)
+
+    # log of the number of ways the counts can be arranged
+    log_combinations = tf.math.lgamma(counts_per_example + 1) - \
+        tf.reduce_sum(tf.math.lgamma(true_counts + 1), axis=-1)
+
+    return log_unnormalized + log_combinations
+
+
 def multinomial_nll(true_counts, logits):
     """Compute the multinomial negative log-likelihood
     Args:
         true_counts: observed count values
         logits: predicted logits values
     """
-    counts_per_example = tf.reduce_sum(true_counts, axis=-1)
-    dist = tfp.distributions.Multinomial(total_count=counts_per_example,
-                                            logits=logits)
-    return (-tf.reduce_sum(dist.log_prob(true_counts)) / 
+    return (-tf.reduce_sum(multinomial_log_prob(true_counts, logits)) / 
             tf.cast(tf.shape(true_counts)[0], dtype=tf.float32))
