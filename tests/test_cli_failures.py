@@ -92,3 +92,37 @@ def test_missing_splits_file_message(synth_dataset, tmp_path):
         cwd=str(tmp_path))
     assert code != 0
     assert "File not found: {}".format(missing) in output
+
+
+def test_failure_in_a_batch_worker_ends_the_training(tmp_path):
+    """
+        A signal file that does not cover the genome: the worker
+        processes cannot read some of the loci. bpnet-train must stop
+        with an error status and say why (it used to wait forever for
+        the batches of the worker that failed).
+    """
+
+    import time
+
+    from tests import synth
+
+    dataset = synth.make_dataset(
+        str(tmp_path / "data"), chrom_len=20000, n_peaks=60, n_background=60)
+    path = dataset["signal"][0]
+    short = {chrom: 6000 for chrom in dataset["chroms"]}
+    synth.write_bigwig(path, short, {
+        chrom: values[:6000]
+        for chrom, values in dataset["tracks"][path].items()})
+
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    start = time.time()
+    code, output = run_cli("bpnet.cli.bpnettrainer",
+                           train_args(dataset, model_dir), cwd=str(tmp_path))
+    assert code != 0, output[-2000:]
+    assert "Batch generation failed in worker process" in output
+    assert "Training of split 0 failed" in output
+    # far below the time after which run_cli gives up on a hung tool
+    assert time.time() - start < 300
+    assert not any(name.startswith("model") for name in os.listdir(
+        str(model_dir)))
