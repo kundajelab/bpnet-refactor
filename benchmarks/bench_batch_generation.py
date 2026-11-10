@@ -1,7 +1,7 @@
 """
     Time to construct one training batch, on real data, with the
-    present code and with one piece of it replaced by the
-    implementation it had before.
+    present code and with pieces of it replaced by the implementations
+    they had before.
 
         python benchmarks/bench_batch_generation.py \\
             --input-data input.json --reference-genome genome.fa \\
@@ -11,10 +11,9 @@
     of bpnet-train (signal and control bigWigs, peaks, background). A
     batch is constructed the way a worker process of the trainer does
     it (64 loci and their reverse complements, 2,114 bases, jitter
-    128): files are opened, sequences fetched and encoded, signal and
-    control values read, reverse complements made. Both variants
-    construct the same rows with the same jitters, in alternating
-    order.
+    128): sequences fetched and encoded, signal and control values
+    read, reverse complements made. Both variants construct the same
+    rows with the same jitters, in alternating order.
 
     Not included: starting the worker processes, preparing and
     shuffling the epoch, several workers competing for the disk, the
@@ -27,25 +26,12 @@ import argparse
 import os
 import random
 import sys
-import time
-
-import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from benchmarks.timing import compare, report
 from bpnet.generators import generators, sequtils
 from tests import legacy_reference
-
-#: the pieces that were replaced by faster ones: (what, the module and
-#: the name the batch generator looks it up under, the implementation
-#: it had before)
-REPLACED = [
-    ("one hot encoder", sequtils, "one_hot_encode",
-     legacy_reference.one_hot_encode_v0),
-    ("bigWig reading", generators, "interval_values",
-     legacy_reference.interval_values_v0),
-]
 
 
 def main():
@@ -69,8 +55,6 @@ def main():
           "with reverse complements) is timed".format(
               len(rows), args.batches, args.batch_size))
 
-    warmup = 2
-
     def batch_rows(start):
         # the rows of a batch as a worker process prepares them
         rows_of_batch = rows.iloc[start:start + args.batch_size][
@@ -80,32 +64,37 @@ def main():
         rows_of_batch['idx'] = rows_of_batch.index.values
         return rows_of_batch
 
-    for what, module, name, previous in REPLACED:
-        present = getattr(module, name)
-        seconds = {"old": [], "new": []}
+    def previous_construction(rows_of_batch):
+        # rows one by one, one bigWig read per row and file through a
+        # Python list, all files opened for every batch
+        legacy_reference.generate_batch_v0(gen, rows_of_batch)
+
+    def with_previous_encoder(construct):
+        def run(rows_of_batch):
+            present = sequtils.one_hot_encode
+            sequtils.one_hot_encode = legacy_reference.one_hot_encode_v0
+            try:
+                construct(rows_of_batch)
+            finally:
+                sequtils.one_hot_encode = present
+        return run
+
+    comparisons = [
+        ("everything as it was", with_previous_encoder(previous_construction)),
+        ("previous reading of the bigWigs", previous_construction),
+        ("previous one hot encoder",
+         with_previous_encoder(gen._generate_batch)),
+    ]
+    for what, previous in comparisons:
         calls = [0]
         position = [0]
 
-        def timed(variant, function):
-            def run(*arguments):
-                start = time.perf_counter()
-                result = function(*arguments)
-                # the calls of the warm up are not part of the timing
-                if calls[0] >= 2 * warmup:
-                    seconds[variant].append(time.perf_counter() - start)
-                return result
-            return run
-
-        def construct(variant, function):
+        def construct(function):
             def run():
                 start = position[0] % (len(rows) - args.batch_size)
-                setattr(module, name, timed(variant, function))
                 # the same jitters for both variants
                 random.seed(start)
-                try:
-                    gen._generate_batch(batch_rows(start))
-                finally:
-                    setattr(module, name, present)
+                function(batch_rows(start))
                 # compare() calls the two alternately; after every
                 # second call both have constructed the current slice
                 # of rows, and the next slice is taken
@@ -114,18 +103,9 @@ def main():
                     position[0] += args.batch_size
             return run
 
-        result = compare(construct("old", previous),
-                         construct("new", present), rounds=args.batches,
-                         warmup=warmup)
-        report("batch, previous {}".format(what), result)
-        per_batch = len(seconds["new"]) / float(args.batches)
-        for variant in ("old", "new"):
-            # time inside the piece, summed over its calls in a batch
-            inside = np.sum(seconds[variant]) / args.batches
-            print("  {} {}: {:.2f} ms per batch ({:.0f} calls), {:.0f}% of "
-                  "the batch time".format(
-                      variant, what, 1e3 * inside, per_batch,
-                      100 * inside / result[variant + "_seconds"]))
+        result = compare(construct(previous), construct(gen._generate_batch),
+                         rounds=args.batches, warmup=2)
+        report("batch, {}".format(what), result)
 
 
 if __name__ == "__main__":
