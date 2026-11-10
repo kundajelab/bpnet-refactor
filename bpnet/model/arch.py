@@ -56,7 +56,9 @@ def _records_weight_layers(build):
         another is in progress in the same thread (a model built 
         inside a callable that the outer build invokes) records into 
         its own list, and the outer list is put back when it ends, 
-        whether it succeeds or fails.
+        whether it succeeds or fails. Layers that were created while 
+        the function ran but are not part of the model it returns 
+        are left out.
     """
     
     @functools.wraps(build)
@@ -67,7 +69,9 @@ def _records_weight_layers(build):
             model = build(*args, **kwargs)
         finally:
             _build.weight_layer_names = enclosing
-        model.weight_layer_names = tuple(names)
+        in_model = set(layer.name for layer in model.layers)
+        model.weight_layer_names = tuple(
+            name for name in names if name in in_model)
         return model
     
     return wrapper

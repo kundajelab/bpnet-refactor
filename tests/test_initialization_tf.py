@@ -261,9 +261,33 @@ def test_package_import_sets_seed_1234():
 @pytest.mark.parametrize("seed", [1234, 0, 77])
 def test_whether_tensorflow_draws_initial_weights_from_its_seed(seed):
     tf.random.set_seed(seed)
-    assert training.initializers_follow_global_seed() is SEEDED_BY_TENSORFLOW
-    # asking again gives the same answer
-    assert training.initializers_follow_global_seed() is SEEDED_BY_TENSORFLOW
+    for answer in (training.initializers_follow_global_seed,
+                   training._initializer_takes_tensorflow_seeds):
+        assert answer() is SEEDED_BY_TENSORFLOW
+        # asking again gives the same answer
+        assert answer() is SEEDED_BY_TENSORFLOW
+
+
+def test_tensorflow_24_is_not_looked_at(monkeypatch):
+    """
+        Under the version the released models were trained with the
+        answer is yes whatever an initializer would show; under later
+        versions it is what the look at an initializer says
+    """
+
+    def no_look():
+        raise AssertionError("the initializer must not be looked at")
+
+    if TF_VERSION < (2, 5):
+        monkeypatch.setattr(training, "_initializer_takes_tensorflow_seeds",
+                            no_look)
+        assert training.initializers_follow_global_seed() is True
+    else:
+        for answer in (True, False):
+            monkeypatch.setattr(
+                training, "_initializer_takes_tensorflow_seeds",
+                lambda: answer)
+            assert training.initializers_follow_global_seed() is answer
 
 
 def test_the_answer_does_not_depend_on_how_functions_are_run():
@@ -273,7 +297,7 @@ def test_the_answer_does_not_depend_on_how_functions_are_run():
     tf.config.run_functions_eagerly(True)
     try:
         before = seed_stream_state()
-        assert training.initializers_follow_global_seed() is \
+        assert training._initializer_takes_tensorflow_seeds() is \
             SEEDED_BY_TENSORFLOW
         assert seed_stream_state() == before
     finally:
@@ -289,7 +313,7 @@ def test_the_answer_is_no_for_a_generator_that_ignores_the_seed(monkeypatch):
 
     monkeypatch.setattr(tf.keras.initializers, "GlorotUniform", OwnSeed)
     state = random.getstate()
-    assert training.initializers_follow_global_seed() is False
+    assert training._initializer_takes_tensorflow_seeds() is False
     # the state of Python's random module is put back
     assert random.getstate() == state
 
@@ -301,7 +325,20 @@ def test_the_answer_is_no_for_a_generator_that_ignores_the_seed(monkeypatch):
                                             seed=7, seed2=8)
 
     monkeypatch.setattr(tf.keras.initializers, "GlorotUniform", FixedSeeds)
-    assert training.initializers_follow_global_seed() is False
+    assert training._initializer_takes_tensorflow_seeds() is False
+
+    # the state of Python's random module is also put back when the
+    # initializer fails
+    class Fails(tf.keras.initializers.Initializer):
+        def __call__(self, shape, dtype=None, **kwargs):
+            random.random()
+            raise RuntimeError("no values")
+
+    monkeypatch.setattr(tf.keras.initializers, "GlorotUniform", Fails)
+    state = random.getstate()
+    with pytest.raises(RuntimeError, match="no values"):
+        training._initializer_takes_tensorflow_seeds()
+    assert random.getstate() == state
 
 
 def test_the_answer_is_yes_for_a_generator_that_takes_tensorflows_seeds(
@@ -315,7 +352,7 @@ def test_the_answer_is_yes_for_a_generator_that_takes_tensorflows_seeds(
     monkeypatch.setattr(tf.keras.initializers, "GlorotUniform",
                         TensorFlowSeeds)
     before = seed_stream_state()
-    assert training.initializers_follow_global_seed() is True
+    assert training._initializer_takes_tensorflow_seeds() is True
     assert seed_stream_state() == before
     assert training.global_seed() == initialization.DEFAULT_SEED
 
@@ -336,6 +373,7 @@ def test_finding_out_leaves_no_trace():
         first = tf.random.uniform([3], seed=9).numpy()
         if probe:
             training.initializers_follow_global_seed()
+            training._initializer_takes_tensorflow_seeds()
         assert training.global_seed() == 99
         return (first, seed_stream_state(), random.random(),
                 np.random.rand(),
@@ -513,6 +551,21 @@ def test_a_build_that_fails_leaves_nothing_in_the_next_record():
         layer.name for layer in model.layers if layer.get_weights()}
 
 
+def activation_that_also(action):
+    done = []
+
+    @tf.autograph.experimental.do_not_convert
+    def activation(x):
+        if not done:
+            done.append(True)
+            x = action(x)
+        return tf.nn.relu(x)
+
+    return small_params(counts_head_params={
+        "units": [8, 1], "dropouts": [0.0, 0.0],
+        "activations": [activation, "linear"]})
+
+
 def test_a_model_built_while_another_is_being_built():
     """
         A callable activation that builds a model of its own: both
@@ -542,6 +595,23 @@ def test_a_model_built_while_another_is_being_built():
     assert getattr(arch._build, "weight_layer_names", None) is None
 
 
+def test_a_model_with_the_same_layer_names_built_inside_another():
+    # the inner model's layers have the names of the outer model's;
+    # each name is recorded once per model, in the order of creation
+    def inner_model(x):
+        arch.BPNet(make_tasks(), small_params(), name_prefix="main")
+        return x
+
+    params = activation_that_also(inner_model)
+    outer = arch.BPNet(make_tasks(), params, name_prefix="main")
+    names = outer.weight_layer_names
+    assert len(names) == len(set(names))
+    assert set(names) == {
+        layer.name for layer in outer.layers if layer.get_weights()}
+    assert names[:3] == ("main_conv_0", "main_dil_conv_1", "main_dil_conv_2")
+    assert names[-2:] == ("profile_predictions", "logcounts_predictions")
+
+
 def test_a_build_that_fails_inside_another_build():
     from bpnet.utils.exceptionhandler import NoTracebackException
 
@@ -567,6 +637,45 @@ def test_a_build_that_fails_inside_another_build():
                    for name in outer.weight_layer_names)
     assert set(outer.weight_layer_names) == {
         layer.name for layer in outer.layers if layer.get_weights()}
+
+
+def test_layers_created_during_a_build_that_are_not_in_the_model():
+    # a callable that uses a helper of the builder for something else
+    def unrelated_graph(x):
+        arch.motif_module(tf.keras.Input(shape=(8, 4)), [2], [1], "valid",
+                          name_prefix="unused")
+        return x
+
+    model = arch.BPNet(make_tasks(), activation_that_also(unrelated_graph),
+                       name_prefix="main")
+    assert "unused_conv_0" not in model.weight_layer_names
+    assert set(model.weight_layer_names) == {
+        layer.name for layer in model.layers if layer.get_weights()}
+    assert initialization.current_weights_digest(model) == \
+        stored_digest(model)
+    assert initialization.set_initial_weights(model, 3) == \
+        stored_digest(model)
+
+
+def test_model_with_a_layer_that_is_missing_from_the_record():
+    """
+        Should a layer with weights ever be missing from the builder's
+        record, its weights would not follow from the seed. Such a
+        model is left as TensorFlow built it where TensorFlow follows
+        the seed, and refused where weights would have to be assigned.
+    """
+
+    model = build("released")
+    model.weight_layer_names = model.weight_layer_names[:-1]
+    before = [w.copy() for w in model.get_weights()]
+
+    report = initialization.initialize(model, 1234, True)
+    assert report["drawn_by"] == "tensorflow"
+    with pytest.raises(ValueError,
+                       match=r"\['logcounts_predictions'\] have weights but"):
+        initialization.initialize(model, 1234, False)
+    assert all(np.array_equal(a, b)
+               for a, b in zip(model.get_weights(), before))
 
 
 def test_models_built_in_two_threads_keep_separate_records():

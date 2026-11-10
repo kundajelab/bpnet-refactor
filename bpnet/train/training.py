@@ -157,37 +157,29 @@ def global_seed():
     return None if seed is None else int(seed)
 
 
-#: seed of the graph in which initializers_follow_global_seed looks at
-#: an initializer; no operation carries this number by chance
+#: seed of the graph in which _initializer_takes_tensorflow_seeds looks 
+#: at an initializer; no operation carries this number by chance
 _PROBE_SEED = 987654
 
 
-def initializers_follow_global_seed():
+def _initializer_takes_tensorflow_seeds():
     """
-        Whether TensorFlow itself derives the initial weights of new 
-        layers from its global seed. It does in TensorFlow 2.4 (and, 
-        from reading the sources, up to 2.9); later versions draw 
-        them from seeds that keras makes up.
+        Whether the random operation that an unseeded keras 
+        initializer creates gets its seeds from TensorFlow
         
-        Found out by looking rather than from the version number: an 
-        unseeded initializer is called in a graph of its own whose 
-        seed is set to a known number. Where initial weights follow 
+        The initializer is called in a graph of its own whose seed is 
+        set to a known number. Where initial weights follow 
         TensorFlow's seed, the random operation it creates carries 
-        that number. Nothing is run: no operation seed is taken from 
+        that number. Nothing is run. No operation seed is taken from 
         the global stream, the random kernels of earlier operations 
         are left alone, and the state of Python's random module is 
-        restored, so that everything after it is as if it had not been
-        called.
-        
-        Outside eager execution the answer is always yes: initial 
-        weights in a TensorFlow 1 style graph are left to TensorFlow. 
+        put back. (Where keras was given a seed generator of its own 
+        with tf.keras.utils.set_random_seed, which only versions that 
+        answer no have, one seed is taken from that generator.)
         
         Returns:
             bool
     """
-    
-    if not tf.executing_eagerly():
-        return True
     
     state = random.getstate()
     graph = tf.Graph()
@@ -204,6 +196,35 @@ def initializers_follow_global_seed():
                 operation.get_attr('seed') == _PROBE_SEED:
             return True
     return False
+
+
+def initializers_follow_global_seed():
+    """
+        Whether TensorFlow itself derives the initial weights of new 
+        layers from its global seed. It does in TensorFlow 2.4 (and, 
+        from reading the sources, up to 2.9); later versions draw 
+        them from seeds that keras makes up.
+        
+        - TensorFlow 2.4, the version the released models were 
+          trained with: yes, without looking any further. 
+        - Outside eager execution: yes. Initial weights in a 
+          TensorFlow 1 style graph are left to TensorFlow. 
+        - Otherwise the answer is found by looking at what an 
+          initializer does (_initializer_takes_tensorflow_seeds), not 
+          from the version number.
+        
+        Returns:
+            bool
+    """
+    
+    if not tf.executing_eagerly():
+        return True
+    
+    version = tuple(int(part) for part in tf.__version__.split('.')[:2])
+    if version < (2, 5):
+        return True
+    
+    return _initializer_takes_tensorflow_seeds()
 
 
 def train_and_validate(

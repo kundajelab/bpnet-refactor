@@ -276,7 +276,8 @@ def test_weights_digest():
 
 
 class LayerStub(object):
-    def __init__(self, weights):
+    def __init__(self, name, weights):
+        self.name = name
         self.weights = weights
         self.assigned = 0
 
@@ -289,27 +290,44 @@ class LayerStub(object):
 
 
 class ModelStub(object):
-    def __init__(self, layers):
-        self.layers = layers
-        self.weight_layer_names = tuple(layers)
+    """
+        What the initialization needs of a model: its layers, and the
+        names of the layers with weights in the order the builder
+        created them
+    """
+
+    def __init__(self, layers, recorded=None):
+        self.layers = list(layers)
+        self.weight_layer_names = tuple(
+            layer.name for layer in layers if layer.get_weights()) \
+            if recorded is None else tuple(recorded)
 
     def get_layer(self, name):
-        return self.layers[name]
+        layer, = [layer for layer in self.layers if layer.name == name]
+        return layer
 
 
 def stub_model(dtype=np.float32, seed=0):
     rng = np.random.RandomState(seed)
-    shapes = {"conv": (3, 4, 5), "dense": (5, 1), "mix": (2, 1)}
-    return ModelStub({name: LayerStub([
+    shapes = [("conv", (3, 4, 5)), ("dense", (5, 1)), ("mix", (2, 1))]
+    layers = [LayerStub(name, [
         rng.normal(size=shape).astype(dtype),
-        rng.normal(size=shape[-1]).astype(dtype)])
-        for name, shape in shapes.items()})
+        rng.normal(size=shape[-1]).astype(dtype)]) for name, shape in shapes]
+    # a layer without weights between them, as in a real model
+    layers.insert(1, LayerStub("relu", []))
+    return ModelStub(layers)
 
 
 def stored_digest(model):
     return hashlib.sha256(b"".join(
         array.tobytes() for name in model.weight_layer_names
         for array in model.get_layer(name).get_weights())).hexdigest()
+
+
+def stored_digest_of_all(model):
+    return hashlib.sha256(b"".join(
+        array.tobytes() for layer in model.layers
+        for array in layer.get_weights())).hexdigest()
 
 
 def test_set_initial_weights():
@@ -330,8 +348,8 @@ def test_unknown_weight_layout_is_rejected():
     kernel = np.zeros((2, 1), dtype=np.float32)
     bias = np.zeros(1, dtype=np.float32)
     for weights in ([kernel], [kernel, bias, bias]):
-        model = ModelStub({
-            "first": LayerStub([kernel, bias]), "dense": LayerStub(weights)})
+        model = ModelStub([LayerStub("first", [kernel, bias]),
+                           LayerStub("dense", weights)])
         with pytest.raises(ValueError, match="dense has {} weight".format(
                 len(weights))):
             initialization.set_initial_weights(model, 1)
@@ -341,10 +359,34 @@ def test_unknown_weight_layout_is_rejected():
 def test_model_without_a_record_of_its_layers_is_rejected():
     # a model that arch.BPNet did not build, a loaded one for example
     with pytest.raises(ValueError, match="no record of its layers"):
-        initialization.set_initial_weights(ModelStub({}), 1)
+        initialization.set_initial_weights(ModelStub([]), 1)
     for drawn_from_seed in (False, True):
         with pytest.raises(ValueError, match="no record of its layers"):
-            initialization.initialize(ModelStub({}), 1, drawn_from_seed)
+            initialization.initialize(ModelStub([]), 1, drawn_from_seed)
+
+
+def test_model_with_weights_the_builder_did_not_create():
+    """
+        A layer with weights that is not in the builder's record (one
+        that a callable given to the builder added to the model): its
+        weights cannot be derived from the seed. Such a model is left
+        alone where TensorFlow follows the seed and refused where
+        weights would have to be assigned.
+    """
+
+    model = stub_model()
+    model.weight_layer_names = ("conv", "mix")
+    before = stored_digest_of_all(model)
+    with pytest.raises(ValueError, match=r"\['dense'\] have weights but"):
+        initialization.set_initial_weights(model, 1)
+    with pytest.raises(ValueError, match=r"\['dense'\] have weights but"):
+        initialization.initialize(model, 1, False)
+    assert stored_digest_of_all(model) == before
+    assert all(layer.assigned == 0 for layer in model.layers)
+
+    report = initialization.initialize(model, 1, True)
+    assert report["drawn_by"] == "tensorflow"
+    assert stored_digest_of_all(model) == before
 
 
 def test_only_float32_models_are_given_seeded_weights():
@@ -397,8 +439,7 @@ def test_initialize_leaves_weights_where_tensorflow_follows_the_seed():
     report = initialization.initialize(model, 21, True)
     assert report == {"seed": 21, "sha256": before, "drawn_by": "tensorflow"}
     assert stored_digest(model) == before
-    assert all(model.get_layer(n).assigned == 0
-               for n in model.weight_layer_names)
+    assert all(layer.assigned == 0 for layer in model.layers)
 
 
 def test_initialize_assigns_where_tensorflow_ignores_the_seed():

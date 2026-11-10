@@ -313,6 +313,15 @@ def set_initial_weights(model, seed=DEFAULT_SEED):
     """
 
     layers = _weight_layers(model)
+    recorded = set(name for name, _, _ in layers)
+    unrecorded = sorted(
+        layer.name for layer in model.layers
+        if layer.name not in recorded and layer.get_weights())
+    if unrecorded:
+        raise ValueError(
+            "Layers {} have weights but were not created by the model "
+            "builder; a model with such layers cannot be given seeded "
+            "initial weights".format(unrecorded))
     for name, _, weights in layers:
         if any(w.dtype != np.float32 for w in weights):
             raise ValueError(
