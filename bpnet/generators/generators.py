@@ -460,6 +460,130 @@ def interrupts_ignored():
         signal.signal(signal.SIGINT, before)
 
 
+class Interrupts(object):
+    """
+        Notes the interrupts (SIGINT) that arrive while a loop runs, 
+        so that none is lost
+        
+        Python raises KeyboardInterrupt in whatever the main thread 
+        is executing when an interrupt arrives. Where exceptions are 
+        discarded (in a destructor, in a callback of a library; 
+        TensorFlow runs many of both) the interrupt disappears and 
+        the loop goes on as if nothing had happened. With this, the 
+        interrupt is noted before the exception is raised, and the 
+        loop asks at every round::
+        
+            with Interrupts() as interrupts:
+                for item in items:
+                    interrupts.check()
+                    ...
+        
+        A library can also turn the KeyboardInterrupt into an error 
+        of its own (TensorFlow did, into a TypeError without a 
+        message, when the interrupt arrived inside its C code). 
+        interrupted() restores the interrupt for the place that 
+        reports the failure::
+        
+            except BaseException as failure:
+                ...
+                raise interrupts.interrupted(failure)
+        
+        Interrupts that were ignored before stay ignored. Outside the 
+        main thread, where signals are not handled, nothing is noted.
+    """
+    
+    def __init__(self):
+        #: True once an interrupt arrived
+        self.noted = False
+        self._before = None
+        self._installed = False
+    
+    def __enter__(self):
+        try:
+            before = signal.getsignal(signal.SIGINT)
+            if before != signal.SIG_IGN:
+                self._before = signal.signal(signal.SIGINT, self._note)
+                self._installed = True
+        except ValueError:
+            pass
+        return self
+    
+    def __exit__(self, *failure):
+        if self._installed:
+            self._installed = False
+            signal.signal(signal.SIGINT, self._before)
+        return False
+    
+    def _note(self, signum, frame):
+        self.noted = True
+        if callable(self._before):
+            # (Python's own handler raises KeyboardInterrupt)
+            self._before(signum, frame)
+        else:
+            raise KeyboardInterrupt
+    
+    def check(self):
+        """
+            Raises:
+                KeyboardInterrupt: if an interrupt arrived since the 
+                    block was entered
+        """
+        
+        if self.noted:
+            raise KeyboardInterrupt
+    
+    def interrupted(self, failure):
+        """
+            What to raise for a failure of the block
+            
+            Args:
+                failure (BaseException): what the block raised
+            
+            Returns:
+                BaseException: the failure itself, or, when an 
+                    interrupt arrived and the failure is something 
+                    else, a KeyboardInterrupt with the failure as 
+                    its cause
+        """
+        
+        if self.noted and not isinstance(failure, KeyboardInterrupt):
+            interrupt = KeyboardInterrupt(
+                "interrupted (the interrupt was reported as: {!r})".format(
+                    failure))
+            interrupt.__cause__ = failure
+            return interrupt
+        return failure
+
+
+def interruptible(items, interrupts=None):
+    """
+        The items of an iterable, for a loop that an interrupt must 
+        end: when an interrupt arrived and its KeyboardInterrupt was 
+        lost (see Interrupts), KeyboardInterrupt is raised before 
+        the next item is fetched, and again before it is handed out
+        
+        Args:
+            items: an iterable
+            
+            interrupts (Interrupts): the notes to look at, of a 
+                block that was entered already (None: interrupts 
+                are noted while the items are iterated)
+        
+        Yields:
+            the items
+    """
+    
+    if interrupts is not None:
+        for item in items:
+            interrupts.check()
+            yield item
+            interrupts.check()
+        return
+    with Interrupts() as interrupts:
+        for item in interruptible(items, interrupts):
+            yield item
+
+
 def stop_after_failure():
     """
         For the place where a command line tool catches its own 

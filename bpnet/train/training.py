@@ -683,11 +683,23 @@ def train_and_validate_or_stop(*args):
             *args: the arguments of train_and_validate
     """
     
+    interrupts = generators.Interrupts()
     try:
-        train_and_validate(*args)
-    except BaseException:
+        with interrupts:
+            train_and_validate(*args)
+    except BaseException as failure:
         generators.stop_after_failure()
-        raise
+        # This process ends now, with its report of what happened. 
+        # An interrupt from here on (the one bpnet-train passes on 
+        # to it, a key pressed again) would only cut that report 
+        # short.
+        try:
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+        except ValueError:
+            pass
+        # (an interrupt stays an interrupt, also when a library 
+        # reported it as an error of its own)
+        raise interrupts.interrupted(failure)
 
 
 def end_training_process(process):

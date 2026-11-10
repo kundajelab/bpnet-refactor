@@ -226,6 +226,37 @@ predict.predict_main()
 """
 
 
+#: bpnet-predict in which an interrupt gets lost during the second call
+#: of the model: KeyboardInterrupt is raised and discarded, as Python
+#: does when an interrupt arrives inside a destructor or a callback
+PREDICT_AND_LOSE_AN_INTERRUPT = WORKERS + """
+import tensorflow as tf
+from bpnet.cli import predict
+
+model_predict = tf.keras.Model.predict
+calls = []
+
+
+def loses_an_interrupt(self, *args, **kwargs):
+    calls.append(1)
+    if len(calls) == 2:
+        try:
+            open('waiting', 'w').close()
+            time.sleep(120)
+        except KeyboardInterrupt:
+            open('lost', 'w').close()
+            if os.environ['FAIL_IN'] == 'another error':
+                # what TensorFlow made of an interrupt that arrived
+                # inside its C code
+                raise TypeError()
+    return model_predict(self, *args, **kwargs)
+
+
+tf.keras.Model.predict = loses_an_interrupt
+predict.predict_main()
+"""
+
+
 def processes_of(session):
     """
         The processes of a session that are still running
@@ -430,6 +461,111 @@ def test_interrupt_of_bpnet_predict_ends_its_workers(
     print("ended {:.1f} s after the interrupt".format(seconds))
     assert seconds < PROMPT
     assert left == []
+
+
+def waits_for_the_interrupt(cwd):
+    return os.path.exists(os.path.join(cwd, "waiting"))
+
+
+@needs_proc
+def test_interrupt_that_python_loses_ends_bpnet_predict(
+        synth_dataset, model_for_predictions, tmp_path):
+    """
+        Python raises KeyboardInterrupt wherever the main thread is
+        when an interrupt arrives; inside a destructor or a callback
+        (TensorFlow runs many) the exception is discarded and the
+        tool used to go on. It notes the interrupt now, and ends
+        before the next batch.
+    """
+
+    code, output, seconds, left = run_until(
+        PREDICT_AND_LOSE_AN_INTERRUPT,
+        predict_args(synth_dataset, model_for_predictions, tmp_path),
+        str(tmp_path), {"WORKERS_OF": "test", "FAIL_IN": "never"},
+        waits_for_the_interrupt,
+        then=lambda process: os.kill(process.pid, signal.SIGINT))
+    assert os.path.exists(str(tmp_path / "lost"))
+    assert code != 0, output[-3000:]
+    assert "KeyboardInterrupt" in output
+    print("ended {:.1f} s after the interrupt".format(seconds))
+    assert seconds < PROMPT
+    assert left == []
+
+
+@needs_proc
+def test_interrupt_that_becomes_another_error_is_reported_as_one(
+        synth_dataset, model_for_predictions, tmp_path):
+    """
+        An interrupt that arrives inside the C code of TensorFlow can
+        come out as an error of its own (a TypeError without a
+        message was seen). bpnet-predict ended with that error; it
+        reports the interrupt now, with the error as its cause.
+    """
+
+    code, output, seconds, left = run_until(
+        PREDICT_AND_LOSE_AN_INTERRUPT,
+        predict_args(synth_dataset, model_for_predictions, tmp_path),
+        str(tmp_path), {"WORKERS_OF": "test", "FAIL_IN": "another error"},
+        waits_for_the_interrupt,
+        then=lambda process: os.kill(process.pid, signal.SIGINT))
+    assert code != 0, output[-3000:]
+    assert "TypeError" in output
+    assert "KeyboardInterrupt: interrupted (the interrupt was reported " \
+        "as: TypeError())" in output
+    assert seconds < PROMPT
+    assert left == []
+
+
+def fails_in_training(how, queue):
+    from bpnet.train import training
+
+    def fails(*args):
+        if how == "interrupt reported as another error":
+            try:
+                os.kill(os.getpid(), signal.SIGINT)
+                time.sleep(5)
+            except KeyboardInterrupt:
+                raise TypeError()
+        raise {"interrupt": KeyboardInterrupt, "error": RuntimeError}[how]()
+
+    training.train_and_validate = fails
+    before = signal.getsignal(signal.SIGINT)
+    try:
+        training.train_and_validate_or_stop()
+        result = "no failure"
+    except BaseException as failure:
+        result = (type(failure).__name__, type(failure.__cause__).__name__)
+    queue.put((result, before != signal.SIG_IGN,
+               signal.getsignal(signal.SIGINT) == signal.SIG_IGN))
+
+
+@pytest.mark.parametrize("how,reported", [
+    ("interrupt", ("KeyboardInterrupt", "NoneType")),
+    ("error", ("RuntimeError", "NoneType")),
+    ("interrupt reported as another error",
+     ("KeyboardInterrupt", "TypeError"))])
+def test_training_process_on_its_way_out(how, reported):
+    """
+        The training process of a split that has failed, or was
+        interrupted, stops its batch workers and ends with its report.
+        The interrupt that bpnet-train passes on to it two seconds
+        after its own must not cut that report short (it did on a
+        busy machine): once the process is on its way out, it ignores
+        interrupts. An interrupt that a library turned into an error
+        of its own is reported as an interrupt.
+    """
+
+    queue = multiprocessing.Queue()
+    process = multiprocessing.Process(target=fails_in_training,
+                                      args=(how, queue))
+    process.start()
+    try:
+        assert queue.get(timeout=START_LIMIT) == (reported, True, True)
+    finally:
+        process.join(END_LIMIT)
+        if process.is_alive():  # pragma: no cover
+            process.kill()
+            process.join()
 
 
 # --------------------------------------------------------------------

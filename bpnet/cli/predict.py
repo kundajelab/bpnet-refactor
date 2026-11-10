@@ -372,7 +372,7 @@ def metrics_update(
         pred_logcounts
 
 
-def predict(args, pred_dir):    
+def predict(args, pred_dir, interrupts=None):
     # load the model: the layers and weights are read from the saved 
     # files and rebuilt, which works for models saved by any 
     # TensorFlow version (see bpnet.model.loading)
@@ -543,8 +543,10 @@ def predict(args, pred_dir):
     all_starts = []
     all_ends = []
         
-    # run predict on each batch separately
-    for batch in tqdm(test_generator, desc='batch', total=num_batches):
+    # run predict on each batch separately (an interrupt that gets 
+    # lost inside a batch ends the loop at the next one)
+    for batch in tqdm(generators.interruptible(test_generator, interrupts), 
+                      desc='batch', total=num_batches):
         
         coordinates = batch['coordinates']
         true_profiles = batch['true_profiles']
@@ -915,13 +917,17 @@ def predict_main():
     logger.init_logger(logfname)
 
     # predict
+    interrupts = generators.Interrupts()
     try:
-        predict(args, pred_dir)
-    except BaseException:
+        with interrupts:
+            predict(args, pred_dir, interrupts)
+    except BaseException as failure:
         # the workers of the batch generator would go on making 
         # batches that nobody takes, and keep this process from ending
         generators.stop_after_failure()
-        raise
+        # (an interrupt stays an interrupt, also when a library 
+        # reported it as an error of its own)
+        raise interrupts.interrupted(failure)
     
 if __name__ == '__main__':
     predict_main()
