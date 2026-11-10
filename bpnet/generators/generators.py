@@ -72,7 +72,7 @@ from bpnet.generators import windows
 from bpnet.utils.exceptionhandler import NoTracebackException
 from bpnet.utils.misc import gaussian1D_smoothing
 from contextlib import contextmanager
-from queue import Empty, Queue
+from queue import Empty, Full, Queue
 from threading import RLock, Thread
 import time
 import traceback
@@ -102,6 +102,27 @@ WORKER_POLL_SECONDS = 1.0
 #: seconds the worker processes of an epoch get to end after they were 
 #: asked to, before they are killed
 WORKER_STOP_SECONDS = 10.0
+
+#: number of batches a worker may have handed over that have not been 
+#: collected yet. A worker that has that many waits before it makes 
+#: the next one, instead of filling its memory with batches.
+WORKER_QUEUE_BATCHES = 2
+
+
+def consumer_queue_batches(workers):
+    """
+        Number of collected batches that may wait for the consumer. 
+        The threads that collect the batches of the workers wait 
+        when that many are there; then the workers wait too.
+        
+        Args:
+            workers (int): number of worker processes
+            
+        Returns:
+            int: between 2 and 8
+    """
+    
+    return max(2, min(8, 2 * workers))
 
 
 class Epoch(object):
@@ -942,20 +963,51 @@ class MSequenceGenerator:
                 batch = self._generate_batch(batch_df)
                 
                 # add batch to the multiprocessing queue
-                mpq.put(batch)
+                if not self._hand_over(mpq, batch, consumer):
+                    return
         
                 cnt += 1
         except Exception:
             # the consumer waits for the batches of this process: tell 
             # it that no more will come, and why, then fail as before
-            mpq.put(WorkerFailure(proc_idx, traceback.format_exc()))
+            self._hand_over(mpq, WorkerFailure(
+                proc_idx, traceback.format_exc()), consumer)
             raise
         
         logging.debug(
             "{} process {} put {} batches into mpq".format(
                 self._mode, proc_idx, cnt))
             
-    def _stealer(self, mpq, q, num_batches, thread_id, proc=None):
+    def _hand_over(self, mpq, item, consumer):
+        """
+            In a worker process: put a batch (or the notice that the 
+            worker failed) into its queue, waiting while the queue is 
+            full
+            
+            Args:
+                mpq (multiprocessing.Queue): the queue of the worker
+                
+                item: what to put
+                
+                consumer (int): id of the process that takes the 
+                    batches (the parent of the worker)
+                
+            Returns:
+                bool: False if the consumer is gone; the worker has 
+                    nothing left to do then
+        """
+        
+        while True:
+            try:
+                mpq.put(item, timeout=WORKER_POLL_SECONDS)
+                return True
+            except Full:
+                if os.getppid() != consumer:
+                    mpq.cancel_join_thread()
+                    return False
+
+    def _stealer(self, mpq, q, num_batches, thread_id, proc=None, 
+                 epoch=None):
         """
             Thread target function to "get" (steal) from the
             multiprocessing queue and "put" in the regular queue
@@ -965,6 +1017,10 @@ class MSequenceGenerator:
             for example when memory ran out), a WorkerFailure goes 
             into the regular queue instead of a batch and the thread 
             ends.
+            
+            The regular queue has room for a few batches. While it 
+            is full the thread waits, and with it the worker; when 
+            the epoch is stopped meanwhile, the thread ends.
 
             Args:
                 mpq (multiprocessing.Queue): The multiprocessing queue
@@ -979,6 +1035,8 @@ class MSequenceGenerator:
                 
                 proc (multiprocessing.Process): the worker process 
                     that fills the multiprocessing queue
+                
+                epoch (Epoch): the epoch the thread belongs to
 
         """
         def ended(delivered):
@@ -1010,7 +1068,14 @@ class MSequenceGenerator:
                     # batch
                     item = ended(i)
                     break
-            q.put(item)
+            while True:
+                try:
+                    q.put(item, timeout=WORKER_POLL_SECONDS)
+                    break
+                except Full:
+                    if epoch is not None and epoch.stopped:
+                        # nobody takes batches any more
+                        return
             if isinstance(item, WorkerFailure):
                 return
 
@@ -1047,7 +1112,7 @@ class MSequenceGenerator:
         threads = epoch.threads
                        
         # the regular queue
-        q = Queue()    
+        q = Queue(consumer_queue_batches(self._num_threads))
 
         # to make sure we dont flood the user with warning messages
         warning_dispatched = False
@@ -1063,7 +1128,7 @@ class MSequenceGenerator:
         # spawn processes that will generate batches of data and "put"
         # into the multiprocessing queues
         for i in range(self._num_threads):
-            mpq = mp.Queue()
+            mpq = mp.Queue(WORKER_QUEUE_BATCHES)
 
             # give each process a  copy of the slice of the dataframe 
             # of positives
@@ -1127,7 +1192,7 @@ class MSequenceGenerator:
                 
                 stealerThread = Thread(
                     target=self._stealer, 
-                    args=[mp_q, q, num_batches[i], i, procs[i]])
+                    args=[mp_q, q, num_batches[i], i, procs[i], epoch])
                 stealerThread.start()
                 threads.append(stealerThread)
             else:
@@ -1157,6 +1222,9 @@ class MSequenceGenerator:
         """
         
         if not complete:
+            # no more batches are taken: the collecting threads must 
+            # not wait for room in the queue of the consumer
+            epoch.stopped = True
             stop_workers(epoch)
         
         for j, proc in enumerate(epoch.procs):

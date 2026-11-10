@@ -26,11 +26,14 @@
     of the generator once it runs, which is set by the slower of the
     workers (constructing and pickling) and the consuming process
     (reading and unpickling, one thread per worker under one
-    interpreter lock). The queues have no bound, so batches that the
-    workers finished before a timing starts are part of what arrives
-    during it. The two generators do not draw the same background
-    loci or jitters. Starting the workers of an epoch and ending them
-    are not timed.
+    interpreter lock). The two generators do not draw the same
+    background loci or jitters. Starting the workers of an epoch and
+    ending them are not timed.
+
+    With `--compare queues` both generators make int8 sequences, and
+    one of them gets queues without a bound, as they were before the
+    workers and the collecting threads waited for room: the bound
+    should not cost batches per second.
 """
 
 import argparse
@@ -61,7 +64,11 @@ def main():
     parser.add_argument("--threads", type=int, nargs="+", default=[2])
     parser.add_argument("--batches", type=int, default=100)
     parser.add_argument("--rounds", type=int, default=6)
+    parser.add_argument("--compare", choices=["types", "queues"],
+                        default="types")
     args = parser.parse_args()
+    first, second = ("float64", "int8") if args.compare == "types" else \
+        ("unbounded", "bounded")
 
     def generator(threads, dtype):
         params = {"sequence_generator_name": "BPNet", "input_seq_len": 2114,
@@ -73,12 +80,18 @@ def main():
             args.chroms, num_threads=threads, batch_size=args.batch_size,
             epochs=1)
 
-    def rate(gen, skip):
+    bounds = (generators.WORKER_QUEUE_BATCHES,
+              generators.consumer_queue_batches)
+
+    def rate(gen, skip, unbounded=False):
         """
             Batches per second over `--batches` batches of an epoch,
             after its first `skip`; megabytes of a batch
         """
 
+        if unbounded:
+            generators.WORKER_QUEUE_BATCHES = 0
+            generators.consumer_queue_batches = lambda workers: 0
         batches = gen.gen()
         try:
             for _ in range(skip):
@@ -90,32 +103,36 @@ def main():
         finally:
             # ends the workers of the epoch
             batches.close()
+            generators.WORKER_QUEUE_BATCHES, \
+                generators.consumer_queue_batches = bounds
 
     for threads in args.threads:
-        gens = {dtype: generator(threads, dtype)
-                for dtype in ("float64", "int8")}
+        gens = {name: generator(
+            threads, name if args.compare == "types" else "int8")
+            for name in (first, second)}
         needed = args.batches + 2 * threads
-        if gens["int8"].len() < needed:
+        if gens[second].len() < needed:
             raise SystemExit("an epoch has {} batches; {} are needed".format(
-                gens["int8"].len(), needed))
-        rates = {"float64": [], "int8": []}
+                gens[second].len(), needed))
+        rates = {first: [], second: []}
         sizes = {}
         for i in range(args.rounds):
-            order = ("float64", "int8") if i % 2 == 0 else ("int8", "float64")
-            for dtype in order:
-                found, sizes[dtype] = rate(gens[dtype], 2 * threads)
-                rates[dtype].append(found)
-        old, new = np.array(rates["float64"]), np.array(rates["int8"])
+            order = (first, second) if i % 2 == 0 else (second, first)
+            for name in order:
+                found, sizes[name] = rate(gens[name], 2 * threads,
+                                          unbounded=name == "unbounded")
+                rates[name].append(found)
+        old, new = np.array(rates[first]), np.array(rates[second])
         ratios = new / old
         rng = np.random.RandomState(0)
         medians = [np.median(ratios[rng.randint(0, len(ratios),
                                                 size=len(ratios))])
                    for _ in range(2000)]
-        print("{:2d} workers: float64 {:6.1f} batches per second ({:.1f} MB "
-              "per batch)   int8 {:6.1f} ({:.1f} MB)   {:.2f}x "
+        print("{:2d} workers: {} {:6.1f} batches per second ({:.1f} MB "
+              "per batch)   {} {:6.1f} ({:.1f} MB)   {:.2f}x "
               "[{:.2f}, {:.2f}]".format(
-                  threads, np.median(old), sizes["float64"], np.median(new),
-                  sizes["int8"], np.median(ratios),
+                  threads, first, np.median(old), sizes[first], second,
+                  np.median(new), sizes[second], np.median(ratios),
                   np.percentile(medians, 2.5), np.percentile(medians, 97.5)))
         sys.stdout.flush()
 
