@@ -334,12 +334,43 @@ def test_load_params_fills_in_defaults():
 # known defects, written as the behaviour we want
 # --------------------------------------------------------------------
 
-@pytest.mark.xfail(strict=True, reason="load_params updates the module "
-                   "level default dictionaries in place")
+def default_parameters():
+    return {name: copy.deepcopy(getattr(bpnetdefaults, name))
+            for name in dir(bpnetdefaults) if name.isupper()}
+
+
 def test_building_a_model_leaves_the_defaults_alone():
-    before = copy.deepcopy(bpnetdefaults.SYNTAX_MODULE_PARAMS)
-    build(small_params())
-    assert bpnetdefaults.SYNTAX_MODULE_PARAMS == before
+    before = default_parameters()
+    build(small_params(counts_head_params={"units": [-1]}),
+          orig_multi_loss=True)
+    arch.load_params({"motif_module_params": {"filters": [3]},
+                      "loss_weights": [2, 3]})
+    assert default_parameters() == before
+
+
+def test_building_a_model_leaves_the_callers_parameters_alone():
+    params = small_params(counts_head_params={"units": [-1]})
+    before = copy.deepcopy(params)
+    arch.BPNet(make_tasks(), params, name_prefix="main",
+               orig_multi_loss=True)
+    assert params == before
+    # the returned dictionaries are copies
+    loaded = arch.load_params(params)
+    loaded[2]["filters"].append(99)
+    loaded[8].append(99)
+    assert params == before
+
+
+def test_models_do_not_depend_on_what_was_built_before():
+    build(small_params(
+        motif_module_params={"filters": [5, 6], "kernel_sizes": [11, 21]},
+        syntax_module_params={"num_dilation_layers": 1, "filters": 6},
+        input_len=188))
+    # the default architecture, with no parameters given
+    model = arch.BPNet(make_tasks(), {}, name_prefix="main")
+    assert model.count_params() == 113938
+    assert [tuple(t.shape) for t in model.outputs] == \
+        [(None, 1000, 2), (None, 1)]
 
 
 def two_task_model():

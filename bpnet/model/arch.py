@@ -8,6 +8,8 @@ seed(1234)
 from tensorflow.random import set_seed 
 set_seed(1234)
 
+import copy
+
 from bpnet.model.custommodel import CustomModel
 from bpnet.utils.exceptionhandler \
     import NoTracebackException
@@ -491,9 +493,10 @@ def load_params(params):
             tuple - all parameters to BPNet
     """
         
-    # initialize all params from defaults and then run through
-    # all the override values from the params json and replace
-    # default values with the user defined values
+    # initialize all params from copies of the defaults and then run
+    # through all the override values from the params json and replace
+    # default values with the user defined values. Neither the module
+    # level defaults nor the caller's dictionary are modified.
     input_len = bpnetdefaults.INPUT_LEN
     if 'input_len' in params:
         input_len = params['input_len']
@@ -502,46 +505,34 @@ def load_params(params):
     if 'output_profile_len' in params:
         output_profile_len = params['output_profile_len']
 
-    motif_module_params = bpnetdefaults.MOTIF_MODULE_PARAMS
-    if 'motif_module_params' in params:
-        for key in params['motif_module_params']:
-            motif_module_params[key] = params['motif_module_params'][key]
+    def _merged(defaults, key):
+        merged = copy.deepcopy(defaults)
+        if key in params:
+            merged.update(copy.deepcopy(params[key]))
+        return merged
 
-    syntax_module_params = bpnetdefaults.SYNTAX_MODULE_PARAMS
-    if 'syntax_module_params' in params:
-        for key in params['syntax_module_params']:
-            syntax_module_params[key] = params['syntax_module_params'][key]
-            
-    profile_head_params = bpnetdefaults.PROFILE_HEAD_PARAMS
-    if 'profile_head_params' in params:
-        for key in params['profile_head_params']:
-            profile_head_params[key] = params['profile_head_params'][key]
-            
-    counts_head_params = bpnetdefaults.COUNTS_HEAD_PARAMS
-    if 'counts_head_params' in params:
-        for key in params['counts_head_params']:
-            counts_head_params[key] = params['counts_head_params'][key]
-        
-    profile_bias_module_params = bpnetdefaults.PROFILE_BIAS_MODULE_PARAMS
-    if 'profile_bias_module_params' in params:
-        for key in params['profile_bias_module_params']:
-            profile_bias_module_params[key] = \
-                params['profile_bias_module_params'][key]
+    motif_module_params = _merged(
+        bpnetdefaults.MOTIF_MODULE_PARAMS, 'motif_module_params')
+    syntax_module_params = _merged(
+        bpnetdefaults.SYNTAX_MODULE_PARAMS, 'syntax_module_params')
+    profile_head_params = _merged(
+        bpnetdefaults.PROFILE_HEAD_PARAMS, 'profile_head_params')
+    counts_head_params = _merged(
+        bpnetdefaults.COUNTS_HEAD_PARAMS, 'counts_head_params')
+    profile_bias_module_params = _merged(
+        bpnetdefaults.PROFILE_BIAS_MODULE_PARAMS,
+        'profile_bias_module_params')
+    counts_bias_module_params = _merged(
+        bpnetdefaults.COUNTS_BIAS_MODULE_PARAMS, 'counts_bias_module_params')
 
-    counts_bias_module_params = bpnetdefaults.COUNTS_BIAS_MODULE_PARAMS
-    if 'counts_bias_module_params' in params:
-        for key in params['counts_bias_module_params']:
-            counts_bias_module_params[key] = \
-                params['counts_bias_module_params'][key]
-            
-    loss_weights = bpnetdefaults.LOSS_WEIGHTS
+    loss_weights = copy.deepcopy(bpnetdefaults.LOSS_WEIGHTS)
     if 'loss_weights' in params:
-        loss_weights = params['loss_weights']
-        
+        loss_weights = copy.deepcopy(params['loss_weights'])
+
     counts_loss = bpnetdefaults.COUNTS_LOSS
     if 'counts_loss' in params:
         counts_loss = params['counts_loss']
-        
+
     return (input_len, output_profile_len, motif_module_params, 
             syntax_module_params, profile_head_params, counts_head_params,
             profile_bias_module_params, counts_bias_module_params,
