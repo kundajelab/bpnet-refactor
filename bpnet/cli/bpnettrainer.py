@@ -116,7 +116,8 @@ def main():
                 args.model_arch_name))
     
     if not os.path.isfile(args.splits):
-        raise NoTracebackException("File not found: {}", args.splits)
+        raise NoTracebackException(
+            "File not found: {}".format(args.splits))
                 
     # load splits from json file
     with open(args.splits, "r") as splits_json:
