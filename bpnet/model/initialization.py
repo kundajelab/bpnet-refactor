@@ -26,9 +26,18 @@
     Philox4x32-10 counter based generator of the RandomUniform kernel,
     the conversion of its output to float32, the Glorot uniform limits
     and the operation seed stream. A model initialized here with seed
-    1234 starts from exactly the weights the same model had under
-    TensorFlow 2.4.1 (the released ENCODE models were trained that
-    way), whatever the TensorFlow version, and so can a PyTorch model.
+    1234 starts from exactly the weights the same model had in a
+    training run under TensorFlow 2.4.1 (the released ENCODE models
+    were trained that way), whatever the TensorFlow version, and so
+    can a PyTorch model.
+
+    What it does not do. Where TensorFlow itself still draws the
+    weights from the global seed (2.4.1), `initialize` leaves them as
+    drawn, so nothing changes there in any situation, including a
+    process that used random operations or built other models before.
+    Weights are only assigned where TensorFlow no longer follows the
+    seed, and then they are the weights of a fresh seed. Only float32
+    models are handled.
 
     Only numpy and the standard library are used.
 """
@@ -87,51 +96,74 @@ def _philox_4x32_10(counters, key):
     return np.stack([c0, c1, c2, c3], axis=1).astype(np.uint32)
 
 
-def random_uniform(n, seed, seed2):
+#: TensorFlow reserves this many counter values per output value when
+#: a random kernel is used; a kernel that is used again continues after
+#: what was reserved (PhiloxRandomOp::Compute, ReserveRandomOutputs)
+_RESERVED_PER_VALUE = 256
+
+#: number of counter values processed at a time (4 output values each)
+_BLOCK = 1 << 18
+
+
+def random_uniform(n, seed, seed2, skip=0):
     """
-        The first n values of TensorFlow's stateful RandomUniform
-        kernel for float32, in [0, 1)
+        Values of TensorFlow's stateful RandomUniform kernel for
+        float32, in [0, 1)
+
+        TensorFlow treats the pair (seed, seed2) = (0, 0) as "not
+        seeded" and replaces it by seeds from the clock; see
+        kernel_seeds for the pair it uses for given seeds. This
+        function returns the generator's output for the pair as given.
 
         Args:
             n (int): number of values
-            seed (int): the kernel's `seed` attribute (the global seed)
-            seed2 (int): the kernel's `seed2` attribute (the operation
-                seed)
+            seed (int): the kernel's `seed` attribute
+            seed2 (int): the kernel's `seed2` attribute
+            skip (int): position in the kernel's stream to start from,
+                in counter values (0 for a kernel that has not been
+                used)
 
         Returns:
             numpy.ndarray: float32 array of length n
     """
 
-    seed, seed2 = int(seed), int(seed2)
+    n, seed, seed2, skip = int(n), int(seed), int(seed2), int(skip)
     groups = (n + 3) // 4
-    index = np.arange(groups, dtype=np.uint64)
-    counters = np.zeros((groups, 4), dtype=np.uint32)
-    # the key is `seed`; `seed2` fills the upper half of the 128 bit
-    # counter, whose lower half counts groups of four values
-    counters[:, 0] = (index & _LOW32).astype(np.uint32)
-    counters[:, 1] = (index >> _SHIFT32).astype(np.uint32)
-    counters[:, 2] = seed2 & _MASK32
-    counters[:, 3] = (seed2 >> 32) & _MASK32
-    bits = _philox_4x32_10(
-        counters, (seed & _MASK32, (seed >> 32) & _MASK32)).reshape(-1)[:n]
+    key = (seed & _MASK32, (seed >> 32) & _MASK32)
+    out = np.empty(groups * 4, dtype=np.float32)
+    for first in range(0, groups, _BLOCK):
+        count = min(_BLOCK, groups - first)
+        # the key is `seed`; `seed2` fills the upper half of the 128
+        # bit counter, whose lower half counts groups of four values
+        index = np.arange(skip + first, skip + first + count,
+                          dtype=np.uint64)
+        counters = np.zeros((count, 4), dtype=np.uint32)
+        counters[:, 0] = (index & _LOW32).astype(np.uint32)
+        counters[:, 1] = (index >> _SHIFT32).astype(np.uint32)
+        counters[:, 2] = seed2 & _MASK32
+        counters[:, 3] = (seed2 >> 32) & _MASK32
+        bits = _philox_4x32_10(counters, key).reshape(-1)
+        # 23 random mantissa bits with exponent 0 give a float in
+        # [1, 2)
+        as_float = ((np.uint32(127) << np.uint32(23))
+                    | (bits & np.uint32(0x7FFFFF))).view(np.float32)
+        out[4 * first:4 * (first + count)] = as_float - np.float32(1.0)
+    return out[:n]
 
-    # 23 random mantissa bits with exponent 0 give a float in [1, 2)
-    as_float = ((np.uint32(127) << np.uint32(23))
-                | (bits & np.uint32(0x7FFFFF))).view(np.float32)
-    return as_float - np.float32(1.0)
 
-
-def glorot_uniform(shape, seed, op_seed):
+def glorot_uniform(shape, seed, op_seed, skip=0):
     """
         A kernel as Keras' default 'glorot_uniform' initializer drew it
-        under TensorFlow 2.4.1 for the given global and operation seed
+        under TensorFlow 2.4.1
 
         Args:
             shape (tuple): kernel shape in Keras layout: (width, in,
                 out) for Conv1D, (in, out) for Dense
-            seed (int): the kernel's `seed` attribute (see
+            seed (int): the random kernel's `seed` attribute (see
                 kernel_seeds)
-            op_seed (int): the kernel's `seed2` attribute
+            op_seed (int): the random kernel's `seed2` attribute
+            skip (int): position in the random kernel's stream (see
+                random_uniform)
 
         Returns:
             numpy.ndarray: float32 array of the given shape, uniform in
@@ -144,18 +176,31 @@ def glorot_uniform(shape, seed, op_seed):
     fan_out = shape[-1] * receptive_field
     limit = np.sqrt(3.0 / max(1.0, (fan_in + fan_out) / 2.0))
     minval, maxval = np.float32(-limit), np.float32(limit)
-    values = random_uniform(int(np.prod(shape)), seed, op_seed)
+    values = random_uniform(int(np.prod(shape)), seed, op_seed, skip)
     # the float32 arithmetic of tf.random.uniform
     return (values * (maxval - minval) + minval).reshape(shape)
 
 
-def operation_seeds(seed, n):
+def operation_seeds(seed, n, state=None):
     """
-        The first n operation seeds TensorFlow hands out after
-        tf.random.set_seed(seed)
+        The next n operation seeds TensorFlow hands out
+
+        Args:
+            seed (int): what tf.random.set_seed was given
+            n (int): number of operation seeds
+            state: state (random.Random.getstate) of TensorFlow's
+                stream of operation seeds; None for the stream right
+                after tf.random.set_seed(seed)
+
+        Returns:
+            list: n integers in [0, 2**31 - 1]
     """
 
-    stream = random.Random(seed)
+    if state is None:
+        stream = random.Random(seed)
+    else:
+        stream = random.Random()
+        stream.setstate(state)
     return [stream.randint(0, _MAX_OP_SEED) for _ in range(n)]
 
 
@@ -180,7 +225,7 @@ def kernel_seeds(seed, op_seed):
     return seeds
 
 
-def initial_kernels(shapes, seed=DEFAULT_SEED):
+def initial_kernels(shapes, seed=DEFAULT_SEED, state=None):
     """
         Kernels for the layers of a model, in the order the layers are
         created
@@ -188,14 +233,25 @@ def initial_kernels(shapes, seed=DEFAULT_SEED):
         Args:
             shapes (list): kernel shapes in creation order
             seed (int): the seed (what tf.random.set_seed was given)
+            state: where TensorFlow's stream of operation seeds stands
+                (see operation_seeds); None for a fresh seed
 
         Returns:
             list: one float32 array per shape
     """
 
-    return [glorot_uniform(shape, *kernel_seeds(seed, op_seed))
-            for shape, op_seed in zip(
-                shapes, operation_seeds(seed, len(shapes)))]
+    kernels = []
+    # TensorFlow keeps one random kernel per pair of seeds; when the
+    # stream hands out the same operation seed twice, the second layer
+    # continues where the kernel stopped reserving for the first
+    reserved = {}
+    for shape, op_seed in zip(
+            shapes, operation_seeds(seed, len(shapes), state)):
+        pair = kernel_seeds(seed, op_seed)
+        skip = reserved.get(pair, 0)
+        kernels.append(glorot_uniform(shape, pair[0], pair[1], skip))
+        reserved[pair] = skip + int(np.prod(shape)) * _RESERVED_PER_VALUE
+    return kernels
 
 
 def weights_digest(arrays):
@@ -210,21 +266,13 @@ def weights_digest(arrays):
     return digest.hexdigest()
 
 
-def set_initial_weights(model, seed=DEFAULT_SEED):
+def _weight_layers(model):
     """
-        Give a freshly built model the initial weights of the seed:
-        Glorot uniform kernels from the seeded stream, zero biases
-
-        Args:
-            model: a model built by bpnet.model.arch.BPNet (it records
-                the names of its layers with weights, in creation
-                order, in `weight_layer_names`)
-            seed (int): the seed; 1234 gives the weights every model
-                started from under TensorFlow 2.4.1
+        The layers with weights of a model in creation order, with
+        their current weights
 
         Returns:
-            str: digest of the weights that were set (see
-                weights_digest)
+            list: (name, layer, [kernel, bias]) per layer
     """
 
     names = list(model.weight_layer_names)
@@ -232,18 +280,124 @@ def set_initial_weights(model, seed=DEFAULT_SEED):
         raise ValueError(
             "The model has no record of its layers with weights; only "
             "models built by bpnet.model.arch.BPNet can be initialized")
-    layers = [model.get_layer(name) for name in names]
-    current = [layer.get_weights() for layer in layers]
-    for name, weights in zip(names, current):
+    found = []
+    for name in names:
+        layer = model.get_layer(name)
+        weights = layer.get_weights()
         if len(weights) != 2:
             raise ValueError(
                 "Layer {} has {} weight arrays; a kernel and a bias are "
                 "expected".format(name, len(weights)))
+        found.append((name, layer, weights))
+    return found
 
-    kernels = initial_kernels([w[0].shape for w in current], seed)
-    arrays = []
-    for layer, weights, kernel in zip(layers, current, kernels):
-        bias = np.zeros(weights[1].shape, dtype=weights[1].dtype)
-        layer.set_weights([kernel.astype(weights[0].dtype), bias])
-        arrays.extend([kernel, bias])
-    return weights_digest(arrays)
+
+def current_weights_digest(model):
+    """
+        Digest (see weights_digest) of the kernels and biases the model
+        has now, in the order its layers were created
+    """
+
+    return weights_digest(
+        [array for _, _, weights in _weight_layers(model)
+         for array in weights])
+
+
+def set_initial_weights(model, seed=DEFAULT_SEED):
+    """
+        Give a freshly built model the initial weights of the seed:
+        Glorot uniform kernels from the seeded stream, zero biases
+
+        Args:
+            model: a float32 model built by bpnet.model.arch.BPNet (it
+                records the names of its layers with weights, in
+                creation order, in `weight_layer_names`)
+            seed (int): the seed; 1234 gives the weights a model
+                started from in a training run under TensorFlow 2.4.1
+
+        Returns:
+            str: digest of the weights that were set (see
+                weights_digest)
+    """
+
+    layers = _weight_layers(model)
+    for name, _, weights in layers:
+        if any(w.dtype != np.float32 for w in weights):
+            raise ValueError(
+                "Layer {} has {} weights; only float32 models can be "
+                "given seeded initial weights".format(
+                    name, weights[0].dtype))
+
+    kernels = initial_kernels([w[0].shape for _, _, w in layers], seed)
+    for (_, layer, weights), kernel in zip(layers, kernels):
+        layer.set_weights([kernel, np.zeros_like(weights[1])])
+    # of the weights the model now has
+    return current_weights_digest(model)
+
+
+def follows_seed(model, seed, state):
+    """
+        Whether the model, as TensorFlow built it, already has the
+        initial weights of the global seed: true where Keras draws
+        kernels from tf.random.set_seed (TensorFlow 2.4), false where
+        it draws them from elsewhere
+
+        Args:
+            model: a freshly built model
+            seed (int): the global seed that was in effect when the
+                model was built (None if none was set)
+            state: state of TensorFlow's stream of operation seeds
+                right before the model was built (see operation_seeds)
+
+        Returns:
+            bool: True if the first kernel is the kernel that the seed
+                and the stream give
+    """
+
+    if seed is None or state is None:
+        return False
+    _, _, weights = _weight_layers(model)[0]
+    kernel = weights[0]
+    if kernel.dtype != np.float32:
+        return False
+    expected, = initial_kernels([kernel.shape], seed, state)
+    return bool(np.array_equal(kernel, expected))
+
+
+def initialize(model, seed, state):
+    """
+        Make the initial weights of a freshly built model follow the
+        global seed, whatever the TensorFlow version
+
+        - The weights are left as TensorFlow drew them when they
+          already follow the seed (TensorFlow 2.4: nothing changes
+          there), when no global seed is set (random weights were
+          asked for), and when the model is not float32.
+        - Otherwise (newer TensorFlow versions, whose initializers
+          ignore the global seed) the weights of the seed are
+          assigned: the weights TensorFlow 2.4.1 draws for the model
+          right after tf.random.set_seed(seed).
+
+        Args:
+            model: a model just built by bpnet.model.arch.BPNet
+            seed (int): the global seed in effect when the model was
+                built, None if none was set
+            state: state of TensorFlow's stream of operation seeds
+                right before the model was built (see operation_seeds);
+                None if it is not known
+
+        Returns:
+            dict: 'seed', 'sha256' (digest of the initial weights, see
+                weights_digest) and 'drawn_by': 'tensorflow' if the
+                weights were left as drawn, 'bpnet' if they were
+                assigned here
+    """
+
+    float32 = all(w.dtype == np.float32
+                  for _, _, weights in _weight_layers(model)
+                  for w in weights)
+    if seed is None or not float32 or follows_seed(model, seed, state):
+        return {'seed': seed, 'sha256': current_weights_digest(model),
+                'drawn_by': 'tensorflow'}
+    return {'seed': seed, 'sha256': set_initial_weights(model, seed),
+            'drawn_by': 'bpnet'}

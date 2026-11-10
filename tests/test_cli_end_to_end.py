@@ -40,14 +40,20 @@ HISTORY_KEYS = [
 
 
 # sha256 over the initial kernels and biases of the synthetic dataset's
-# architecture for seeds 1234 and 7. The first is what the unmodified
-# trainer (upstream main at 0b11a7c) started from on this dataset under
-# TensorFlow 2.4.1; under that version both are the weights Keras draws
-# itself after tf.random.set_seed(seed) (see test_initialization.py).
-# Every TensorFlow version must start there
+# architecture for three seeds. The one of seed 1234 is what the
+# unmodified trainer (upstream main at 0b11a7c) started from on this
+# dataset under TensorFlow 2.4.1; under that version all are the
+# weights Keras draws itself after tf.random.set_seed(seed) (see
+# test_initialization_tf.py). Every TensorFlow version must start there
 INITIAL_WEIGHTS_SHA256 = {
     1234: "56a4b9e7de8f3a4363f0b3b4b08e24289fe9cd7f43204053f2a71c9c52199be6",
-    7: "df30f8c0cc3c46ca982edec4ee1c79c0dd391c09ff6f5dad55cfacbe4b08af72"}
+    7: "df30f8c0cc3c46ca982edec4ee1c79c0dd391c09ff6f5dad55cfacbe4b08af72",
+    0: "e44c42849f007e53b798b9d2e864564b4a59587f75edcf04607b7f643bd73785"}
+
+#: TensorFlow 2.4 draws the initial weights from the global seed
+#: itself; under later versions the trainer assigns them
+DRAWN_BY = "tensorflow" if tuple(
+    int(x) for x in tf.__version__.split(".")[:2]) < (2, 5) else "bpnet"
 
 #: the layers with weights in the order the model creates them
 LAYERS = ["main_conv_0", "main_dil_conv_1", "main_dil_conv_2",
@@ -144,7 +150,7 @@ def frozen(synth_dataset, tmp_path_factory):
 
     runs = {}
     for name, extra in [("default", []), ("seed 7", ["--seed", 7]),
-                        ("seed 7 again", ["--seed", 7])]:
+                        ("seed 0", ["--seed", 0])]:
         runs[name] = run_trainer(
             synth_dataset, tmp_path_factory.mktemp("frozen"), epochs=1,
             max_jitter=0, learning_rate=0,
@@ -285,14 +291,16 @@ def test_trainer_reports_the_initial_weights(trained):
     assert trained["code"] == 0, trained["output"][-3000:]
     config = read_json(os.path.join(trained["dir"], "config_split000.json"))
     assert config["initial_weights"] == {
-        "seed": 1234, "sha256": INITIAL_WEIGHTS_SHA256[1234]}
+        "seed": 1234, "sha256": INITIAL_WEIGHTS_SHA256[1234],
+        "drawn_by": DRAWN_BY}
     assert config["hyper_params"]["seed"] is None
     assert initial_weights_log_lines(trained) == [
-        "seed 1234, sha256 " + INITIAL_WEIGHTS_SHA256[1234]]
+        "seed 1234, sha256 {}, drawn by {}".format(
+            INITIAL_WEIGHTS_SHA256[1234], DRAWN_BY)]
 
 
 @pytest.mark.parametrize("run,seed", [("default", 1234), ("seed 7", 7),
-                                      ("seed 7 again", 7)])
+                                      ("seed 0", 0)])
 def test_training_starts_from_the_seeded_weights(frozen, run, seed):
     """
         With a learning rate of zero the saved weights are the initial
@@ -322,11 +330,13 @@ def test_training_starts_from_the_seeded_weights(frozen, run, seed):
     config = read_json(os.path.join(frozen[run]["dir"],
                                     "config_split000.json"))
     assert config["initial_weights"] == {
-        "seed": seed, "sha256": INITIAL_WEIGHTS_SHA256[seed]}
+        "seed": seed, "sha256": INITIAL_WEIGHTS_SHA256[seed],
+        "drawn_by": DRAWN_BY}
     assert config["hyper_params"]["seed"] == (None if run == "default"
                                               else seed)
     assert initial_weights_log_lines(frozen[run]) == [
-        "seed {}, sha256 {}".format(seed, INITIAL_WEIGHTS_SHA256[seed])]
+        "seed {}, sha256 {}, drawn by {}".format(
+            seed, INITIAL_WEIGHTS_SHA256[seed], DRAWN_BY)]
 
 
 def epoch_loss(d, weights, numpy_seed):
@@ -390,18 +400,16 @@ def test_seed_governs_the_choice_of_training_loci(synth_dataset, frozen):
 
     expected = epoch_loss(synth_dataset, weights["seed 7"], 7)
     assert losses["seed 7"] == pytest.approx(expected, rel=2e-4)
-    assert losses["seed 7 again"] == pytest.approx(expected, rel=2e-4)
-    # batches arrive in a different order from the worker processes,
-    # which changes the float32 mean in its last digits only
-    assert losses["seed 7 again"] == pytest.approx(losses["seed 7"],
-                                                   rel=1e-5)
+    assert losses["seed 0"] == pytest.approx(
+        epoch_loss(synth_dataset, weights["seed 0"], 0), rel=2e-4)
     assert losses["default"] == pytest.approx(
         epoch_loss(synth_dataset, weights["default"], 1234), rel=2e-4)
 
     # the comparison tells the epochs of two seeds apart: the same
     # model on the epoch of another seed is far outside the tolerance
-    other = epoch_loss(synth_dataset, weights["seed 7"], 1234)
-    assert abs(other - expected) > 2e-3 * expected
+    for other_seed in (1234, 0):
+        other = epoch_loss(synth_dataset, weights["seed 7"], other_seed)
+        assert abs(other - expected) > 2e-3 * expected
 
 
 def test_saved_weights_are_readable_by_layer_name(trained):

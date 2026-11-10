@@ -140,21 +140,25 @@ def reduce_lr_on_plateau(losses, current_lr, factor=0.5, patience=2,
     return new_lr
 
 
-def global_seed():
+def seed_state():
     """
-        The seed of tf.random.set_seed that is in effect (the package
-        sets 1234 when it is imported; a caller may have set another)
+        TensorFlow's global seed (the package sets 1234 when it is 
+        imported; --seed or a caller may have set another) and where 
+        the stream of operation seeds that follows from it stands
         
         Returns:
-            int: the global seed, 1234 if none is set
+            tuple: (seed, state); the seed is None if no global seed is
+                set; the state is that of TensorFlow's random.Random 
+                of operation seeds (None if it cannot be read)
     """
     
     from tensorflow.python.eager import context
     
     seed = context.global_seed()
     if seed is None:
-        return initialization.DEFAULT_SEED
-    return int(seed)
+        return None, None
+    stream = getattr(context.context(), '_rng', None)
+    return int(seed), (stream.getstate() if stream is not None else None)
 
 
 def train_and_validate(
@@ -365,23 +369,27 @@ def train_and_validate(
     logging.debug("New {} model".format(model_arch_name))
     get_model = getattr(arch, model_arch_name)
     
+    # where TensorFlow's seed stands before the model is built
+    initial_seed, initial_seed_stream = seed_state()
+    
     model = get_model(tasks, 
                         model_arch_params, 
                         orig_multi_loss=orig_multi_loss, 
                         name_prefix="main")
     
-    # Initial weights. Under TensorFlow 2.4.1 the global seed fixed the 
+    # Initial weights. Under TensorFlow 2.4.1 the global seed fixes the 
     # initial weights; newer versions draw them differently on every 
     # run, which hurts experiments with few peaks (they train for too 
     # few steps to recover from an unlucky start of the layers that 
-    # combine the predictions with the control tracks). Assigning the 
-    # weights of the seed here gives every TensorFlow version the
-    # starting point TensorFlow 2.4.1 had.
-    initial_weights_seed = global_seed()
-    initial_weights_digest = initialization.set_initial_weights(
-        model, initial_weights_seed)
-    logging.info("Initial weights: seed {}, sha256 {}".format(
-        initial_weights_seed, initial_weights_digest))
+    # combine the predictions with the control tracks). Where 
+    # TensorFlow did not draw the weights from the seed, the weights 
+    # of the seed are assigned here; where it did, they are left as 
+    # they are.
+    initial_weights = initialization.initialize(
+        model, initial_seed, initial_seed_stream)
+    logging.info("Initial weights: seed {}, sha256 {}, drawn by {}".format(
+        initial_weights['seed'], initial_weights['sha256'], 
+        initial_weights['drawn_by']))
 
     # print out the model summary
     model.summary()
@@ -573,9 +581,7 @@ def train_and_validate(
         config['parallelization_params'] = parallelization_params
         
         # what the model started from
-        config['initial_weights'] = {
-            'seed': initial_weights_seed, 
-            'sha256': initial_weights_digest}
+        config['initial_weights'] = initial_weights
         
         # the number of epochs the training lasted
         config['training_epochs'] = epoch + 1

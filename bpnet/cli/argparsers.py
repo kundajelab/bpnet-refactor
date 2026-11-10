@@ -55,13 +55,15 @@ def training_argsparser():
 
     parser.add_argument('--seed', type=seed_value, default=None,
                         help="seed for the initial weights and for the "
-                        "random choices made while the training loci are "
-                        "prepared (background sampling, trimming, "
-                        "shuffling). The jitter is drawn in the worker "
-                        "processes and does not depend on it. When not "
-                        "given, the initial weights are those of seed "
-                        "1234, the weights every model started from "
-                        "under TensorFlow 2.4.1")
+                        "random choices made while the training and "
+                        "validation loci are prepared (background "
+                        "sampling, trimming, shuffling). A run is not "
+                        "reproduced exactly by it: the jitter is drawn "
+                        "in the worker processes and does not depend on "
+                        "the seed, and batches arrive in varying order. "
+                        "When not given, the initial weights are those "
+                        "of seed 1234, the weights a training run "
+                        "started from under TensorFlow 2.4.1")
 
     # model params
     # TODO - might want to yaml just the model params 

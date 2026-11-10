@@ -28,7 +28,8 @@ Tests run on the CPU. Set `BPNET_TEST_GPU=1` to let TensorFlow use a GPU.
 | `test_losses.py` | multinomial NLL against scipy, its gradient and normalization constant, MSE and Poisson count losses |
 | `test_custommodel.py` | the training objective against the numpy reference (masking by weight, joint two-strand multinomial, log(total + 2) count target), gradients against finite differences, the Adam update rule, train / test step bookkeeping |
 | `test_training_helpers.py` | early stopping and learning-rate-on-plateau rules |
-| `test_initialization.py` | the seeded initial weights: the numpy generator against TensorFlow's random kernel, the weights recorded from a TensorFlow 2.4.1 training run, and (on TensorFlow 2.4) against what Keras draws itself for seven architectures; the `--seed` option's values |
+| `test_initialization.py` | the seeded initial weights without TensorFlow: the numpy generator against values recorded from TensorFlow 2.4.1, the weights a training run started from under that version, operation seeds, repeated seeds, when weights are left as drawn and when they are assigned; the `--seed` option's values |
+| `test_initialization_tf.py` | the same against TensorFlow: the generator against TensorFlow's random kernel, the seed handling against TensorFlow's, on TensorFlow 2.4 the kernels against what Keras draws itself for seven architectures and five seeds; what the trainer does before and after building its model |
 | `test_optimizer.py` | the Adam update on prescribed gradients (40 steps, magnitudes around epsilon, a learning-rate change) |
 | `test_metrics.py` | the per-region metrics of `bpnet-predict` (correlations, normalized likelihood, cross entropy and Jensen-Shannon scores, MSE) against formulas written out in the test |
 | `test_bigwig_writing.py` | both bigWig writers: region order, the split of overlapping regions between their centres, the statistics file |

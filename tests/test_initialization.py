@@ -1,7 +1,10 @@
 """
-    Tests for the seeded initial weights (bpnet.model.initialization):
-    the numpy generator reproduces TensorFlow's random kernel and the
-    weights Keras gave a model under TensorFlow 2.4.1
+    Tests for the seeded initial weights (bpnet.model.initialization)
+    that need no TensorFlow: the numpy generator against values
+    recorded from TensorFlow 2.4.1, the weights a training run started
+    from under that version, the operation seeds, the Glorot limits.
+    The comparisons with TensorFlow itself are in
+    test_initialization_tf.py.
 """
 
 import argparse
@@ -29,10 +32,6 @@ RELEASED_SHAPES = [(21, 4, 64)] + [(3, 64, 64)] * 8 + \
 RELEASED_BIAS_SIZES = [64] * 9 + [2, 1, 2, 1]
 
 
-# --------------------------------------------------------------------
-# without TensorFlow
-# --------------------------------------------------------------------
-
 def test_released_architecture_seed_1234_matches_the_tf241_record():
     kernels = initialization.initial_kernels(RELEASED_SHAPES, 1234)
     arrays = []
@@ -55,6 +54,27 @@ def test_operation_seeds_are_the_python_random_stream():
     stream = random.Random(99)
     assert initialization.operation_seeds(99, 5) == \
         [stream.randint(0, 2 ** 31 - 1) for _ in range(5)]
+    # the seed is used as given, also when it is negative or large
+    for seed in (-7, 2 ** 32 + 9, 2 ** 40):
+        stream = random.Random(seed)
+        assert initialization.operation_seeds(seed, 3) == \
+            [stream.randint(0, 2 ** 31 - 1) for _ in range(3)]
+    assert initialization.operation_seeds(2 ** 32 + 9, 3) != \
+        initialization.operation_seeds(9, 3)
+
+
+def test_operation_seeds_continue_from_a_state_of_the_stream():
+    stream = random.Random(1234)
+    first = [stream.randint(0, 2 ** 31 - 1) for _ in range(2)]
+    state = stream.getstate()
+    assert first == initialization.operation_seeds(1234, 2)
+    assert initialization.operation_seeds(1234, 2, state) == \
+        initialization.operation_seeds(1234, 4)[2:]
+    # the state decides, not the seed, and it is not consumed
+    assert initialization.operation_seeds(99, 2, state) == \
+        initialization.operation_seeds(1234, 4)[2:]
+    assert initialization.operation_seeds(1234, 2, state) == \
+        initialization.operation_seeds(1234, 4)[2:]
 
 
 def test_random_uniform_reference_values():
@@ -76,6 +96,41 @@ def test_random_uniform_reference_values():
         # a longer request extends the same stream
         assert np.array_equal(
             initialization.random_uniform(1000, seed, seed2)[:11], values)
+
+
+def test_random_uniform_from_a_position_in_the_stream():
+    # four values per counter value
+    whole = initialization.random_uniform(40, 1234, 5678)
+    for skip in (1, 2, 7):
+        assert np.array_equal(
+            initialization.random_uniform(9, 1234, 5678, skip=skip),
+            whole[4 * skip:4 * skip + 9])
+    assert initialization.random_uniform(3, 1234, 5678, skip=2).tolist() == \
+        [0.4489556550979614, 0.04433882236480713, 0.32650279998779297]
+    # far positions: values recorded from tf.raw_ops.RandomUniform
+    # under TensorFlow 2.4.1 (the last of 300,001 values, and values
+    # from counter value 70,000 on)
+    assert initialization.random_uniform(300001, 5, 6)[-3:].tolist() == \
+        [0.10677707195281982, 0.6713669300079346, 0.5270742177963257]
+    assert initialization.random_uniform(3, 5, 6, skip=70000).tolist() == \
+        [0.5379114151000977, 0.638777494430542, 0.6014165878295898]
+    # a position beyond 32 bits moves into the next counter word
+    far = initialization.random_uniform(8, 3, 4, skip=2 ** 32 - 1)
+    assert np.array_equal(
+        far[4:], initialization.random_uniform(4, 3, 4, skip=2 ** 32))
+    assert not np.array_equal(
+        far[4:], initialization.random_uniform(4, 3, 4, skip=0))
+
+
+def test_random_uniform_in_blocks(monkeypatch):
+    # long requests are generated in blocks; the result does not
+    # depend on the block size
+    expected = initialization.random_uniform(1003, 11, 12, skip=5)
+    for block in (1, 7, 250, 251):
+        monkeypatch.setattr(initialization, "_BLOCK", block)
+        assert np.array_equal(
+            initialization.random_uniform(1003, 11, 12, skip=5), expected)
+    assert len(initialization.random_uniform(0, 1, 2)) == 0
 
 
 def test_random_uniform_is_uniform_on_the_unit_interval():
@@ -126,6 +181,51 @@ def test_initial_kernels_of_a_seed_beyond_the_kernel_range():
         kernel, initialization.glorot_uniform((3, 4, 5), seed, op_seed))
 
 
+def test_repeated_operation_seed_continues_the_kernels_stream(monkeypatch):
+    """
+        TensorFlow keeps one random kernel per pair of seeds. When the
+        stream hands out an operation seed a second time, the layer
+        gets what follows the 256 counter values per weight that were
+        reserved for the first layer.
+    """
+
+    monkeypatch.setattr(initialization, "operation_seeds",
+                        lambda seed, n, state=None: [5, 9, 5, 5][:n])
+    shapes = [(3, 2, 4), (2, 2), (3, 2, 4), (5, 1)]
+    kernels = initialization.initial_kernels(shapes, 77)
+    assert np.array_equal(
+        kernels[0], initialization.glorot_uniform(shapes[0], 77, 5))
+    assert np.array_equal(
+        kernels[1], initialization.glorot_uniform(shapes[1], 77, 9))
+    assert np.array_equal(kernels[2], initialization.glorot_uniform(
+        shapes[2], 77, 5, skip=24 * 256))
+    assert np.array_equal(kernels[3], initialization.glorot_uniform(
+        shapes[3], 77, 5, skip=48 * 256))
+    assert not np.array_equal(kernels[2], kernels[0])
+
+
+def test_repeated_operation_seed_as_recorded_from_tensorflow_241():
+    # seed 33780 hands out the same operation seed to the layers 164
+    # and 191 of a model with 192 one-filter motif convolutions; the
+    # first weights of the two layers as TensorFlow 2.4.1 drew them
+    seeds = initialization.operation_seeds(33780, 192)
+    assert seeds[164] == seeds[191] == 269732680
+    assert len(set(seeds)) == 191
+    shapes = [(1, 4, 1)] + [(1, 1, 1)] * 191
+    kernels = initialization.initial_kernels(shapes, 33780)
+    assert float(kernels[164].ravel()[0]) == -1.5604612827301025
+    assert float(kernels[191].ravel()[0]) == -0.9455151557922363
+
+
+def test_initial_kernels_from_a_state_of_the_stream():
+    shapes = [(3, 4, 5), (5, 1), (2, 1)]
+    stream = random.Random(21)
+    stream.randint(0, 2 ** 31 - 1)
+    later = initialization.initial_kernels(shapes[1:], 21, stream.getstate())
+    whole = initialization.initial_kernels(shapes, 21)
+    assert all(np.array_equal(a, b) for a, b in zip(later, whole[1:]))
+
+
 def test_initial_kernels_depend_on_seed_and_position():
     shapes = [(3, 8, 8), (3, 8, 8), (8, 1)]
     a = initialization.initial_kernels(shapes, 1)
@@ -172,12 +272,14 @@ def test_weights_digest():
 class LayerStub(object):
     def __init__(self, weights):
         self.weights = weights
+        self.assigned = 0
 
     def get_weights(self):
         return self.weights
 
     def set_weights(self, weights):
-        raise AssertionError("nothing may be set")
+        self.weights = [np.array(w) for w in weights]
+        self.assigned += 1
 
 
 class ModelStub(object):
@@ -189,6 +291,35 @@ class ModelStub(object):
         return self.layers[name]
 
 
+def stub_model(dtype=np.float32, seed=0):
+    rng = np.random.RandomState(seed)
+    shapes = {"conv": (3, 4, 5), "dense": (5, 1), "mix": (2, 1)}
+    return ModelStub({name: LayerStub([
+        rng.normal(size=shape).astype(dtype),
+        rng.normal(size=shape[-1]).astype(dtype)])
+        for name, shape in shapes.items()})
+
+
+def stored_digest(model):
+    return hashlib.sha256(b"".join(
+        array.tobytes() for name in model.weight_layer_names
+        for array in model.get_layer(name).get_weights())).hexdigest()
+
+
+def test_set_initial_weights():
+    model = stub_model()
+    digest = initialization.set_initial_weights(model, 21)
+    kernels = initialization.initial_kernels([(3, 4, 5), (5, 1), (2, 1)], 21)
+    for name, kernel in zip(model.weight_layer_names, kernels):
+        stored, bias = model.get_layer(name).get_weights()
+        assert np.array_equal(stored, kernel) and stored.dtype == np.float32
+        assert not bias.any() and bias.dtype == np.float32
+    # the digest is of the weights the model now has
+    assert digest == stored_digest(model)
+    assert digest == initialization.current_weights_digest(model)
+    assert initialization.set_initial_weights(model, 22) != digest
+
+
 def test_unknown_weight_layout_is_rejected():
     kernel = np.zeros((2, 1), dtype=np.float32)
     bias = np.zeros(1, dtype=np.float32)
@@ -198,12 +329,102 @@ def test_unknown_weight_layout_is_rejected():
         with pytest.raises(ValueError, match="dense has {} weight".format(
                 len(weights))):
             initialization.set_initial_weights(model, 1)
+        assert model.get_layer("first").assigned == 0
 
 
 def test_model_without_a_record_of_its_layers_is_rejected():
     # a model that arch.BPNet did not build, a loaded one for example
     with pytest.raises(ValueError, match="no record of its layers"):
         initialization.set_initial_weights(ModelStub({}), 1)
+    with pytest.raises(ValueError, match="no record of its layers"):
+        initialization.initialize(ModelStub({}), 1, None)
+
+
+def test_only_float32_models_are_given_seeded_weights():
+    model = stub_model(dtype=np.float64)
+    before = stored_digest(model)
+    with pytest.raises(ValueError, match="dense|conv|mix"):
+        initialization.set_initial_weights(model, 1)
+    assert stored_digest(model) == before
+    # initialize leaves such a model as it was built
+    report = initialization.initialize(model, 1, None)
+    assert report == {"seed": 1, "sha256": before, "drawn_by": "tensorflow"}
+    assert stored_digest(model) == before
+
+
+def model_drawn_from(seed, state=None):
+    """
+        A stub model whose kernels are what TensorFlow 2.4 draws for
+        the seed from the given state of the operation seed stream
+    """
+
+    model = stub_model()
+    names = model.weight_layer_names
+    kernels = initialization.initial_kernels(
+        [model.get_layer(n).get_weights()[0].shape for n in names], seed,
+        state)
+    for name, kernel in zip(names, kernels):
+        model.get_layer(name).weights = [
+            kernel, np.zeros(kernel.shape[-1], dtype=np.float32)]
+    return model
+
+
+def test_initialize_leaves_weights_that_follow_the_seed():
+    # as under TensorFlow 2.4: fresh seed
+    model = model_drawn_from(21)
+    state = random.Random(21).getstate()
+    before = stored_digest(model)
+    assert initialization.follows_seed(model, 21, state)
+    report = initialization.initialize(model, 21, state)
+    assert report == {"seed": 21, "sha256": before, "drawn_by": "tensorflow"}
+    assert all(model.get_layer(n).assigned == 0
+               for n in model.weight_layer_names)
+
+    # and a stream that other random operations have used before: the
+    # weights are not those of a fresh seed, and are left alone
+    stream = random.Random(21)
+    for _ in range(3):
+        stream.randint(0, 2 ** 31 - 1)
+    state = stream.getstate()
+    model = model_drawn_from(21, state)
+    before = stored_digest(model)
+    assert before != stored_digest(model_drawn_from(21))
+    report = initialization.initialize(model, 21, state)
+    assert report == {"seed": 21, "sha256": before, "drawn_by": "tensorflow"}
+    assert stored_digest(model) == before
+
+
+def test_initialize_assigns_where_the_weights_ignore_the_seed():
+    # as under newer TensorFlow versions: weights from elsewhere
+    model = stub_model(seed=3)
+    state = random.Random(21).getstate()
+    assert not initialization.follows_seed(model, 21, state)
+    report = initialization.initialize(model, 21, state)
+    assert report == {"seed": 21, "drawn_by": "bpnet",
+                      "sha256": stored_digest(model_drawn_from(21))}
+    assert stored_digest(model) == report["sha256"]
+
+    # also when the stream had been used: the weights of a fresh seed
+    stream = random.Random(21)
+    stream.randint(0, 2 ** 31 - 1)
+    model = stub_model(seed=4)
+    report = initialization.initialize(model, 21, stream.getstate())
+    assert report["sha256"] == stored_digest(model_drawn_from(21))
+
+    # and when the state of the stream is not known
+    model = stub_model(seed=5)
+    report = initialization.initialize(model, 21, None)
+    assert report["drawn_by"] == "bpnet"
+    assert report["sha256"] == stored_digest(model_drawn_from(21))
+
+
+def test_initialize_without_a_global_seed_leaves_the_weights():
+    model = stub_model(seed=6)
+    before = stored_digest(model)
+    report = initialization.initialize(model, None, None)
+    assert report == {"seed": None, "sha256": before,
+                      "drawn_by": "tensorflow"}
+    assert stored_digest(model) == before
 
 
 def test_seed_option_values():
@@ -227,157 +448,3 @@ def test_seed_option_of_the_training_parser(capsys):
     assert "-1 is not between 0 and 4294967295" in capsys.readouterr().err
 
 
-# --------------------------------------------------------------------
-# with TensorFlow
-# --------------------------------------------------------------------
-
-tf = pytest.importorskip("tensorflow")
-
-from bpnet.model import arch
-
-from tests.model_helpers import (RELEASED_PARAMS, make_tasks,
-                                 randomize_weights, small_params)
-
-TF_VERSION = tuple(int(x) for x in tf.__version__.split(".")[:2])
-
-CONFIGURATIONS = {
-    "released": (RELEASED_PARAMS, {}, {}),
-    "no control": (small_params(), dict(n_bias=0), {}),
-    "unstranded": (small_params(), dict(n_signal=1, n_bias=1), {}),
-    "two motif convolutions": (small_params(
-        input_len=196, motif_module_params={
-            "filters": [5, 6], "kernel_sizes": [11, 21]}), {}, {}),
-    "hidden counts head": (small_params(counts_head_params={
-        "units": [8, 4, 1], "dropouts": [0.5, 0.0, 0.0],
-        "activations": ["relu", "leakyrelu", "linear"]}), {}, {}),
-    "original loss": (small_params(), {}, dict(orig_multi_loss=True)),
-    "two tasks": (small_params(
-        profile_bias_module_params={"kernel_sizes": [1, 1]}),
-        dict(n_tasks=2), {}),
-}
-
-
-def build(name):
-    params, task_options, model_options = CONFIGURATIONS[name]
-    return arch.BPNet(make_tasks(**task_options), copy.deepcopy(params),
-                      name_prefix="main", **model_options)
-
-
-@pytest.mark.parametrize("seed,seed2,n", [
-    (1234, 5678, 4096), (0, 1, 7), (2147483646, 3, 33), (17, 2147483646, 1),
-    (99, 0, 2050)])
-def test_random_uniform_equals_the_tensorflow_kernel(seed, seed2, n):
-    expected = tf.raw_ops.RandomUniform(
-        shape=[n], dtype=tf.float32, seed=seed, seed2=seed2).numpy()
-    assert np.array_equal(initialization.random_uniform(n, seed, seed2),
-                          expected)
-
-
-@pytest.mark.parametrize("seed,op_seed", [
-    (1234, 5), (0, 0), (2 ** 31 - 1, 5), (2 ** 31 - 1, 2 ** 31 - 1),
-    (2 ** 31 + 5, 2 ** 31 + 8), (7, 0), (0, 3)])
-def test_kernel_seeds_are_the_ones_tensorflow_derives(seed, op_seed):
-    from tensorflow.python.framework import random_seed
-
-    try:
-        tf.random.set_seed(seed)
-        assert tuple(random_seed.get_seed(op_seed)) == \
-            initialization.kernel_seeds(seed, op_seed)
-        # and through the public interface
-        drawn = tf.random.uniform([9], seed=op_seed).numpy()
-    finally:
-        tf.random.set_seed(initialization.DEFAULT_SEED)
-    assert np.array_equal(drawn, initialization.random_uniform(
-        9, *initialization.kernel_seeds(seed, op_seed)))
-
-
-@pytest.mark.parametrize("name", sorted(CONFIGURATIONS))
-def test_model_records_its_layers_with_weights(name):
-    model = build(name)
-    with_weights = {layer.name for layer in model.layers
-                    if layer.get_weights()}
-    assert set(model.weight_layer_names) == with_weights
-    assert len(model.weight_layer_names) == len(with_weights)
-    # a plain tuple: keras wraps the lists and tuples it tracks (and
-    # would save with the model) in other types
-    assert type(model.weight_layer_names) is tuple
-
-
-def test_released_model_layer_order():
-    model = build("released")
-    assert list(model.weight_layer_names) == \
-        ["main_conv_0"] + ["main_dil_conv_{}".format(i) for i in range(1, 9)] \
-        + ["main_profile_head", "main_counts_head", "profile_predictions",
-           "logcounts_predictions"]
-
-
-def test_set_initial_weights_on_the_released_model():
-    model = build("released")
-    # whatever the weights were before, biases included
-    randomize_weights(model, seed=3)
-    assert all(model.get_layer(name).get_weights()[1].any()
-               for name in model.weight_layer_names)
-    digest = initialization.set_initial_weights(model, 1234)
-    assert digest == RELEASED_SEED_1234_DIGEST
-    arrays = []
-    for name in model.weight_layer_names:
-        kernel, bias = model.get_layer(name).get_weights()
-        assert not bias.any()
-        arrays.extend([kernel, bias])
-    # the digest describes the weights the model now has
-    assert hashlib.sha256(b"".join(
-        a.tobytes() for a in arrays)).hexdigest() == digest
-    kernel = model.get_layer("logcounts_predictions").get_weights()[0]
-    assert kernel.ravel().tolist() == \
-        [-0.08632349967956543, 0.41392314434051514]
-    # the same seed again gives the same weights, another seed others
-    assert initialization.set_initial_weights(model, 1234) == digest
-    assert initialization.set_initial_weights(model, 1) != digest
-
-
-def test_models_built_one_after_the_other_get_the_same_weights():
-    first = build("no control")
-    build("hidden counts head")
-    second = build("no control")
-    assert initialization.set_initial_weights(first, 3) == \
-        initialization.set_initial_weights(second, 3)
-
-
-@pytest.mark.skipif(TF_VERSION >= (2, 5), reason="only TensorFlow 2.4 draws "
-                    "the initial weights from the global seed")
-@pytest.mark.parametrize("name", sorted(CONFIGURATIONS))
-@pytest.mark.parametrize("seed", [1234, 7, 2 ** 31 + 5])
-def test_equals_what_tensorflow_24_draws_itself(name, seed):
-    """
-        Under TensorFlow 2.4 the weights Keras draws after
-        tf.random.set_seed(seed) are the ones this module computes, for
-        every architecture: assigning them there changes nothing
-    """
-
-    try:
-        tf.random.set_seed(seed)
-        model = build(name)
-    finally:
-        # the seed the package sets when it is imported
-        tf.random.set_seed(initialization.DEFAULT_SEED)
-    native = {n: model.get_layer(n).get_weights()
-              for n in model.weight_layer_names}
-    initialization.set_initial_weights(model, seed)
-    for n in model.weight_layer_names:
-        kernel, bias = model.get_layer(n).get_weights()
-        assert np.array_equal(kernel, native[n][0]), n
-        assert np.array_equal(bias, native[n][1]), n
-
-
-def test_global_seed_is_what_tf_random_set_seed_was_given():
-    from bpnet.train import training
-
-    try:
-        tf.random.set_seed(4321)
-        assert training.global_seed() == 4321
-        # no global seed: the seed the package has always set
-        tf.random.set_seed(None)
-        assert training.global_seed() == 1234
-    finally:
-        tf.random.set_seed(initialization.DEFAULT_SEED)
-    assert training.global_seed() == 1234

@@ -3,6 +3,8 @@
     bpnet network architectures
 """
 
+import threading
+
 from numpy.random import seed
 seed(1234)
 from tensorflow.random import set_seed 
@@ -21,8 +23,9 @@ from bpnet.model import bpnetdefaults
 
 # names of the layers that have weights, in the order BPNet() creates
 # them; the seeded initial weights (bpnet.model.initialization) are
-# assigned in this order
-_weight_layer_names = []
+# assigned in this order. One list per thread, so that models built at
+# the same time in different threads do not record into each other's
+_build = threading.local()
 
 
 def _weighted(layer):
@@ -35,7 +38,9 @@ def _weighted(layer):
         Returns:
             the same layer
     """
-    _weight_layer_names.append(layer.name)
+    names = getattr(_build, 'weight_layer_names', None)
+    if names is not None:
+        names.append(layer.name)
     return layer
 
 
@@ -603,7 +608,7 @@ def BPNet(
     """
     
     # the layers with weights are recorded as they are created
-    del _weight_layer_names[:]
+    _build.weight_layer_names = []
 
     # load params, override defaults
     (input_len, 
@@ -761,6 +766,7 @@ def BPNet(
                         outputs=[profile_outputs, logcounts_outputs])
 
     # names of the layers with weights, in creation order
-    model.weight_layer_names = tuple(_weight_layer_names)
+    model.weight_layer_names = tuple(_build.weight_layer_names)
+    _build.weight_layer_names = None
 
     return model
