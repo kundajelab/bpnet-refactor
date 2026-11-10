@@ -74,6 +74,11 @@ def importance_hdf5_to_bigwig(hdf5_path: str,
     # regions may not be sorted, so get their sorted order
     order_of_regs = sorted(range(len(regions)), key=lambda x:(chr_to_idx[regions[x][0]], regions[x][1]))
 
+    # subset to chromosome (debugging)
+    if debug_chr:
+        order_of_regs = [x for x in order_of_regs
+                         if regions[x][0] == debug_chr]
+
     # regions may overlap but as we go in sorted order, for regions that overlap values are repeated used
     # from the nearest peak 
 
@@ -86,10 +91,6 @@ def importance_hdf5_to_bigwig(hdf5_path: str,
     iterator = range(len(order_of_regs))
     
     for itr in iterator:
-        # subset to chromosome (debugging)
-        if debug_chr and regions[i][0]!=debug_chr:
-            continue
-
         i = order_of_regs[itr]
         i_chr, i_start, i_end, i_mid = regions[i]
 
