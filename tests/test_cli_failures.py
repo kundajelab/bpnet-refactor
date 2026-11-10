@@ -4,6 +4,7 @@
 """
 
 import json
+import multiprocessing
 import os
 import signal
 import subprocess
@@ -345,15 +346,23 @@ def test_failed_step_ends_bpnet_train_and_its_workers(synth_dataset,
 
 
 @needs_proc
-def test_interrupt_of_bpnet_train_alone_ends_its_processes(synth_dataset,
-                                                           tmp_path):
+@pytest.mark.parametrize("to", ["bpnet-train alone", "its process group"])
+def test_interrupt_of_bpnet_train_ends_its_processes(synth_dataset, tmp_path,
+                                                     to):
     """
         An interrupt that reaches only the process that waits for the
-        training process (not the whole group, as from a keyboard):
-        the training process is asked to end, stops its batch workers
-        and ends. (bpnet-train used to wait until the training was
-        over.)
+        training process is passed on: the training process stops its
+        batch workers and ends. (bpnet-train used to wait until the
+        training was over.) An interrupt from a keyboard reaches all
+        processes of the tool; the one that is passed on then comes
+        on top, and does not disturb the cleanup.
     """
+
+    def interrupt(process):
+        if to == "bpnet-train alone":
+            os.kill(process.pid, signal.SIGINT)
+        else:
+            os.killpg(process.pid, signal.SIGINT)
 
     model_dir = tmp_path / "model"
     model_dir.mkdir()
@@ -361,8 +370,7 @@ def test_interrupt_of_bpnet_train_alone_ends_its_processes(synth_dataset,
         TRAIN_AND_FAIL, train_args(synth_dataset, model_dir,
                                    **{"--batch-size": 1}),
         str(tmp_path), {"WORKERS_OF": "train", "FAIL_IN": "never"},
-        two_workers_have_work_left,
-        then=lambda process: os.kill(process.pid, signal.SIGINT))
+        two_workers_have_work_left, then=interrupt)
     assert code != 0, output[-3000:]
     # the interrupt of bpnet-train and the one it passed on to the
     # training process
@@ -399,4 +407,56 @@ def test_failure_in_bpnet_predict_ends_its_workers(synth_dataset, tmp_path):
     print("ended {:.1f} s after the prediction failed".format(seconds))
     assert seconds < PROMPT
     assert left == []
+
+
+# --------------------------------------------------------------------
+# what bpnet-train does with its training process when it is
+# interrupted, on stand-ins for that process
+# --------------------------------------------------------------------
+
+def stand_in(kind, ready):
+    if kind in ("ignores the interrupt", "ignores everything"):
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+    if kind == "ignores everything":
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    ready.set()
+    if kind == "is ending":
+        time.sleep(0.2)
+        os._exit(3)
+    try:
+        time.sleep(600)
+    except KeyboardInterrupt:
+        # what a training process does: clean up, then fail
+        os._exit(5)
+
+
+@pytest.mark.parametrize("kind,exit_code,at_least,at_most", [
+    # it had the interrupt too and is on its way out: nothing is sent
+    ("is ending", 3, 0.0, 0.5),
+    # it ends when the interrupt is passed on
+    ("takes the interrupt", 5, 0.5, 1.4),
+    # it is terminated, then killed
+    ("ignores the interrupt", -signal.SIGTERM, 1.5, 2.4),
+    ("ignores everything", -signal.SIGKILL, 2.5, 4.0)])
+def test_training_process_is_ended_step_by_step(monkeypatch, kind, exit_code,
+                                                at_least, at_most):
+    from bpnet.train import training
+
+    monkeypatch.setattr(training, "TRAINER_NOTICE_SECONDS", 0.5)
+    monkeypatch.setattr(training, "TRAINER_STOP_SECONDS", 1.0)
+    ready = multiprocessing.Event()
+    process = multiprocessing.Process(target=stand_in, args=(kind, ready))
+    process.start()
+    try:
+        assert ready.wait(60)
+        start = time.time()
+        training.end_training_process(process)
+        seconds = time.time() - start
+        assert not process.is_alive()
+        assert process.exitcode == exit_code
+        assert at_least <= seconds < at_most
+    finally:
+        if process.is_alive():
+            process.kill()
+        process.join()
 

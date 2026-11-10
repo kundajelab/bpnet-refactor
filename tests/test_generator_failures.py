@@ -56,23 +56,31 @@ class Worker(generators.MBPNetSequenceGenerator):
     how = "exception"
     #: whether the workers ignore the request to end (SIGTERM)
     stubborn = False
+    #: a multiprocessing.Value in which the stubborn workers count
+    #: themselves once they ignore the request
+    ready = None
     #: seconds a worker goes on after it has handed over its last batch
     lingers = 0.0
     #: number of batches after which a worker waits until it is ended
     #: (None: it does not)
     parks_after = None
     #: seconds a thread that collects the batches of a worker goes on
-    #: after its last batch
+    #: after its last batch, and seconds it waits before its first
     threads_linger = 0.0
+    threads_wait = 0.0
 
     def _proc_target(self, coords_df, mpq, proc_idx):
         self._worker = proc_idx
         if self.stubborn:
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            if self.ready is not None:
+                with self.ready.get_lock():
+                    self.ready.value += 1
         super(Worker, self)._proc_target(coords_df, mpq, proc_idx)
         time.sleep(self.lingers)
 
     def _stealer(self, *args):
+        time.sleep(self.threads_wait)
         super(Worker, self)._stealer(*args)
         time.sleep(self.threads_linger)
 
@@ -82,6 +90,9 @@ class Worker(generators.MBPNetSequenceGenerator):
         worker = getattr(self, "_worker", None)
         if worker is not None and worker == self.failing and \
                 self._made == self.fail_at:
+            if self.ready is not None:
+                # not before every worker ignores the request to end
+                wait_until(lambda: self.ready.value >= 2)
             if self.how == "exception":
                 raise ValueError("no values for this batch")
             if self.how == "exit":
@@ -93,6 +104,13 @@ class Worker(generators.MBPNetSequenceGenerator):
         if self.parks_after is not None and self._made > self.parks_after:
             threading.Event().wait()
         return super(Worker, self)._generate_batch(coords)
+
+
+def wait_until(condition, seconds=TIME_LIMIT / 2.0):
+    deadline = time.time() + seconds
+    while not condition() and time.time() < deadline:
+        time.sleep(0.02)
+    return condition()
 
 
 def make_generator(dataset, mode="val", **kwargs):
@@ -355,14 +373,18 @@ def test_other_workers_are_stopped_when_one_fails(synth_dataset,
 
 def test_worker_that_does_not_end_when_asked_is_killed(synth_dataset,
                                                        monkeypatch):
-    monkeypatch.setattr(generators, "WORKER_STOP_SECONDS", 1.0)
+    monkeypatch.setattr(generators, "WORKER_STOP_SECONDS", 2.0)
     generator = slow_generator(synth_dataset, slow=[1])
     generator.failing = 0
     generator.stubborn = True
+    generator.ready = multiprocessing.Value("i", 0)
     kind, message, seconds, left = outcome(generator)
     assert kind == "failed", message
-    assert 1.0 <= seconds < PROMPT
-    assert left == NOTHING
+    # both workers ignore the request (the one that failed is still
+    # on its way out) and are killed after one wait, not after one
+    # wait each
+    assert 2.0 <= seconds < 3.5
+    assert left[:2] == (0, 0)
 
 
 # --------------------------------------------------------------------
@@ -551,13 +573,6 @@ def parked_generator(dataset, batches=1):
     return generator
 
 
-def wait_until(condition, seconds=TIME_LIMIT / 2.0):
-    deadline = time.time() + seconds
-    while not condition() and time.time() < deadline:
-        time.sleep(0.02)
-    return condition()
-
-
 def stopped_while_the_consumer_waits(generator, queue):
     before = Before()
     taken, errors = [], []
@@ -611,13 +626,15 @@ def stopped_while_the_consumer_is_elsewhere(generator, queue):
     before = Before()
     batches = generator.gen()
     next(batches)
+    if generator.ready is not None:
+        wait_until(lambda: generator.ready.value >= 2)
     during = leftovers(before)
     start = time.time()
     generator.stop()
+    seconds = time.time() - start
     # again, and for every generator: nothing left to do
     generator.stop()
     generators.stop_all()
-    seconds = time.time() - start
     # without the consumer having taken another batch
     after = leftovers(before)
     rest = list(batches)
@@ -643,9 +660,11 @@ def test_stop_does_not_need_the_consumer(synth_dataset, monkeypatch,
     """
 
     monkeypatch.setattr(generators, "WORKER_STOP_SECONDS",
-                        1.0 if workers == "stubborn" else 2.0 * SLOW_EPOCH)
+                        2.0 if workers == "stubborn" else 2.0 * SLOW_EPOCH)
     generator = parked_generator(synth_dataset)
-    generator.stubborn = workers == "stubborn"
+    if workers == "stubborn":
+        generator.stubborn = True
+        generator.ready = multiprocessing.Value("i", 0)
     if workers == "slow threads":
         generator.threads_linger = 1.5
     result = outcome(generator, stopped_while_the_consumer_is_elsewhere)
@@ -654,10 +673,16 @@ def test_stop_does_not_need_the_consumer(synth_dataset, monkeypatch,
     assert during[:2] == (2, 2)
     assert after[:2] == (0, 0)
     assert seconds < PROMPT
-    if workers != "ordinary":
-        assert seconds >= 1.0
+    if workers == "stubborn":
+        # one wait for both workers, then they are killed
+        assert 2.0 <= seconds < 3.5
+    if workers == "slow threads":
+        assert seconds >= 1.5
     # the batches end without an error, and nothing is left
-    assert rest == 0 and done == NOTHING
+    assert rest == 0 and done[:2] == (0, 0)
+    if workers != "stubborn":
+        # (the counter of the stubborn workers holds a descriptor)
+        assert done == NOTHING
     assert again == generator.len() and epoch == 1 and under_way == 0
 
 
@@ -756,6 +781,93 @@ def test_failure_to_start_a_worker_ends_those_that_were_started(
                       NOTHING, 0, 0), result
 
 
+def stopped_while_the_last_workers_are_waited_for(generator, queue):
+    before = Before()
+    taken, errors = [], []
+
+    def consumer():
+        try:
+            for batch in generator.gen():
+                taken.append(batch)
+        except BaseException as error:
+            errors.append(repr(error))
+
+    thread = threading.Thread(target=consumer)
+    thread.start()
+    # every batch was taken; the generator waits for its workers,
+    # which are slow to end
+    wait_until(lambda: len(taken) == generator.len())
+    time.sleep(0.5)
+    during = leftovers(before)
+    start = time.time()
+    generator.stop()
+    seconds = time.time() - start
+    thread.join(PROMPT)
+    queue.put((len(taken), errors, thread.is_alive(), during[:2], seconds,
+               leftovers(before), generator.curr_epoch,
+               len(generators._EPOCHS)))
+
+
+def test_stop_reaches_an_epoch_that_waits_for_its_workers(synth_dataset,
+                                                          monkeypatch):
+    """
+        All batches of an epoch were taken, and its workers do not
+        end (here they linger for a minute). The epoch is still under
+        way and can be stopped, from another thread; the wait for the
+        workers does not shut the stop out.
+    """
+
+    monkeypatch.setattr(generators, "WORKER_STOP_SECONDS", 2.0 * SLOW_EPOCH)
+    generator = make_generator(synth_dataset)
+    generator.lingers = float(SLOW_EPOCH)
+    result = outcome(generator, stopped_while_the_last_workers_are_waited_for)
+    assert len(result) == 8, result
+    taken, errors, alive, during, seconds, after, epoch, under_way = result
+    assert taken == generator.len() and errors == [] and not alive
+    # two workers, their threads have ended, the consumer's has not
+    assert during == (2, 1)
+    assert seconds < PROMPT
+    assert after == NOTHING
+    # the epoch was complete
+    assert epoch == 1 and under_way == 0
+
+
+def epoch_with_another_start_method(generator, queue):
+    multiprocessing.set_start_method(generator.start_method, force=True)
+    taken = sum(1 for _ in generator.gen())
+    # an epoch that is stopped
+    generator.delay = SLOW_EPOCH
+    batches = generator.gen()
+    next(batches)
+    start = time.time()
+    generator.stop()
+    seconds = time.time() - start
+    rest = sum(1 for _ in batches)
+    queue.put((taken, generator.curr_epoch, seconds, rest,
+               len(multiprocessing.active_children()),
+               len(generators._EPOCHS)))
+
+
+@pytest.mark.parametrize("method", ["forkserver", "spawn"])
+def test_workers_that_are_not_forked(synth_dataset, monkeypatch, method):
+    """
+        With the other ways to start a process the worker gets a copy
+        of the generator instead of sharing it, and with "forkserver"
+        its parent is not the process that takes its batches. An epoch
+        delivers all its batches, and can be stopped.
+    """
+
+    monkeypatch.setattr(generators, "WORKER_STOP_SECONDS", 2.0 * SLOW_EPOCH)
+    generator = make_generator(synth_dataset)
+    generator.start_method = method
+    result = outcome(generator, epoch_with_another_start_method)
+    assert len(result) == 6, result
+    taken, epoch, seconds, rest, workers, under_way = result
+    assert taken == generator.len() and epoch == 1
+    assert seconds < PROMPT and rest == 0
+    assert workers == 0 and under_way == 0
+
+
 def stop_in_a_forked_process(generator, queue):
     before = Before()
     batches = generator.gen()
@@ -838,6 +950,104 @@ def test_workers_end_when_their_consumer_is_gone(synth_dataset):
         except OSError:
             pass
         consumer.join()
+
+
+def holds_an_epoch_whose_workers_are_done(generator, queue):
+    os.setsid()
+    batches = generator.gen()
+    # the epoch starts; nothing collects the batches for a long time
+    threading.Thread(target=next, args=(batches,), daemon=True).start()
+    # the workers make their batches at once; then they wait for them
+    # to be collected
+    time.sleep(2.0)
+    queue.put([child.pid for child in multiprocessing.active_children()])
+    time.sleep(TIME_LIMIT)
+
+
+@pytest.mark.skipif(not os.path.isdir("/proc/self"),
+                    reason="needs /proc to look at other processes")
+def test_workers_with_batches_to_hand_over_end_when_their_consumer_is_gone(
+        synth_dataset):
+    """
+        The workers have made all their batches and wait for them to
+        be taken. Their consumer is killed. They end instead of
+        waiting forever: a worker holds no reading end of its own
+        queue, so that writing to it fails once the consumer is gone.
+    """
+
+    generator = make_generator(synth_dataset, batch_size=1)
+    assert generator.len() // 2 >= 20
+    generator.threads_wait = float(TIME_LIMIT)
+    queue = multiprocessing.Queue()
+    consumer = multiprocessing.Process(
+        target=holds_an_epoch_whose_workers_are_done, args=(generator, queue))
+    consumer.start()
+    try:
+        workers = queue.get(timeout=TIME_LIMIT)
+        assert len(workers) == 2
+        assert not any(ended(pid) for pid in workers)
+        os.kill(consumer.pid, signal.SIGKILL)
+        consumer.join()
+        assert wait_until(lambda: all(ended(pid) for pid in workers), 5.0)
+    finally:
+        try:
+            os.killpg(consumer.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        consumer.join()
+
+
+def test_handle_on_the_reading_end_of_a_workers_queue():
+    queue = multiprocessing.Queue()
+    assert generators.close_reading_end(queue) is True
+    assert queue._reader.closed and not queue._writer.closed
+
+    class WithoutHandle(object):
+        pass
+
+    assert generators.close_reading_end(WithoutHandle()) is False
+
+
+def interrupted_while_stopping(generator, queue):
+    stopped = []
+
+    def slow_stop():
+        # a second interrupt arrives while the batch generation is
+        # being stopped
+        os.kill(os.getpid(), signal.SIGINT)
+        time.sleep(0.5)
+        stopped.append("stopped")
+
+    generators.stop_all = slow_stop
+    try:
+        generators.stop_after_failure()
+        outcome = "returned"
+    except KeyboardInterrupt:
+        outcome = "interrupted"
+
+    def failing_stop():
+        raise OSError("cannot stop")
+
+    generators.stop_all = failing_stop
+    try:
+        generators.stop_after_failure()
+        second = "returned"
+    except OSError:
+        second = "raised"
+    queue.put((outcome, stopped, second,
+               signal.getsignal(signal.SIGINT) is signal.SIG_IGN))
+
+
+def test_cleanup_after_a_failure_is_not_interrupted(synth_dataset):
+    """
+        What the command line tools call when they fail: an interrupt
+        that arrives during the cleanup does not end it, and an error
+        of the cleanup is not raised (the failure of the tool is the
+        one to report)
+    """
+
+    result = outcome(make_generator(synth_dataset), interrupted_while_stopping)
+    assert result == ("returned", ["stopped"], "returned", True), result
 
 
 def test_window_beyond_the_chromosome_of_a_bigwig(tmp_path):

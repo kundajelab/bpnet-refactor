@@ -920,10 +920,7 @@ def predict_main():
     except BaseException:
         # the workers of the batch generator would go on making 
         # batches that nobody takes, and keep this process from ending
-        try:
-            generators.stop_all()
-        except Exception:
-            logging.exception("Could not stop the batch generation")
+        generators.stop_after_failure()
         raise
     
 if __name__ == '__main__':

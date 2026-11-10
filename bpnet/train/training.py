@@ -686,11 +686,7 @@ def train_and_validate_or_stop(*args):
     try:
         train_and_validate(*args)
     except BaseException:
-        try:
-            generators.stop_all()
-        except Exception:
-            # the failure of the training is the one to report
-            logging.exception("Could not stop the batch generation")
+        generators.stop_after_failure()
         raise
 
 
