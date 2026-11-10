@@ -228,15 +228,31 @@ def test_importance_bigwig(tmp_path, gzipped):
     check_file(out, HEADER, regions, list(projected), stats)
 
 
-@pytest.mark.xfail(strict=True, reason="the debug_chr filter looks at a "
-                   "region picked by a leftover loop variable instead of "
-                   "the current region")
-def test_importance_bigwig_debug_chromosome(tmp_path):
+def test_importance_bigwig_without_regions_is_an_error(tmp_path):
+    # no region on the requested chromosome: a clear error before any
+    # output file is created
+    h5_path, bed_path, sizes_path, _, _ = make_scores(
+        tmp_path, [l for l in LOCI if l[0] != "chr10"])
+    out, stats = tmp_path / "scores.bw", tmp_path / "stats.txt"
+    with pytest.raises(ValueError, match="No regions to write on "
+                       "chromosome chr10"):
+        importance_hdf5_to_bigwig(h5_path, bed_path, str(out), str(stats),
+                                  sizes_path, debug_chr="chr10")
+    assert not out.exists() and not stats.exists()
+
+
+@pytest.mark.parametrize("debug_chr", ["chr1", "chr2", "chr10"])
+def test_importance_bigwig_debug_chromosome(tmp_path, debug_chr):
+    """
+        debug_chr restricts the output to the regions of one chromosome
+    """
+
     h5_path, bed_path, sizes_path, regions, projected = make_scores(
         tmp_path, LOCI)
     out, stats = str(tmp_path / "scores.bw"), str(tmp_path / "stats.txt")
     importance_hdf5_to_bigwig(h5_path, bed_path, out, stats, sizes_path,
-                              debug_chr="chr1")
-    keep = [i for i, r in enumerate(regions) if r[0] == "chr1"]
+                              debug_chr=debug_chr)
+    keep = [i for i, r in enumerate(regions) if r[0] == debug_chr]
+    assert 0 < len(keep) < len(regions)
     check_file(out, HEADER, [regions[i] for i in keep],
                [projected[i] for i in keep], stats)
