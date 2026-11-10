@@ -4,15 +4,35 @@ import pyBigWig
 import numpy as np
 from tqdm import tqdm
 
-#: whether the positions of a region are written as a run (a fixedStep 
-#: section: one value per position) or, as they always were, as an 
-#: entry per position with its own start and end. pyBigWig before 
-#: 0.3.29 records the end of a run six positions too far, in the 
-#: section and in the index of the file; the values that are read 
-#: back are right, but the file is not, so with those versions 
-#: nothing changes.
-RUNS = tuple(int(part) for part in re.findall(
-    r'\d+', pyBigWig.__version__)[:3]) >= (0, 3, 29)
+def writes_exact_runs(version):
+    """
+        Whether a pyBigWig of this version records the end of a run 
+        of positions (a fixedStep section) where the run ends
+        
+        Versions before 0.3.29 record it six positions too far, in 
+        the section and in the index of the file. The values that 
+        are read back are right, but the file is not.
+        
+        Args:
+            version (str): pyBigWig.__version__
+            
+        Returns:
+            bool: True for the releases 0.3.29 and later (and their 
+                post releases); False for earlier ones and for 
+                anything that is not a release (development 
+                versions, release candidates, other strings)
+    """
+    
+    release = re.match(r'^(\d+)\.(\d+)\.(\d+)(\.post\d+)?$', str(version))
+    return release is not None and tuple(
+        int(part) for part in release.groups()[:3]) >= (0, 3, 29)
+
+
+#: whether the positions of a region are written as a run (one value 
+#: per position) or, as they always were, as an entry per position 
+#: with its own start and end. With a pyBigWig that does not record 
+#: the end of a run correctly, nothing changes.
+RUNS = writes_exact_runs(pyBigWig.__version__)
 
 
 def region_segments(regions, order):
@@ -88,9 +108,11 @@ def as_float32(values):
         direct conversion treats differently: integers beyond 2**53 
         and long doubles are rounded twice, and a signalling NaN 
         becomes a quiet one. Values beyond the range of float32 
-        become infinite. Anything that is not a plain array of 
-        numbers (a masked array, a list, an array of objects) is 
-        converted value by value with float(), as it always was.
+        become infinite. Anything that is not a plain row of 
+        numbers (a masked array or another subclass of an array, a 
+        list, an array of objects, an array with a second dimension) 
+        is converted value by value with float(), as it always was; 
+        what float() refuses is refused.
         
         Args:
             values (numpy.ndarray): the values of a run of positions
@@ -100,12 +122,11 @@ def as_float32(values):
     """
     
     with np.errstate(over='ignore', invalid='ignore'):
-        if isinstance(values, np.ma.MaskedArray) or \
-                not isinstance(values, np.ndarray) or \
-                values.dtype.kind not in 'biuf':
-            doubles = np.array([float(x) for x in values], dtype=np.float64)
-        else:
+        if type(values) is np.ndarray and values.ndim == 1 and \
+                values.dtype.kind in 'biuf':
             doubles = values.astype(np.float64)
+        else:
+            doubles = np.array([float(x) for x in values], dtype=np.float64)
         return doubles.astype(np.float32)
 
 
@@ -136,9 +157,8 @@ def add_run(bw, chrom, start, end, values):
     
     start, end = int(start), int(end)
     
-    # what pyBigWig refuses when it is given every position (a run 
-    # has no ends to compare with, and a negative start is taken for 
-    # a very large one)
+    # a run has no ends that pyBigWig could compare with the number 
+    # of values, and a negative start is taken for a very large one
     if start < 0 or end < start or len(values) != end - start:
         raise RuntimeError(
             "Cannot write {} values to {}:{}-{} of the bigWig file".format(

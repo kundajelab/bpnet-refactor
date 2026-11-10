@@ -362,6 +362,26 @@ def special_values():
     return header, regions, data
 
 
+class Sevens(np.float64):
+    def __float__(self):
+        return 7.0
+
+
+class SpecialRow(np.ndarray):
+    """
+        An array whose values say something else about themselves
+        when they are asked one by one, as the writer always asked
+    """
+
+    def __getitem__(self, index):
+        value = super(SpecialRow, self).__getitem__(index)
+        return Sevens(value) if np.isscalar(value) else value
+
+
+def special_row():
+    return np.array([1.0, 2.0, 3.0, 4.0]).view(SpecialRow)
+
+
 def other_types():
     """
         Rows that are not float32 or float64 arrays. The values go
@@ -383,6 +403,12 @@ def other_types():
         np.array([0x7f800001, 0xffc00123, 0x3f800000, 0x00000001],
                  dtype=np.uint32).view(np.float32),
         np.array([0.1, 1e-7, 65504.0, -0.0], dtype=np.float16),
+        # unsigned values that a signed type of the same size cannot hold
+        np.array([65535, 40000, 32768, 1], dtype=np.uint16),
+        # beyond the range of a double
+        np.array([np.longdouble("1e400"), -np.longdouble("1e400"),
+                  np.longdouble("1e-400"), np.longdouble("nan")]),
+        special_row(),
     ]
     regions = [("chr1", 20 * i, 20 * i + 4, 20 * i + 2)
                for i in range(len(rows))]
@@ -405,6 +431,11 @@ CASES = {
                      ("chr1", 320, 380, 350), ("chr10", 0, 40, 20)], 6)),
     "special values": special_values,
     "rows of other types": other_types,
+    # one value per position, in a second dimension of length one
+    "rows with a second dimension": lambda: (
+        HEADER, [("chr1", 100, 120, 110), ("chr2", 40, 60, 50)],
+        [row.reshape(20, 1) for row in region_data(
+            [("chr1", 100, 120, 110), ("chr2", 40, 60, 50)], 9)]),
     # the part of a region before the start of its chromosome is left
     # out
     "region before the chromosome start": lambda: (
@@ -472,7 +503,8 @@ def test_layout_of_the_file_follows_the_pybigwig_version(tmp_path):
 
     version = tuple(int(part) for part in re.findall(
         r"\d+", pyBigWig.__version__)[:3])
-    assert bigwig_helper.RUNS == (version >= (0, 3, 29))
+    assert bigwig_helper.RUNS == bigwig_helper.writes_exact_runs(
+        pyBigWig.__version__) == (version >= (0, 3, 29))
 
     header, regions, data = like_predictions(3)
     paths = write_both(tmp_path, header, regions, data)
@@ -516,6 +548,14 @@ def test_special_values_are_stored_as_float32(tmp_path, monkeypatch):
 @pytest.mark.filterwarnings("ignore:Warning. converting a masked element")
 def test_values_go_through_a_double():
     as_float32 = bigwig_helper.as_float32
+    # value by value where the values are not a plain row of numbers
+    assert as_float32(special_row()).tolist() == [7.0] * 4
+    assert as_float32(np.array([[1.5], [2.5]])).tolist() == [1.5, 2.5]
+    with pytest.raises(TypeError):
+        as_float32(np.arange(6.0).reshape(3, 2))
+    assert as_float32(np.array([65535, 40000], dtype=np.uint16)).tolist() \
+        == [65535.0, 40000.0]
+    assert np.isinf(as_float32(np.array([np.longdouble("1e400")]))).all()
     # rounded twice: to the nearest double, then to the nearest float32
     big = np.array([2 ** 62 + 2 ** 38 + 1], dtype=np.int64)
     assert as_float32(big).tobytes() != big.astype(np.float32).tobytes()
@@ -592,6 +632,33 @@ def test_pybigwig_without_numpy_writes_the_same_file(tmp_path, monkeypatch):
     write_bigwig(data, regions, header, with_lists, str(tmp_path / "l.txt"))
     monkeypatch.undo()
     assert same_bytes(with_arrays, with_lists)
+
+
+@pytest.mark.parametrize("runs", [True, False])
+def test_row_with_several_values_per_position_is_refused(tmp_path,
+                                                         monkeypatch, runs):
+    """
+        Three positions with two values each. (Handed to pyBigWig as
+        an array, the six values would go to six positions.)
+    """
+
+    monkeypatch.setattr(bigwig_helper, "RUNS", runs)
+    regions, data = [("chr1", 10, 13, 11)], [np.arange(6.0).reshape(3, 2)]
+    for write in (write_bigwig_v0, write_bigwig):
+        with pytest.raises(TypeError):
+            write(data, regions, HEADER, str(tmp_path / "x.bw"),
+                  str(tmp_path / "x.txt"))
+
+
+@pytest.mark.parametrize("version,runs", [
+    ("0.3.22", False), ("0.3.26", False), ("0.3.28", False),
+    ("0.3.29", True), ("0.3.30", True), ("0.4.0", True), ("1.0.0", True),
+    ("0.3.29.post1", True),
+    # not a release: stay with what is known to be right
+    ("0.3.29.dev0", False), ("0.3.29rc1", False), ("0.3.30a1", False),
+    ("0.3", False), ("unknown", False), ("", False)])
+def test_versions_that_write_runs(version, runs):
+    assert bigwig_helper.writes_exact_runs(version) is runs
 
 
 @pytest.mark.parametrize("regions,data,error", [
