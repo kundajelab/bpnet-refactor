@@ -373,7 +373,7 @@ def test_other_workers_are_stopped_when_one_fails(synth_dataset,
 
 def test_worker_that_does_not_end_when_asked_is_killed(synth_dataset,
                                                        monkeypatch):
-    monkeypatch.setattr(generators, "WORKER_STOP_SECONDS", 2.0)
+    monkeypatch.setattr(generators, "WORKER_STOP_SECONDS", 4.0)
     generator = slow_generator(synth_dataset, slow=[1])
     generator.failing = 0
     generator.stubborn = True
@@ -383,7 +383,7 @@ def test_worker_that_does_not_end_when_asked_is_killed(synth_dataset,
     # both workers ignore the request (the one that failed is still
     # on its way out) and are killed after one wait, not after one
     # wait each
-    assert 2.0 <= seconds < 3.5
+    assert 4.0 <= seconds < 7.0
     assert left[:2] == (0, 0)
 
 
@@ -629,9 +629,9 @@ def stopped_while_the_consumer_is_elsewhere(generator, queue):
     if generator.ready is not None:
         wait_until(lambda: generator.ready.value >= 2)
     during = leftovers(before)
-    start = time.time()
+    start = time.monotonic()
     generator.stop()
-    seconds = time.time() - start
+    seconds = time.monotonic() - start
     # again, and for every generator: nothing left to do
     generator.stop()
     generators.stop_all()
@@ -647,7 +647,25 @@ def stopped_while_the_consumer_is_elsewhere(generator, queue):
                generator.curr_epoch, len(generators._EPOCHS)))
 
 
+def stopped_while_the_clock_jumps(generator, queue):
+    # the clock of the day moves an hour every time it is read; the
+    # waits of a stop are not measured with it
+    real = time.time
+    jumps = []
+
+    def jumping():
+        jumps.append(1)
+        return real() + 3600.0 * len(jumps)
+
+    generators.time.time = jumping
+    try:
+        stopped_while_the_consumer_is_elsewhere(generator, queue)
+    finally:
+        generators.time.time = real
+
+
 @pytest.mark.parametrize("workers", ["ordinary", "stubborn",
+                                     "stubborn, clock jumps",
                                      "slow threads"])
 def test_stop_does_not_need_the_consumer(synth_dataset, monkeypatch,
                                          workers):
@@ -659,28 +677,32 @@ def test_stop_does_not_need_the_consumer(synth_dataset, monkeypatch,
         generator is.
     """
 
+    stubborn = workers.startswith("stubborn")
     monkeypatch.setattr(generators, "WORKER_STOP_SECONDS",
-                        2.0 if workers == "stubborn" else 2.0 * SLOW_EPOCH)
+                        4.0 if stubborn else 2.0 * SLOW_EPOCH)
     generator = parked_generator(synth_dataset)
-    if workers == "stubborn":
+    if stubborn:
         generator.stubborn = True
         generator.ready = multiprocessing.Value("i", 0)
     if workers == "slow threads":
         generator.threads_linger = 1.5
-    result = outcome(generator, stopped_while_the_consumer_is_elsewhere)
+    result = outcome(generator, stopped_while_the_clock_jumps
+                     if workers.endswith("clock jumps")
+                     else stopped_while_the_consumer_is_elsewhere)
     assert len(result) == 8, result
     during, seconds, after, rest, done, again, epoch, under_way = result
     assert during[:2] == (2, 2)
     assert after[:2] == (0, 0)
     assert seconds < PROMPT
-    if workers == "stubborn":
-        # one wait for both workers, then they are killed
-        assert 2.0 <= seconds < 3.5
+    if stubborn:
+        # one wait for both workers (not one each), then they are
+        # killed
+        assert 4.0 <= seconds < 7.0
     if workers == "slow threads":
         assert seconds >= 1.5
     # the batches end without an error, and nothing is left
     assert rest == 0 and done[:2] == (0, 0)
-    if workers != "stubborn":
+    if not stubborn:
         # (the counter of the stubborn workers holds a descriptor)
         assert done == NOTHING
     assert again == generator.len() and epoch == 1 and under_way == 0
@@ -1009,14 +1031,16 @@ def test_handle_on_the_reading_end_of_a_workers_queue():
 
 
 def interrupted_while_stopping(generator, queue):
-    stopped = []
+    before = signal.getsignal(signal.SIGINT)
+    seen = []
 
     def slow_stop():
         # a second interrupt arrives while the batch generation is
         # being stopped
+        seen.append(signal.getsignal(signal.SIGINT) is signal.SIG_IGN)
         os.kill(os.getpid(), signal.SIGINT)
         time.sleep(0.5)
-        stopped.append("stopped")
+        seen.append("stopped")
 
     generators.stop_all = slow_stop
     try:
@@ -1024,6 +1048,7 @@ def interrupted_while_stopping(generator, queue):
         outcome = "returned"
     except KeyboardInterrupt:
         outcome = "interrupted"
+    restored = signal.getsignal(signal.SIGINT) is before
 
     def failing_stop():
         raise OSError("cannot stop")
@@ -1034,20 +1059,70 @@ def interrupted_while_stopping(generator, queue):
         second = "returned"
     except OSError:
         second = "raised"
-    queue.put((outcome, stopped, second,
-               signal.getsignal(signal.SIGINT) is signal.SIG_IGN))
+
+    # on another thread the handling of signals cannot be changed;
+    # the cleanup runs all the same
+    elsewhere = []
+    generators.stop_all = lambda: elsewhere.append("stopped")
+
+    def on_a_thread():
+        try:
+            generators.stop_after_failure()
+        except BaseException as error:
+            elsewhere.append(repr(error))
+
+    thread = threading.Thread(target=on_a_thread)
+    thread.start()
+    thread.join()
+    queue.put((outcome, seen, restored, second, elsewhere,
+               signal.getsignal(signal.SIGINT) is before))
 
 
 def test_cleanup_after_a_failure_is_not_interrupted(synth_dataset):
     """
         What the command line tools call when they fail: an interrupt
-        that arrives during the cleanup does not end it, and an error
-        of the cleanup is not raised (the failure of the tool is the
-        one to report)
+        that arrives during the cleanup does not end it, interrupts
+        are taken again afterwards as before, and an error of the
+        cleanup is not raised (the failure of the tool is the one to
+        report)
     """
 
     result = outcome(make_generator(synth_dataset), interrupted_while_stopping)
-    assert result == ("returned", ["stopped"], "returned", True), result
+    assert result == ("returned", [True, "stopped"], True, "returned",
+                      ["stopped"], True), result
+
+
+def interrupted_right_after_a_start(generator, queue):
+    before = Before()
+    start = multiprocessing.Process.start
+
+    def start_then_interrupt(self):
+        start(self)
+        raise KeyboardInterrupt()
+
+    multiprocessing.Process.start = start_then_interrupt
+    try:
+        next(generator.gen())
+        result = "an epoch was started"
+    except KeyboardInterrupt:
+        result = "interrupted"
+    finally:
+        multiprocessing.Process.start = start
+    gc.collect()
+    queue.put((result, leftovers(before), generator.curr_epoch,
+               len(generators._EPOCHS)))
+
+
+def test_worker_that_was_just_started_is_ended_too(synth_dataset):
+    """
+        Something happens right after the first worker of an epoch
+        was started (an interrupt, here). The worker is known to the
+        epoch before it is started, and ends with it.
+    """
+
+    result = outcome(parked_generator(synth_dataset),
+                     interrupted_right_after_a_start)
+    assert result == ("interrupted", NOTHING, 0, 0), result
 
 
 def test_window_beyond_the_chromosome_of_a_bigwig(tmp_path):

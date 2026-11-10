@@ -703,20 +703,24 @@ def end_training_process(process):
         its batch workers then end by themselves when they find it 
         gone.
         
+        Further interrupts are ignored until this is done: the keys 
+        pressed again must not leave the training process behind.
+        
         Args:
             process (multiprocessing.Process): the training process
     """
     
-    process.join(TRAINER_NOTICE_SECONDS)
-    if process.is_alive():
-        os.kill(process.pid, signal.SIGINT)
-        process.join(TRAINER_STOP_SECONDS)
-    if process.is_alive():
-        process.terminate()
-        process.join(TRAINER_STOP_SECONDS)
-    if process.is_alive():
-        process.kill()
-        process.join()
+    with generators.interrupts_ignored():
+        process.join(TRAINER_NOTICE_SECONDS)
+        if process.is_alive():
+            os.kill(process.pid, signal.SIGINT)
+            process.join(TRAINER_STOP_SECONDS)
+        if process.is_alive():
+            process.terminate()
+            process.join(TRAINER_STOP_SECONDS)
+        if process.is_alive():
+            process.kill()
+            process.join()
 
 
 def train_and_validate_ksplits(

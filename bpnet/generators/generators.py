@@ -71,6 +71,7 @@ from bpnet.generators import sequtils
 from bpnet.generators import windows
 from bpnet.utils.exceptionhandler import NoTracebackException
 from bpnet.utils.misc import gaussian1D_smoothing
+from contextlib import contextmanager
 from queue import Empty, Queue
 from threading import RLock, Thread
 import time
@@ -151,7 +152,8 @@ def _forget_the_epochs_of_the_parent():
     del _EPOCHS[:]
 
 
-os.register_at_fork(after_in_child=_forget_the_epochs_of_the_parent)
+if hasattr(os, 'register_at_fork'):
+    os.register_at_fork(after_in_child=_forget_the_epochs_of_the_parent)
 
 
 def close_writing_end(mpq):
@@ -220,7 +222,9 @@ def stop_workers(epoch):
     """
     
     with epoch.lock:
-        procs = [proc for proc in epoch.procs if proc is not None]
+        # (a process that could not be started has no id)
+        procs = [proc for proc in epoch.procs 
+                 if proc is not None and proc.pid is not None]
         for proc in procs:
             if proc.is_alive():
                 proc.terminate()
@@ -280,6 +284,28 @@ def stop_all(generator=None):
                 thread.join(max(0.0, deadline - time.monotonic()))
 
 
+@contextmanager
+def interrupts_ignored():
+    """
+        Ignore interrupts (SIGINT) while something is done that must 
+        be done to its end, and take them again afterwards as before
+        
+        Outside the main thread the handling of signals cannot be 
+        changed, and interrupts are not delivered there anyway: the 
+        block then just runs.
+    """
+    
+    try:
+        before = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    except ValueError:
+        yield
+        return
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGINT, before)
+
+
 def stop_after_failure():
     """
         For the place where a command line tool catches its own 
@@ -288,21 +314,16 @@ def stop_after_failure():
         
         A second interrupt must not end the cleanup half way (the 
         keys pressed again, or the interrupt that bpnet-train passes 
-        on to its training process), so interrupts are ignored from 
-        here on; the tool is on its way out. A failure of the 
-        cleanup itself is logged and not raised: the failure of the 
-        tool is the one to report.
+        on to its training process), so interrupts are ignored while 
+        it runs. A failure of the cleanup itself is logged and not 
+        raised: the failure of the tool is the one to report.
     """
     
-    try:
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
-    except ValueError:
-        # not the main thread: the interrupt is not delivered here
-        pass
-    try:
-        stop_all()
-    except Exception:
-        logging.exception("Could not stop the batch generation")
+    with interrupts_ignored():
+        try:
+            stop_all()
+        except Exception:
+            logging.exception("Could not stop the batch generation")
 
 
 class MSequenceGenerator:
@@ -1059,11 +1080,13 @@ class MSequenceGenerator:
                     "sum(num_batches) {}".format(
                         self._mode, i, df.shape, sum(num_batches)))
 
-                # spawn and start the batch generation process 
+                # spawn and start the batch generation process. It is 
+                # recorded before it is started, so that the epoch 
+                # can end it whatever happens right after the start.
                 p = mp.Process(target=self._proc_target, args=[df, mpq, i])
-                p.start()
                 procs.append(p)
                 mp_queues.append(mpq)
+                p.start()
                 # only the worker writes to its queue
                 close_writing_end(mpq)
                 
@@ -1137,7 +1160,7 @@ class MSequenceGenerator:
             stop_workers(epoch)
         
         for j, proc in enumerate(epoch.procs):
-            if proc is not None:
+            if proc is not None and proc.pid is not None:
                 logging.debug(
                     "{} waiting to join process {}".format(self._mode, j))
                 proc.join()

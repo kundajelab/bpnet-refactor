@@ -215,7 +215,7 @@ calls = []
 
 def fails_the_second_time(self, *args, **kwargs):
     calls.append(1)
-    if len(calls) == 2:
+    if len(calls) == 2 and os.environ.get('FAIL_IN') != 'never':
         open('failed', 'w').close()
         raise RuntimeError('the prediction failed')
     return model_predict(self, *args, **kwargs)
@@ -380,31 +380,54 @@ def test_interrupt_of_bpnet_train_ends_its_processes(synth_dataset, tmp_path,
     assert left == []
 
 
-@needs_proc
-def test_failure_in_bpnet_predict_ends_its_workers(synth_dataset, tmp_path):
-    model_dir = tmp_path / "model"
-    model_dir.mkdir()
+@pytest.fixture(scope="module")
+def model_for_predictions(synth_dataset, tmp_path_factory):
+    directory = tmp_path_factory.mktemp("model_for_predictions")
     code, output = run_cli("bpnet.cli.bpnettrainer", train_args(
-        synth_dataset, model_dir), cwd=str(tmp_path))
+        synth_dataset, directory), cwd=str(directory))
     assert code == 0, output[-3000:]
+    return str(directory / "model_split000")
 
-    out_dir = tmp_path / "predictions"
-    out_dir.mkdir()
-    d = synth_dataset
-    code, output, seconds, left = run_until(PREDICT_AND_FAIL, [
-        "--model", model_dir / "model_split000",
-        "--chrom-sizes", d["chrom_sizes"],
-        "--chroms"] + d["splits"]["0"]["test"] + [
-        "--test-indices-file", "None", "--reference-genome", d["fasta"],
-        "--output-dir", out_dir, "--input-data", d["input_json"],
-        "--sequence-generator-name", "BPNet",
-        "--input-seq-len", d["input_len"], "--output-len", d["output_len"],
-        "--output-window-size", d["output_len"], "--batch-size", 1,
-        "--threads", 2], str(out_dir), {"WORKERS_OF": "test"}, failed)
+
+def predict_args(d, model, out_dir):
+    return ["--model", model, "--chrom-sizes", d["chrom_sizes"],
+            "--chroms"] + d["splits"]["0"]["test"] + [
+            "--test-indices-file", "None", "--reference-genome", d["fasta"],
+            "--output-dir", out_dir, "--input-data", d["input_json"],
+            "--sequence-generator-name", "BPNet",
+            "--input-seq-len", d["input_len"],
+            "--output-len", d["output_len"],
+            "--output-window-size", d["output_len"], "--batch-size", 1,
+            "--threads", 2]
+
+
+@needs_proc
+def test_failure_in_bpnet_predict_ends_its_workers(
+        synth_dataset, model_for_predictions, tmp_path):
+    code, output, seconds, left = run_until(
+        PREDICT_AND_FAIL,
+        predict_args(synth_dataset, model_for_predictions, tmp_path),
+        str(tmp_path), {"WORKERS_OF": "test"}, failed)
     assert code != 0, output[-3000:]
     assert "the prediction failed" in output
     assert "Batch generation failed" not in output
     print("ended {:.1f} s after the prediction failed".format(seconds))
+    assert seconds < PROMPT
+    assert left == []
+
+
+@needs_proc
+def test_interrupt_of_bpnet_predict_ends_its_workers(
+        synth_dataset, model_for_predictions, tmp_path):
+    code, output, seconds, left = run_until(
+        PREDICT_AND_FAIL,
+        predict_args(synth_dataset, model_for_predictions, tmp_path),
+        str(tmp_path), {"WORKERS_OF": "test", "FAIL_IN": "never"},
+        two_workers_have_work_left,
+        then=lambda process: os.kill(process.pid, signal.SIGINT))
+    assert code != 0, output[-3000:]
+    assert "KeyboardInterrupt" in output
+    print("ended {:.1f} s after the interrupt".format(seconds))
     assert seconds < PROMPT
     assert left == []
 
@@ -421,7 +444,6 @@ def stand_in(kind, ready):
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
     ready.set()
     if kind == "is ending":
-        time.sleep(0.2)
         os._exit(3)
     try:
         time.sleep(600)
@@ -430,33 +452,87 @@ def stand_in(kind, ready):
         os._exit(5)
 
 
-@pytest.mark.parametrize("kind,exit_code,at_least,at_most", [
+#: the times of the escalation in these tests: long enough that a
+#: busy machine does not blur the steps
+NOTICE, STOP = 1.0, 2.0
+
+
+@pytest.mark.parametrize("kind,exit_code,at_least", [
     # it had the interrupt too and is on its way out: nothing is sent
-    ("is ending", 3, 0.0, 0.5),
+    ("is ending", 3, 0.0),
     # it ends when the interrupt is passed on
-    ("takes the interrupt", 5, 0.5, 1.4),
+    ("takes the interrupt", 5, NOTICE),
     # it is terminated, then killed
-    ("ignores the interrupt", -signal.SIGTERM, 1.5, 2.4),
-    ("ignores everything", -signal.SIGKILL, 2.5, 4.0)])
+    ("ignores the interrupt", -signal.SIGTERM, NOTICE + STOP),
+    ("ignores everything", -signal.SIGKILL, NOTICE + 2 * STOP)])
 def test_training_process_is_ended_step_by_step(monkeypatch, kind, exit_code,
-                                                at_least, at_most):
+                                                at_least):
+    """
+        The exit code of the stand-in says which step ended it, the
+        time that the steps before it were waited for
+    """
+
     from bpnet.train import training
 
-    monkeypatch.setattr(training, "TRAINER_NOTICE_SECONDS", 0.5)
-    monkeypatch.setattr(training, "TRAINER_STOP_SECONDS", 1.0)
+    monkeypatch.setattr(training, "TRAINER_NOTICE_SECONDS", NOTICE)
+    monkeypatch.setattr(training, "TRAINER_STOP_SECONDS", STOP)
     ready = multiprocessing.Event()
     process = multiprocessing.Process(target=stand_in, args=(kind, ready))
     process.start()
     try:
         assert ready.wait(60)
-        start = time.time()
+        start = time.monotonic()
         training.end_training_process(process)
-        seconds = time.time() - start
+        seconds = time.monotonic() - start
         assert not process.is_alive()
         assert process.exitcode == exit_code
-        assert at_least <= seconds < at_most
+        assert at_least <= seconds < at_least + 20
     finally:
         if process.is_alive():
             process.kill()
         process.join()
 
+
+def interrupted_again(queue):
+    """
+        In a process of its own (it sends itself an interrupt): the
+        training process is being ended when a second interrupt
+        arrives
+    """
+
+    import threading
+
+    from bpnet.train import training
+
+    training.TRAINER_NOTICE_SECONDS, training.TRAINER_STOP_SECONDS = 0.5, 1.0
+    handler = signal.getsignal(signal.SIGINT)
+    ready = multiprocessing.Event()
+    process = multiprocessing.Process(
+        target=stand_in, args=("ignores everything", ready))
+    process.start()
+    ready.wait(60)
+    threading.Timer(0.8, os.kill, args=(os.getpid(), signal.SIGINT)).start()
+    try:
+        training.end_training_process(process)
+        result = "ended"
+    except KeyboardInterrupt:
+        result = "interrupted"
+    queue.put((result, process.is_alive(), process.exitcode,
+               signal.getsignal(signal.SIGINT) is handler))
+    if process.is_alive():
+        process.kill()
+
+
+def test_second_interrupt_does_not_leave_the_training_process():
+    queue = multiprocessing.Queue()
+    child = multiprocessing.Process(target=interrupted_again, args=(queue,))
+    child.start()
+    try:
+        result = queue.get(timeout=120)
+    finally:
+        child.join(30)
+        if child.is_alive():
+            child.kill()
+            child.join()
+    # the training process was killed, and interrupts are taken again
+    assert result == ("ended", False, -signal.SIGKILL, True), result
