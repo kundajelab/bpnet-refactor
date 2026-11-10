@@ -247,8 +247,15 @@ class MSequenceGenerator:
         #: the number of tracks across all tasks
         self._total_signal_tracks = 0
         for i in range(self._num_tasks):
-            self._total_signal_tracks += \
-                len(self._tasks[i]['signal']['source'])
+            num_signal_files = len(self._tasks[i]['signal']['source'])
+            # a task is one unstranded track or a plus/minus pair; the
+            # reverse complement of anything else is not defined
+            if num_signal_files < 1 or num_signal_files > 2:
+                raise NoTracebackException(
+                    "Task {} has {} 'signal' files. A task must have 1 "
+                    "(unstranded) or 2 (plus and minus strand) signal "
+                    "files.".format(i, num_signal_files))
+            self._total_signal_tracks += num_signal_files
         
         #: the number of bias tracks for each task
         self._bias_tracks = {}
@@ -1076,10 +1083,7 @@ class MBPNetSequenceGenerator(MSequenceGenerator):
             for i in range(self._num_tasks):
                 
                 cur_num_signal_files = len(signal_files[i])
-                assert(cur_num_signal_files>0)
-                if cur_num_signal_files>2:
-                    logging.error(f"signal_files cannot be more than two per task. But given: {signal_files} for task {i}")                       
-                                
+
                 # Step 2. get the profile signal value
                 for signal_file in signal_files[i]:
                     profile_predictions[rowCnt, :, profile_track_idx] = \
@@ -1189,9 +1193,9 @@ class MBPNetSequenceGenerator(MSequenceGenerator):
         # in 'train' mode we add some extras to track all the
         # loci used in every batch of training
         if self._mode == 'train':
-            inputs['jitters'] = np.array(jitters),
-            inputs['index'] = np.array(idxs),
-            inputs['status'] = coords['status'].values,
+            inputs['jitters'] = np.array(jitters)
+            inputs['index'] = np.array(idxs)
+            inputs['status'] = coords['status'].values
             inputs['rev_comp'] = coords['rev_comp'].values
         
         # in 'train' and 'val' mode we need outputs as well     
