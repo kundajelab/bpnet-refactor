@@ -76,6 +76,7 @@ from queue import Empty, Full, Queue
 from threading import RLock, Thread
 import time
 import traceback
+import weakref
 
 
 class WorkerFailure(object):
@@ -154,10 +155,12 @@ class Epoch(object):
         #: a pipe that nothing is written to. The consumer holds the 
         #: writing end for as long as the epoch lasts, and no other 
         #: process does (a process that is forked from the consumer 
-        #: gives up its copy, see _forget_the_epochs_of_the_parent); 
-        #: every worker gets the reading end, and finds the end of 
-        #: the data there once the consumer is gone (see Consumer).
-        self.alive_reader, self.alive_writer = mp.Pipe(duplex=False)
+        #: gives up its copy, see _CONSUMER_HANDLES); every worker 
+        #: gets the reading end, and finds the end of the data there 
+        #: once the consumer is gone (see Consumer).
+        with _CONSUMER_HANDLES_LOCK:
+            self.alive_reader, self.alive_writer = mp.Pipe(duplex=False)
+            _CONSUMER_HANDLES.add(self.alive_writer)
 
     def close(self):
         """
@@ -165,7 +168,9 @@ class Epoch(object):
             consumer is there (after the workers have ended)
         """
         
-        self.alive_writer.close()
+        with _CONSUMER_HANDLES_LOCK:
+            self.alive_writer.close()
+            _CONSUMER_HANDLES.discard(self.alive_writer)
         self.alive_reader.close()
 
 
@@ -177,31 +182,51 @@ _EPOCHS = []
 _EPOCHS_LOCK = RLock()
 
 
+#: the handles that stand for this process as the consumer of an 
+#: epoch (Epoch.alive_writer: the writing ends of the pipes the 
+#: workers look at), and the lock under which such a handle is made 
+#: and recorded, or closed. A fork takes the lock too. So a forked 
+#: process knows every such handle of its parent, whatever the 
+#: parent was doing in its other threads, and gives all of them up: 
+#: otherwise the workers of the parent would take it for their 
+#: consumer once the parent is gone. (The handles are not kept alive 
+#: by being recorded.)
+_CONSUMER_HANDLES = weakref.WeakSet()
+_CONSUMER_HANDLES_LOCK = RLock()
+
+
+def _before_a_fork():
+    _CONSUMER_HANDLES_LOCK.acquire()
+
+
+def _after_a_fork():
+    _CONSUMER_HANDLES_LOCK.release()
+
+
 def _forget_the_epochs_of_the_parent():
     """
         In a forked process: the epochs of the parent are not this 
         process's to stop, and the lock may have been held by a 
-        thread that does not exist here
-        
-        The process is not the consumer of those epochs either: it 
-        closes its copies of the handles that stand for the consumer 
-        (Epoch.alive_writer). Otherwise the workers of the parent 
-        would take this process for their consumer when the parent 
-        is gone.
+        thread that does not exist here. The process is not the 
+        consumer of those epochs either: it closes its copies of 
+        the handles that stand for the consumer.
     """
     
-    global _EPOCHS_LOCK
+    global _EPOCHS_LOCK, _CONSUMER_HANDLES_LOCK
     _EPOCHS_LOCK = RLock()
-    for epoch in _EPOCHS:
+    del _EPOCHS[:]
+    for handle in list(_CONSUMER_HANDLES):
         try:
-            epoch.alive_writer.close()
+            handle.close()
         except OSError:  # pragma: no cover
             pass
-    del _EPOCHS[:]
+    _CONSUMER_HANDLES.clear()
+    _CONSUMER_HANDLES_LOCK = RLock()
 
 
 if hasattr(os, 'register_at_fork'):
-    os.register_at_fork(after_in_child=_forget_the_epochs_of_the_parent)
+    os.register_at_fork(before=_before_a_fork, after_in_parent=_after_a_fork,
+                        after_in_child=_forget_the_epochs_of_the_parent)
 
 
 def close_writing_end(mpq):

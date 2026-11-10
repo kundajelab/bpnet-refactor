@@ -6,9 +6,12 @@
     through when the queues are full.
 """
 
+import copy
+import gc
 import multiprocessing
 import os
 import signal
+import threading
 import time
 
 import numpy as np
@@ -19,7 +22,8 @@ from bpnet.utils.exceptionhandler import NoTracebackException
 
 from tests.test_generator_failures import (
     NOTHING, PROMPT, TIME_LIMIT, Before, Worker, ended,
-    kill_with_its_session, leftovers, make_generator, outcome, wait_until)
+    kill_with_its_session, leftovers, make_generator, open_files, outcome,
+    wait_until)
 
 
 class Counted(Worker):
@@ -299,34 +303,93 @@ class Notes(Counted):
 ORPHAN_SECONDS = 5.0
 
 
+def a_bystander():
+    """
+        Fork a process that does nothing and goes on after its parent
+
+        Returns:
+            int: its id
+    """
+
+    pid = os.fork()
+    if pid == 0:
+        try:
+            time.sleep(TIME_LIMIT)
+        finally:
+            os._exit(0)
+    return pid
+
+
 def holds_an_epoch_with_full_queues(generator, queue):
     os.setsid()
     multiprocessing.set_start_method(generator.start_method, force=True)
     generator.made = multiprocessing.Value("i", 0)
     batches = generator.gen()
-    next(batches)
-    made, waiting = until_the_queues_are_full(generator)
+    kept = [batches]
     others = []
+    if generator.bystander == "forked while the epoch waits to be known":
+        # Another thread starts the epoch. It has made the record of
+        # the epoch, with the handle that stands for the consumer,
+        # and waits for the registry of epochs, which is held here
+        # (as it is while the workers of another epoch are started).
+        # A process that is forked now must give up that handle too.
+        made = threading.Event()
+        init = generators.Epoch.__init__
+
+        def noted(self, *args):
+            init(self, *args)
+            made.set()
+
+        generators.Epoch.__init__ = noted
+        with generators._EPOCHS_LOCK:
+            starter = threading.Thread(target=next, args=(batches,))
+            starter.start()
+            assert made.wait(TIME_LIMIT)
+            time.sleep(0.5)
+            others.append(a_bystander())
+        starter.join()
+        generators.Epoch.__init__ = init
+    elif generator.bystander == "forked while the handle is made":
+        # Another thread is in the middle of making the handle: the
+        # pipe exists and is not recorded yet. A fork waits for that.
+        made = threading.Event()
+        pipe = generators.mp.Pipe
+
+        def slowly(*args, **kwargs):
+            ends = pipe(*args, **kwargs)
+            made.set()
+            time.sleep(1.0)
+            return ends
+
+        generators.mp.Pipe = slowly
+        starter = threading.Thread(target=next, args=(batches,))
+        starter.start()
+        assert made.wait(TIME_LIMIT)
+        others.append(a_bystander())
+        starter.join()
+        generators.mp.Pipe = pipe
+    else:
+        next(batches)
+    made, waiting = until_the_queues_are_full(generator)
     if generator.bystander == "forked":
         # a process that is forked from the consumer while the epoch
         # is under way, and goes on after it
-        others.append(os.fork())
-        if others[-1] == 0:
-            try:
-                time.sleep(TIME_LIMIT)
-            finally:
-                os._exit(0)
+        others.append(a_bystander())
+    elif generator.bystander == "forked during two epochs":
+        other = copy.copy(generator)
+        other.made = multiprocessing.Value("i", 0)
+        more = other.gen()
+        kept.append(more)
+        next(more)
+        also_made, also_waiting = until_the_queues_are_full(other)
+        made, waiting = made + also_made, waiting and also_waiting
+        others.append(a_bystander())
     elif generator.bystander == "holds the handle":
         # a process that has the handle that stands for the consumer
         # (one that was started without Python knowing, by a library,
         # would), and goes on after it
         handle = os.dup(generators._EPOCHS[0].alive_writer.fileno())
-        others.append(os.fork())
-        if others[-1] == 0:
-            try:
-                time.sleep(TIME_LIMIT)
-            finally:
-                os._exit(0)
+        others.append(a_bystander())
         os.close(handle)
     queue.put((made, waiting,
                [child.pid for child in multiprocessing.active_children()],
@@ -346,6 +409,7 @@ def orphans_end(generator, method, bystander=None):
 
     generator.start_method = method
     generator.bystander = bystander
+    epochs = 2 if bystander == "forked during two epochs" else 1
     queue = multiprocessing.Queue()
     consumer = multiprocessing.Process(
         target=holds_an_epoch_with_full_queues, args=(generator, queue))
@@ -353,8 +417,8 @@ def orphans_end(generator, method, bystander=None):
     workers, others = [], []
     try:
         made, waiting, workers, others = queue.get(timeout=TIME_LIMIT)
-        assert waiting and made == 1 + most_waiting(2)
-        assert len(workers) == 2
+        assert waiting and made == epochs * (1 + most_waiting(2))
+        assert len(workers) == 2 * epochs
         assert not any(ended(pid) for pid in workers)
         os.kill(consumer.pid, signal.SIGKILL)
         consumer.join()
@@ -395,19 +459,28 @@ def test_waiting_workers_end_when_their_consumer_is_gone(synth_dataset,
 
 @needs_proc
 @pytest.mark.parametrize("method", ["fork", "forkserver"])
-def test_process_forked_from_the_consumer_is_not_the_consumer(synth_dataset,
-                                                              method):
+@pytest.mark.parametrize("when", [
+    "forked", "forked during two epochs",
+    "forked while the epoch waits to be known",
+    "forked while the handle is made"])
+def test_process_forked_from_the_consumer_is_not_the_consumer(
+        synth_dataset, when, method):
     """
-        The consumer forks another process while the epoch is under
+        The consumer forks another process while an epoch is under
         way. That process has copies of everything the consumer had
         open; it gives up the handle that stands for the consumer, so
         that the workers end when the consumer is killed although the
         other process goes on.
+
+        That holds for the handles of all epochs of the consumer, and
+        whenever the fork happens: while another thread has made an
+        epoch and waits to enter it into the registry, and while the
+        handle itself is being made (the fork waits for that).
     """
 
     generator = counted_generator(synth_dataset)
     generator.__class__ = Notes
-    assert orphans_end(generator, method, bystander="forked")
+    assert orphans_end(generator, method, bystander=when)
 
 
 @needs_proc
@@ -461,6 +534,72 @@ def test_pipe_that_stands_for_the_consumer(synth_dataset):
     result = outcome(generator, forks_during_an_epoch)
     assert result == ((True, False, 0), (False, False), (True, True),
                       generator.len(), NOTHING), result
+
+
+def test_handles_of_a_consumer_are_recorded_while_they_are_open(
+        synth_dataset):
+    generator = make_generator(synth_dataset)
+    recorded = len(generators._CONSUMER_HANDLES)
+    batches = generator.gen()
+    next(batches)
+    epoch = generators._EPOCHS[-1]
+    assert epoch.alive_writer in generators._CONSUMER_HANDLES
+    assert len(generators._CONSUMER_HANDLES) == recorded + 1
+    batches.close()
+    assert epoch.alive_writer.closed and epoch.alive_reader.closed
+    assert len(generators._CONSUMER_HANDLES) == recorded
+
+    # a record of an epoch that is dropped without being closed: the
+    # handle goes with it
+    del epoch
+    files = open_files()
+    dropped = generators.Epoch(generator)
+    assert len(generators._CONSUMER_HANDLES) == recorded + 1
+    assert open_files() == files + 2
+    del dropped
+    gc.collect()
+    assert len(generators._CONSUMER_HANDLES) == recorded
+    assert open_files() == files
+
+
+def test_fork_waits_while_a_handle_is_recorded():
+    """
+        Making a handle and recording it are done under a lock that a
+        fork takes too: a process is not forked in between, and the
+        lock is free again after the fork, in the parent and in the
+        child.
+    """
+
+    held, release = threading.Event(), threading.Event()
+
+    def holder():
+        with generators._CONSUMER_HANDLES_LOCK:
+            held.set()
+            release.wait(TIME_LIMIT)
+
+    thread = threading.Thread(target=holder)
+    thread.start()
+    assert held.wait(TIME_LIMIT)
+    threading.Timer(1.0, release.set).start()
+    start = time.monotonic()
+    pid = os.fork()
+    if pid == 0:
+        # the child: its lock is its own, and free
+        free = generators._CONSUMER_HANDLES_LOCK.acquire(False)
+        os._exit(0 if free else 1)
+    waited = time.monotonic() - start
+    _, status = os.waitpid(pid, 0)
+    thread.join()
+    assert waited > 0.8
+    assert os.WEXITSTATUS(status) == 0
+
+    got = []
+    other = threading.Thread(target=lambda: got.append(
+        generators._CONSUMER_HANDLES_LOCK.acquire(timeout=5.0)) or
+        generators._CONSUMER_HANDLES_LOCK.release())
+    other.start()
+    other.join()
+    assert got == [True]
 
 
 def test_consumer_as_a_worker_sees_it():
