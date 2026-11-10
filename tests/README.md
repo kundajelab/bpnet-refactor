@@ -22,6 +22,13 @@ Tests run on the CPU. Set `BPNET_TEST_GPU=1` to let TensorFlow use a GPU.
 | `test_generators_synth.py` | `MBPNetSequenceGenerator` on the synthetic dataset: epoch composition (trimming, padding, background resampling), batch contents against the truth, jitter, reverse-complement copies, smoothed controls, unstranded / no-control / two-task layouts |
 | `test_sequtils.py` | peak loading, one-hot encoding, reverse complement |
 | `test_generators.py` | batch generation in train / val / test mode on the mini genome in `data/` |
+| `reference_model.py` | the forward pass and the training loss in plain numpy (float64), written from the description of the architecture; the yardstick for every backend |
+| `model_helpers.py` | small and released architecture parameters, random weights, random batches |
+| `test_arch.py` | the graph `arch.BPNet` builds (layer names, weight shapes, cropping, dilation) and its outputs against the numpy reference for ten configurations |
+| `test_losses.py` | multinomial NLL against scipy, its gradient and normalization constant, MSE and Poisson count losses |
+| `test_custommodel.py` | the training objective against the numpy reference (masking by weight, joint two-strand multinomial, log(total + 2) count target), gradients against finite differences, the Adam update rule, train / test step bookkeeping |
+| `test_training_helpers.py` | early stopping and learning-rate-on-plateau rules |
+| `test_optimizer.py` | the Adam update on prescribed gradients (40 steps, magnitudes around epsilon, a learning-rate change) |
 | `data/` | small hand-made input files |
 
 ## Known defects
@@ -29,3 +36,11 @@ Tests run on the CPU. Set `BPNET_TEST_GPU=1` to let TensorFlow use a GPU.
 Tests marked `xfail(strict=True)` describe behaviour we want but do not have yet. They fail
 today, and the PR that fixes a defect removes the marker (a strict xfail that starts passing
 fails the suite, so it cannot be forgotten).
+
+## Numerical tolerances
+
+Model outputs and losses are compared with the float64 numpy reference at a relative tolerance
+of 1e-4 (2e-4 for losses); weight updates at an absolute tolerance of a few 1e-6 for updates of
+about 1e-3. These bounds hold for float32 arithmetic on the CPU. On Ampere or newer NVIDIA GPUs
+TensorFlow computes convolutions in TF32 by default, which is less precise: run GPU parity checks
+with `NVIDIA_TF32_OVERRIDE=0`.
