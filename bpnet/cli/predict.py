@@ -327,6 +327,9 @@ def metrics_update(
         true_profile_smooth_prob = true_profile_smooth / np.sum(
             true_profile_smooth)
         pred_profile_prob = pred_profile / np.sum(pred_profile)
+        # a constant prediction has to be recognised before the sum is
+        # nudged to exactly 1, which changes one element
+        pred_is_constant = np.unique(pred_profile_prob).size == 1
         pred_profile_prob = _fix_sum_to_one(pred_profile_prob)
 
         # metrics 
@@ -338,7 +341,7 @@ def metrics_update(
         # different approach to check if the array has the same value.
         # If true then pearson correlation is undefined 
         if np.unique(true_profile_smooth_prob).size == 1 or \
-            np.unique(pred_profile_prob).size == 1:
+            pred_is_constant:
             metrics_tracker['profile_pearsonrs'][example_idx, track_idx] = 0
             metrics_tracker['profile_spearmanrs'][example_idx, track_idx] = 0
         else:
@@ -406,7 +409,7 @@ def predict(args, pred_dir):
         # make sure the background_train_indices_file file exists
         if not os.path.isfile(args.test_indices_file):
             raise NoTracebackException(
-                "File not found: {} ".format(test_indices_file))    
+                "File not found: {} ".format(args.test_indices_file))
 
         # load test_indices
         f = open(args.test_indices_file)
@@ -815,12 +818,12 @@ def predict(args, pred_dir):
         np.max(metrics_tracker['profile_jsds']), 
         np.median(metrics_tracker['profile_jsds'])))
     
-    logging.info("spearman\t{:0.3f}\t\t{:0.3f}\t\t{:0.3f}".format(
+    logging.info("pearson\t\t{:0.3f}\t\t{:0.3f}\t\t{:0.3f}".format(
         np.min(metrics_tracker['profile_pearsonrs']), 
         np.max(metrics_tracker['profile_pearsonrs']), 
         np.median(metrics_tracker['profile_pearsonrs'])))
     
-    logging.info("pearson\t\t{:0.3f}\t\t{:0.3f}\t\t{:0.3f}".format(
+    logging.info("spearman\t{:0.3f}\t\t{:0.3f}\t\t{:0.3f}".format(
         np.min(metrics_tracker['profile_spearmanrs']),
         np.max(metrics_tracker['profile_spearmanrs']), 
         np.median(metrics_tracker['profile_spearmanrs'])))
@@ -850,13 +853,10 @@ def predict(args, pred_dir):
     
     with open('{}/spearman.txt'.format(args.output_dir), "w+") as f:
         f.write(str(round(np.nan_to_num(np.mean(counts_spearman)),3)))
-        f.close
     with open('{}/pearson.txt'.format(args.output_dir), "w+") as f:
         f.write(str(round(np.nan_to_num(np.mean(counts_pearson)),3)))
-        f.close
     with open('{}/jsd.txt'.format(args.output_dir), "w+") as f:
         f.write(str(round(np.nan_to_num(np.median(metrics_tracker['profile_jsds'])),3)))
-        f.close
     
     np.savez_compressed(
         '{}/mnll'.format(args.output_dir), 
