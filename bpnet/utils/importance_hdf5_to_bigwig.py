@@ -5,6 +5,8 @@ import h5py
 import gzip
 import hdf5plugin
 
+from bpnet.utils.bigwig_helper import add_run, region_segments
+
 def importance_hdf5_to_bigwig(hdf5_path: str, 
                               regions_path: str,
                               outfile: str,
@@ -90,47 +92,15 @@ def importance_hdf5_to_bigwig(hdf5_path: str,
     bw = pyBigWig.open(outfile, 'w')
     bw.addHeader(gs)
     all_entries = []
-    cur_chr = ""
-    cur_end = 0
 
-    iterator = range(len(order_of_regs))
-    
-    for itr in iterator:
-        i = order_of_regs[itr]
-        i_chr, i_start, i_end, i_mid = regions[i]
-
-        if i_chr != cur_chr: 
-            cur_chr = i_chr
-            cur_end = 0
-
-        # bring current end to at least start of current region
-        if cur_end < i_start:
-            cur_end = i_start
-
-        assert(regions[i][2]>=cur_end)
-
-        # figure out where to stop for this region, get next region
-        # which may partially overlap with this one
-        next_end = i_end
-
-        if itr+1 != len(order_of_regs):
-            n = order_of_regs[itr+1]
-            next_chr, next_start, _, next_mid = regions[n]
-
-            if next_chr == i_chr and next_start < i_end:
-                # if next region overlaps with this, end between their midpoints
-                next_end = (i_mid+next_mid)//2
+    for i, i_chr, cur_end, next_end in region_segments(regions, order_of_regs):
+        i_start = regions[i][1]
 
         vals = np.sum(proj_shap_scores[i], axis=0)[cur_end - i_start:next_end - i_start]
 
-        bw.addEntries([i_chr]*(next_end-cur_end), 
-                       list(range(cur_end,next_end)), 
-                       ends = list(range(cur_end+1, next_end+1)), 
-                       values=[float(x) for x in vals])
+        add_run(bw, i_chr, cur_end, next_end, vals)
 
         all_entries.append(vals)
-
-        cur_end = next_end
 
     bw.close()
 

@@ -2,30 +2,39 @@ import pyBigWig
 import numpy as np
 from tqdm import tqdm
 
-def write_bigwig(data, regions, header, bw_out, outstats_file):
-    # regions may overlap but as we go in sorted order, at a given position,
-    # we will pick the value from the interval whose summit is closest to 
-    # current position
+def region_segments(regions, order):
+    """
+        The part of every region that is written to a bigWig
+        
+        Regions may overlap, and a bigWig holds one value per 
+        position. Regions are taken in the order of the file. Where a 
+        region overlaps the next one, it is written up to the 
+        midpoint between the centres of the two, and the next one 
+        from there: every position gets the value of the region 
+        whose centre is closest.
+        
+        Args:
+            regions (list): (chromosome, start, end, centre) of every 
+                region
+                
+            order (list): indices of the regions to write, in the 
+                order of the file (chromosomes as in the header, 
+                then by start)
+                
+        Returns:
+            list: (index of the region, chromosome, start, end) for 
+                each region in `order`: the positions that are 
+                written from it. A region between two others with 
+                the same centre has none (start equals end).
+    """
     
-    chr_to_idx = {}
-    for i,x in enumerate(header):
-        chr_to_idx[x[0]] = i
-
-    bw = pyBigWig.open(bw_out, 'w')
-    bw.addHeader(header)
-    
-    # regions may not be sorted, so get their sorted order
-    order_of_regs = sorted(range(len(regions)), key=lambda x:(chr_to_idx[regions[x][0]], regions[x][1]))
-
-    all_entries = []
+    segments = []
     cur_chr = ""
     cur_end = 0
 
-    iterator = range(len(order_of_regs))
+    for itr in range(len(order)):
 
-    for itr in tqdm(iterator):
-
-        i = order_of_regs[itr]
+        i = order[itr]
         i_chr, i_start, i_end, i_mid = regions[i]
     
         if i_chr != cur_chr: 
@@ -42,24 +51,93 @@ def write_bigwig(data, regions, header, bw_out, outstats_file):
         # which may partially overlap with this one
         next_end = i_end
     
-        if itr+1 != len(order_of_regs):
-            n = order_of_regs[itr+1]
+        if itr+1 != len(order):
+            n = order[itr+1]
             next_chr, next_start, _, next_mid = regions[n]
        
             if next_chr == i_chr and next_start < i_end:
                 # if next region overlaps with this, end between their midpoints
                 next_end = (i_mid+next_mid)//2
-       
-        vals = data[i][cur_end - i_start:next_end - i_start]
-
-        bw.addEntries([i_chr]*(next_end-cur_end), 
-                       list(range(cur_end,next_end)), 
-                       ends = list(range(cur_end+1, next_end+1)), 
-                       values=[float(x) for x in vals])
-    
-        all_entries.append(vals)
+        
+        segments.append((i, i_chr, cur_end, next_end))
         
         cur_end = next_end
+    
+    return segments
+
+
+def add_run(bw, chrom, start, end, values):
+    """
+        Add the values of the consecutive positions start .. end - 1 
+        to a bigWig file that is being written
+        
+        The positions go into the file as one fixedStep run, which 
+        holds a value per position. (An entry per position, with its 
+        own start and end, takes three times the space before 
+        compression and several times as long to write; what is read 
+        back from the file, position by position or as a summary, is 
+        the same.) Values are stored as float32, as always.
+        
+        Args:
+            bw (pyBigWig.bigWigFile): file opened for writing, with 
+                its header added
+            
+            chrom (str): chromosome
+            
+            start (int): first position
+            
+            end (int): position after the last
+            
+            values (numpy.ndarray): one value per position
+    """
+    
+    start, end = int(start), int(end)
+    if end == start:
+        return
+    
+    # what pyBigWig refused when it was given every position (a 
+    # fixedStep run has no ends to compare with)
+    if start < 0 or end < start or len(values) != end - start:
+        raise RuntimeError(
+            "Cannot write {} values to {}:{}-{} of the bigWig file".format(
+                len(values), chrom, start, end))
+    
+    # the conversion pyBigWig applies to Python floats: values beyond 
+    # the range of float32 become infinite
+    with np.errstate(over='ignore'):
+        values = np.ascontiguousarray(values, dtype=np.float32)
+    if not pyBigWig.numpy:
+        values = [float(x) for x in values]
+    
+    bw.addEntries(str(chrom), start, values=values, span=1, step=1)
+
+
+def write_bigwig(data, regions, header, bw_out, outstats_file):
+    # regions may overlap but as we go in sorted order, at a given position,
+    # we will pick the value from the interval whose summit is closest to 
+    # current position
+    
+    chr_to_idx = {}
+    for i,x in enumerate(header):
+        chr_to_idx[x[0]] = i
+
+    bw = pyBigWig.open(bw_out, 'w')
+    bw.addHeader(header)
+    
+    # regions may not be sorted, so get their sorted order
+    order_of_regs = sorted(range(len(regions)), key=lambda x:(chr_to_idx[regions[x][0]], regions[x][1]))
+
+    all_entries = []
+
+    for i, i_chr, cur_end, next_end in tqdm(
+            region_segments(regions, order_of_regs)):
+        
+        i_start = regions[i][1]
+        vals = data[i][cur_end - i_start:next_end - i_start]
+
+        add_run(bw, i_chr, cur_end, next_end, vals)
+    
+        all_entries.append(vals)
 
     bw.close()
 
