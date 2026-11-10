@@ -19,6 +19,26 @@ from tensorflow.keras.backend import int_shape
 import tensorflow as tf
 from bpnet.model import bpnetdefaults
 
+# names of the layers that have weights, in the order BPNet() creates
+# them; the seeded initial weights (bpnet.model.initialization) are
+# assigned in this order
+_weight_layer_names = []
+
+
+def _weighted(layer):
+    """
+        Record a layer that has a kernel and a bias
+        
+        Args:
+            layer (tensorflow.keras.layers.Layer): Conv1D or Dense layer
+                
+        Returns:
+            the same layer
+    """
+    _weight_layer_names.append(layer.name)
+    return layer
+
+
 def _crop_layer(layer, new_size):
     """
         Crop a layer's first dimension
@@ -131,18 +151,18 @@ def motif_module(
     motif_module_out = one_hot_input
     # n-1 conv layers with activation (n = len(kernel_sizes))
     for i in range(len(kernel_sizes)-1):
-        motif_module_out = layers.Conv1D(
+        motif_module_out = _weighted(layers.Conv1D(
             filters[i], kernel_size=kernel_sizes[i], padding=padding, 
             activation='relu', 
-            name='{}_conv_{}'.format(name_prefix, i))(motif_module_out)
+            name='{}_conv_{}'.format(name_prefix, i)))(motif_module_out)
         
     # The activation of the last conv in the motif module is done
     # in the syntax module. The reason for this is to accommodate 
     # the 'pre_activation_residual_unit' option in the syntax module
-    return layers.Conv1D(
+    return _weighted(layers.Conv1D(
         filters[-1], kernel_size=kernel_sizes[-1], padding=padding, 
         name='{}_conv_{}'.format(
-            name_prefix, len(filters) - 1))(motif_module_out)
+            name_prefix, len(filters) - 1)))(motif_module_out)
     
 
 def syntax_module(
@@ -192,10 +212,10 @@ def syntax_module(
         x_activated = layers.ReLU(name=x.name.split('/')[0]+'_relu')(x)
             
         # dilated convolution
-        conv_output_without_activation = layers.Conv1D(
+        conv_output_without_activation = _weighted(layers.Conv1D(
             filters=filters, kernel_size=kernel_size, padding=padding, 
             dilation_rate=2**i,
-            name='{}_dil_conv_{}'.format(name_prefix, i))(x_activated)
+            name='{}_dil_conv_{}'.format(name_prefix, i)))(x_activated)
 
         if pre_activation_residual_unit:
             # If padding is 'valid' we need to crop layer to match 
@@ -247,9 +267,9 @@ def profile_head(
 
     """
     
-    return layers.Conv1D(
+    return _weighted(layers.Conv1D(
         filters=filters, kernel_size=kernel_size, padding=padding, 
-        name='{}_profile_head'.format(name_prefix))(syntax_module_out)
+        name='{}_profile_head'.format(name_prefix)))(syntax_module_out)
 
 
 def counts_head(
@@ -289,12 +309,14 @@ def counts_head(
         if activations[i] != 'leakyrelu':
             # we can use this formulation for all activations that 
             # have a string name representation
-            x = layers.Dense(units[i], name='counts_dense_{}'.format(i),
-                             activation=activations[i])(x)
+            x = _weighted(layers.Dense(
+                units[i], name='counts_dense_{}'.format(i),
+                activation=activations[i]))(x)
         else:
             # add a separate leaky relu layer since keras doesnt 
             # have a string name for leaky relu
-            x = layers.Dense(units[i], name='counts_dense_{}'.format(i))(x)
+            x = _weighted(layers.Dense(
+                units[i], name='counts_dense_{}'.format(i)))(x)
             x = layers.LeakyReLU(name='counts_dense_LReLU_{}'.format(i))(x)
         
         #add dropout layer
@@ -303,7 +325,7 @@ def counts_head(
                                name='counts_dropout_{}'.format(i))(x)
             
     # the final Dense layer with linear activation and no dropout
-    return layers.Dense(units[-1], name=name)(x)
+    return _weighted(layers.Dense(units[-1], name=name))(x)
 
 
 def profile_bias_module(
@@ -373,9 +395,9 @@ def profile_bias_module(
                 name = "profile_predictions"
             else:
                 name = "profile_predictions_{}".format(i)
-            profile_outputs.append(layers.Conv1D(
+            profile_outputs.append(_weighted(layers.Conv1D(
                 filters=num_task_tracks, kernel_size=kernel_sizes[i], 
-                name=name)(concat_with_profile_bias_input))
+                name=name))(concat_with_profile_bias_input))
 
     # profile output
     if len(profile_outputs) == 1:
@@ -464,13 +486,13 @@ def counts_bias_module(counts_head, counts_bias_inputs, tasks_info,
             #     units=num_task_tracks, 
             #     name=name)(concat_with_counts_bias_input))
             if orig_multi_loss:
-                counts_outputs.append(layers.Dense(
+                counts_outputs.append(_weighted(layers.Dense(
                     units=num_task_tracks, 
-                    name=name)(concat_with_counts_bias_input))
+                    name=name))(concat_with_counts_bias_input))
             else: 
-                counts_outputs.append(layers.Dense(
+                counts_outputs.append(_weighted(layers.Dense(
                     units=num_tasks, 
-                    name=name)(concat_with_counts_bias_input))
+                    name=name))(concat_with_counts_bias_input))
 
     # counts output
     if len(counts_outputs) == 1:
@@ -580,6 +602,9 @@ def BPNet(
             tensorflow.keras.layers.Model
     """
     
+    # the layers with weights are recorded as they are created
+    del _weight_layer_names[:]
+
     # load params, override defaults
     (input_len, 
      output_profile_len, 
@@ -725,7 +750,7 @@ def BPNet(
     #        'output_profile_len':output_profile_len,\
     #        'loss_weights':loss_weights,\
     #        'inputs':inputs, 'outputs':[profile_outputs, logcounts_outputs]})
-    return CustomModel(num_tasks,
+    model = CustomModel(num_tasks,
                         total_tracks, 
                         tracks_for_each_task, 
                         output_profile_len, 
@@ -735,4 +760,7 @@ def BPNet(
                         inputs=inputs, 
                         outputs=[profile_outputs, logcounts_outputs])
 
+    # names of the layers with weights, in creation order
+    model.weight_layer_names = tuple(_weight_layer_names)
 
+    return model

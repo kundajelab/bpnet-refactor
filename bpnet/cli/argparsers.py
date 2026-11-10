@@ -1,5 +1,23 @@
 import argparse
 
+
+def seed_value(text):
+    """
+        Type of the --seed option of bpnet-train: an integer that both
+        numpy and tensorflow accept as a seed
+    """
+
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            "{!r} is not an integer".format(text))
+    if not 0 <= value <= 2 ** 32 - 1:
+        raise argparse.ArgumentTypeError(
+            "{} is not between 0 and 4294967295".format(value))
+    return value
+
+
 def training_argsparser():
     # command line arguments
     parser = argparse.ArgumentParser()
@@ -34,6 +52,16 @@ def training_argsparser():
     parser.add_argument('--lr-reduction-factor', type=float, 
                         help="factor by which the learning rate will be "
                         "reduced", default=0.5)
+
+    parser.add_argument('--seed', type=seed_value, default=None,
+                        help="seed for the initial weights and for the "
+                        "random choices made while the training loci are "
+                        "prepared (background sampling, trimming, "
+                        "shuffling). The jitter is drawn in the worker "
+                        "processes and does not depend on it. When not "
+                        "given, the initial weights are those of seed "
+                        "1234, the weights every model started from "
+                        "under TensorFlow 2.4.1")
 
     # model params
     # TODO - might want to yaml just the model params 

@@ -52,10 +52,13 @@ import os
 import pandas as pd
 import time
 
+import numpy as np
+
 from bpnet.utils.datetime_custom import *
 from bpnet.utils.exceptionhandler import NoTracebackException
 from bpnet.utils import logger
 from bpnet.model import arch
+from bpnet.model import initialization
 from tensorflow.keras.optimizers import Adam
 from bpnet.generators import generators 
 
@@ -135,6 +138,23 @@ def reduce_lr_on_plateau(losses, current_lr, factor=0.5, patience=2,
         return current_lr
     
     return new_lr
+
+
+def global_seed():
+    """
+        The seed of tf.random.set_seed that is in effect (the package
+        sets 1234 when it is imported; a caller may have set another)
+        
+        Returns:
+            int: the global seed, 1234 if none is set
+    """
+    
+    from tensorflow.python.eager import context
+    
+    seed = context.global_seed()
+    if seed is None:
+        return initialization.DEFAULT_SEED
+    return int(seed)
 
 
 def train_and_validate(
@@ -276,6 +296,15 @@ def train_and_validate(
     # we need to initialize the logger for each process
     logger.init_logger(logfname)
     
+    # a requested seed replaces the seeds set when the package was 
+    # imported: numpy's for the random choices made while the batch 
+    # generators are set up (background sampling, trimming, shuffling)
+    # and tensorflow's global seed, which the initial weights follow
+    seed = hyper_params.get('seed')
+    if seed is not None:
+        np.random.seed(seed)
+        set_seed(seed)
+
     # parameters that are specific to the training batch generation
     # process
     train_batch_gen_params = batch_gen_params
@@ -341,6 +370,19 @@ def train_and_validate(
                         orig_multi_loss=orig_multi_loss, 
                         name_prefix="main")
     
+    # Initial weights. Under TensorFlow 2.4.1 the global seed fixed the 
+    # initial weights; newer versions draw them differently on every 
+    # run, which hurts experiments with few peaks (they train for too 
+    # few steps to recover from an unlucky start of the layers that 
+    # combine the predictions with the control tracks). Assigning the 
+    # weights of the seed here gives every TensorFlow version the
+    # starting point TensorFlow 2.4.1 had.
+    initial_weights_seed = global_seed()
+    initial_weights_digest = initialization.set_initial_weights(
+        model, initial_weights_seed)
+    logging.info("Initial weights: seed {}, sha256 {}".format(
+        initial_weights_seed, initial_weights_digest))
+
     # print out the model summary
     model.summary()
         
@@ -529,6 +571,11 @@ def train_and_validate(
         config['batch_gen_params'] = batch_gen_params
         config['hyper_params'] = hyper_params
         config['parallelization_params'] = parallelization_params
+        
+        # what the model started from
+        config['initial_weights'] = {
+            'seed': initial_weights_seed, 
+            'sha256': initial_weights_digest}
         
         # the number of epochs the training lasted
         config['training_epochs'] = epoch + 1

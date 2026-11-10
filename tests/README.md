@@ -28,12 +28,13 @@ Tests run on the CPU. Set `BPNET_TEST_GPU=1` to let TensorFlow use a GPU.
 | `test_losses.py` | multinomial NLL against scipy, its gradient and normalization constant, MSE and Poisson count losses |
 | `test_custommodel.py` | the training objective against the numpy reference (masking by weight, joint two-strand multinomial, log(total + 2) count target), gradients against finite differences, the Adam update rule, train / test step bookkeeping |
 | `test_training_helpers.py` | early stopping and learning-rate-on-plateau rules |
+| `test_initialization.py` | the seeded initial weights: the numpy generator against TensorFlow's random kernel, the weights recorded from a TensorFlow 2.4.1 training run, and (on TensorFlow 2.4) against what Keras draws itself for seven architectures; the `--seed` option's values |
 | `test_optimizer.py` | the Adam update on prescribed gradients (40 steps, magnitudes around epsilon, a learning-rate change) |
 | `test_metrics.py` | the per-region metrics of `bpnet-predict` (correlations, normalized likelihood, cross entropy and Jensen-Shannon scores, MSE) against formulas written out in the test |
 | `test_bigwig_writing.py` | both bigWig writers: region order, the split of overlapping regions between their centres, the statistics file |
 | `test_counts_loss_weight.py` | `bpnet-counts-loss-weight` |
 | `saved_weights.py` | reads a SavedModel's weights by layer name from its checkpoint |
-| `test_cli_end_to_end.py` | (slow) `bpnet-train` then `bpnet-predict` as subprocesses on the synthetic dataset; predictions, metric files and bigWigs recomputed from the saved weights with the numpy reference |
+| `test_cli_end_to_end.py` | (slow) `bpnet-train` then `bpnet-predict` as subprocesses on the synthetic dataset; predictions, metric files and bigWigs recomputed from the saved weights with the numpy reference; the weights a run starts from and the loci `--seed` selects, from runs with a learning rate of zero |
 | `test_cli_failures.py` | (slow) failures inside `bpnet-train` reach the exit status |
 | `legacy_reference.py` | earlier implementations of functions that were replaced by faster ones, kept verbatim to prove equality |
 | `data/` | small hand-made input files |
