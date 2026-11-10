@@ -406,7 +406,7 @@ def predict(args, pred_dir):
         # make sure the background_train_indices_file file exists
         if not os.path.isfile(args.test_indices_file):
             raise NoTracebackException(
-                "File not found: {} ".format(test_indices_file))    
+                "File not found: {} ".format(args.test_indices_file))
 
         # load test_indices
         f = open(args.test_indices_file)
@@ -815,12 +815,12 @@ def predict(args, pred_dir):
         np.max(metrics_tracker['profile_jsds']), 
         np.median(metrics_tracker['profile_jsds'])))
     
-    logging.info("spearman\t{:0.3f}\t\t{:0.3f}\t\t{:0.3f}".format(
+    logging.info("pearson\t\t{:0.3f}\t\t{:0.3f}\t\t{:0.3f}".format(
         np.min(metrics_tracker['profile_pearsonrs']), 
         np.max(metrics_tracker['profile_pearsonrs']), 
         np.median(metrics_tracker['profile_pearsonrs'])))
     
-    logging.info("pearson\t\t{:0.3f}\t\t{:0.3f}\t\t{:0.3f}".format(
+    logging.info("spearman\t{:0.3f}\t\t{:0.3f}\t\t{:0.3f}".format(
         np.min(metrics_tracker['profile_spearmanrs']),
         np.max(metrics_tracker['profile_spearmanrs']), 
         np.median(metrics_tracker['profile_spearmanrs'])))
@@ -850,13 +850,10 @@ def predict(args, pred_dir):
     
     with open('{}/spearman.txt'.format(args.output_dir), "w+") as f:
         f.write(str(round(np.nan_to_num(np.mean(counts_spearman)),3)))
-        f.close
     with open('{}/pearson.txt'.format(args.output_dir), "w+") as f:
         f.write(str(round(np.nan_to_num(np.mean(counts_pearson)),3)))
-        f.close
     with open('{}/jsd.txt'.format(args.output_dir), "w+") as f:
         f.write(str(round(np.nan_to_num(np.median(metrics_tracker['profile_jsds'])),3)))
-        f.close
     
     np.savez_compressed(
         '{}/mnll'.format(args.output_dir), 

@@ -386,6 +386,48 @@ def test_metric_files_follow_from_the_predictions(predicted):
     assert summary("spearman.txt") == round(float(np.mean(spearman)), 3)
 
 
+def test_predict_log_summary(predicted):
+    """
+        The log ends with min / max / median of every profile metric
+        over regions and strands
+    """
+
+    import re
+
+    rows = {}
+    for line in predicted["output"].splitlines():
+        match = re.search(
+            r"INFO - (\w+)\s+(-?\d+\.\d+)\s+(-?\d+\.\d+)\s+(-?\d+\.\d+)$",
+            line)
+        if match:
+            rows[match.group(1)] = [float(v) for v in match.groups()[1:]]
+    assert sorted(rows) == ["cross_entropy", "jsd", "mnll", "mse", "pearson",
+                            "spearman"]
+    for name, values in rows.items():
+        array = np.load(os.path.join(predicted["dir"], name + ".npz"))[name]
+        expected = [array.min(), array.max(), np.median(array)]
+        np.testing.assert_allclose(values, expected, rtol=0, atol=5.1e-4,
+                                   err_msg=name)
+
+
+def test_missing_test_indices_file_is_reported(synth_dataset, trained,
+                                               tmp_path):
+    d = synth_dataset
+    missing = tmp_path / "no_such_indices.txt"
+    code, output = run_cli("bpnet.cli.predict", [
+        "--model", trained["model"], "--chrom-sizes", d["chrom_sizes"],
+        "--test-indices-file", missing, "--reference-genome", d["fasta"],
+        "--output-dir", tmp_path, "--input-data", d["input_json"],
+        "--input-seq-len", d["input_len"], "--output-len", d["output_len"],
+        "--output-window-size", d["output_len"]], cwd=str(tmp_path))
+    if code != 0 and "required positional argument" in output:
+        pytest.xfail("bpnet-predict cannot load a saved model with this "
+                     "TensorFlow version")
+    assert code != 0
+    assert "File not found: {}".format(missing) in output
+    assert "NameError" not in output
+
+
 def test_predicted_bigwigs(synth_dataset, predicted):
     a = predicted["arrays"]
     test_chroms = sorted(synth_dataset["splits"]["0"]["test"])
