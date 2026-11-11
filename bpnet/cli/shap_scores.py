@@ -14,13 +14,10 @@ from bpnet.utils.shaputils import *
 from bpnet.utils.logger import *
 from bpnet.generators.sequtils import one_hot_encode
 from bpnet.utils.misc import gaussian1D_smoothing
-from tensorflow.keras.models import load_model
 import tensorflow as tf
-from tensorflow.keras.utils import CustomObjectScope
 from bpnet.utils.importance_hdf5_to_bigwig import importance_hdf5_to_bigwig
 
-from bpnet.model.custommodel \
-    import CustomModel
+from bpnet.model import loading
 
 import hdf5plugin
 
@@ -92,8 +89,13 @@ def save_scores(peaks_df, one_hot_sequences, hyp_shap_scores, output_fname):
     
 
 def shap_scores(args, shap_dir):
-    # load the model
-    model = load_model(args.model, compile=False)
+    # load the model (with the package's own loader: keras' loader 
+    # only reads these models back under TensorFlow 2.4)
+    try:
+        model = loading.load_model(args.model)
+    except (OSError, ValueError, tf.errors.OpError) as error:
+        raise NoTracebackException(
+            "Cannot load the model {}: {}".format(args.model, error))
     
     # read all the peaks into a pandas dataframe
     peaks_df = pd.read_csv(args.bed_file, sep='\t', header=None, 
@@ -418,7 +420,7 @@ def shap_scores_main():
     if args.input_data is not None:
         if not os.path.exists(args.input_data):
             raise NoTracebackException(
-                "Input data file {} does not exist".format(args.control_info))
+                "Input data file {} does not exist".format(args.input_data))
             
     # check if both args.chroms and args.sample are specified, only
     # one of the two is allowed
@@ -443,9 +445,7 @@ def shap_scores_main():
     
     # shap
     logging.info("Loading {}".format(args.model))
-    with CustomObjectScope({'tf': tf,
-                            'CustomModel': CustomModel}):
-        shap_scores(args, shap_scores_dir)
+    shap_scores(args, shap_scores_dir)
 
 if __name__ == '__main__':
     shap_scores_main()
