@@ -235,7 +235,7 @@ def train_and_validate(
     val_indices=None, background_train_indices=None, 
     background_val_indices=None, bias_input_data=None, 
     mnll_loss_sample_weight=1.0, mnll_loss_background_sample_weight=0.0, 
-    orig_multi_loss=False, suffix_tag=None):
+    orig_multi_loss=False, suffix_tag=None, interrupts=None):
 
     """
         Train and validate on a single train and validation set
@@ -301,6 +301,11 @@ def train_and_validate(
             suffix_tag (str): optional tag to add as a suffix to files
                 (model, log, history & config params files) created in
                 the model directory
+            
+            interrupts (generators.Interrupts): notes of interrupts 
+                to look at after every batch, so that an interrupt 
+                whose KeyboardInterrupt was lost ends the training 
+                (None: no such checks)
          
          Returns:
              keras.models.Model
@@ -506,6 +511,11 @@ def train_and_validate(
     # the epoch with the best validation loss
     best_epoch = 1
     
+    # an interrupt whose KeyboardInterrupt was lost (in a callback of 
+    # TensorFlow, say) ends the training at the next batch
+    interrupt_checks = [] if interrupts is None else \
+        [InterruptCheck(interrupts)]
+    
     # start training
     logging.debug("Training started ...")
     for epoch in range(hyper_params['epochs']):
@@ -519,7 +529,8 @@ def train_and_validate(
         # training generator function that will be passed to fit
         train_generator = train_gen.gen()
         history = model.fit(
-            train_generator, epochs=1, steps_per_epoch=train_steps)
+            train_generator, epochs=1, steps_per_epoch=train_steps,
+            callbacks=interrupt_checks)
         train_end_time = time.time()
         
         # record the training losses
@@ -532,7 +543,8 @@ def train_and_validate(
         # validation generator function that will be passed to evaluate 
         val_generator = val_gen.gen()
         val_loss = model.evaluate(
-            val_generator, steps=val_steps, return_dict=True)
+            val_generator, steps=val_steps, return_dict=True,
+            callbacks=interrupt_checks)
         val_losses.append(val_loss['loss'])
         val_losses_lr.append(val_loss['loss'])
         val_end_time = time.time()
@@ -669,6 +681,31 @@ TRAINER_NOTICE_SECONDS = 2.0
 TRAINER_STOP_SECONDS = 30.0
 
 
+class InterruptCheck(tf.keras.callbacks.Callback):
+    """
+        Ends fit() or evaluate() at the next batch after an interrupt 
+        whose KeyboardInterrupt was lost (see generators.Interrupts)
+        
+        Args:
+            interrupts (generators.Interrupts): the notes to look at
+    """
+    
+    def __init__(self, interrupts):
+        super(InterruptCheck, self).__init__()
+        self.interrupts = interrupts
+        # (the logs are not looked at, so that Keras need not convert 
+        # them for this callback. It does for its progress bar, which 
+        # bpnet-train shows; without it Keras 2.4 still converts them 
+        # after every batch once a callback has batch hooks.)
+        self._supports_tf_logs = True
+    
+    def on_train_batch_end(self, batch, logs=None):
+        self.interrupts.check()
+    
+    def on_test_batch_end(self, batch, logs=None):
+        self.interrupts.check()
+
+
 def train_and_validate_or_stop(*args):
     """
         What the training process of a split runs: train_and_validate, 
@@ -683,11 +720,25 @@ def train_and_validate_or_stop(*args):
             *args: the arguments of train_and_validate
     """
     
+    interrupts = generators.Interrupts()
     try:
-        train_and_validate(*args)
-    except BaseException:
+        with interrupts:
+            train_and_validate(*args, interrupts=interrupts)
+            # (an interrupt that was lost at the very end)
+            interrupts.check()
+    except BaseException as failure:
         generators.stop_after_failure()
-        raise
+        # This process ends now, with its report of what happened. 
+        # An interrupt from here on (the one bpnet-train passes on 
+        # to it, a key pressed again) would only cut that report 
+        # short.
+        try:
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+        except ValueError:
+            pass
+        # (an interrupt stays an interrupt, also when a library 
+        # reported it as an error of its own)
+        raise interrupts.interrupted(failure)
 
 
 def end_training_process(process):

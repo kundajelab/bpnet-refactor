@@ -460,6 +460,188 @@ def interrupts_ignored():
         signal.signal(signal.SIGINT, before)
 
 
+#: the message with which Python refuses to change the handling of a 
+#: signal outside the main thread of the main interpreter ("signal 
+#: only works in main thread", followed by "of the main interpreter" 
+#: from Python 3.9 on)
+_REFUSED = re.compile(r"signal only works in main thread")
+
+
+class Interrupts(object):
+    """
+        Notes the interrupts (SIGINT) that arrive while a loop runs, 
+        so that none is lost
+        
+        Python raises KeyboardInterrupt in whatever the main thread 
+        is executing when an interrupt arrives. Where exceptions are 
+        discarded (in a destructor, in a callback of a library; 
+        TensorFlow runs many of both) the interrupt disappears and 
+        the loop goes on as if nothing had happened. With this, the 
+        interrupt is noted before the exception is raised, and the 
+        loop asks at every round::
+        
+            with Interrupts() as interrupts:
+                for item in items:
+                    interrupts.check()
+                    ...
+        
+        A library can also turn the KeyboardInterrupt into an error 
+        of its own (TensorFlow did, into a TypeError without a 
+        message, when the interrupt arrived inside its C code). 
+        interrupted() restores the interrupt for the place that 
+        reports the failure::
+        
+            except BaseException as failure:
+                ...
+                raise interrupts.interrupted(failure)
+        
+        Interrupts that were ignored before stay ignored, and so is 
+        a handler that was not installed from Python (nothing is 
+        noted then). An interrupt in the last instructions of the 
+        entry, after its protection and before the block runs, can 
+        leave the handler of the block installed; it then goes on 
+        passing interrupts to the handler that was there, so that 
+        they act as before. An interrupt with the default action of the 
+        system is raised as a KeyboardInterrupt while the block runs, 
+        so that the tool can clean up. A handler that someone else 
+        installs while the block runs is left in place at its end. 
+        Outside the main thread, where signals are not handled, 
+        nothing is noted.
+    """
+    
+    def __init__(self):
+        #: True once an interrupt arrived
+        self.noted = False
+        self._before = None
+        self._installed = False
+        # (the handler, as one object: whether it is still installed 
+        # is asked by identity)
+        self._handler = self._note
+    
+    def __enter__(self):
+        before = signal.getsignal(signal.SIGINT)
+        if before is None or before == signal.SIG_IGN:
+            return self
+        self._before = before
+        self._installed = True
+        try:
+            signal.signal(signal.SIGINT, self._handler)
+            return self
+        except ValueError as error:
+            if _REFUSED.match(str(error)):
+                # the handling of signals cannot be changed here (not 
+                # the main thread of the main interpreter): nothing was 
+                # installed, and nothing is noted. (Not the handler 
+                # that was there: handlers run in the main thread, 
+                # where this is not refused.)
+                self._installed = False
+                return self
+            # (another ValueError: from the handler that was there, 
+            # called for an interrupt, say)
+            self._restore()
+            raise
+        except BaseException:
+            # an interrupt right after the handler was installed (or 
+            # anything else on the way): the block does not run, and 
+            # its end is not called
+            self._restore()
+            raise
+    
+    def __exit__(self, *failure):
+        self._restore()
+        return False
+    
+    def _restore(self):
+        if not self._installed:
+            return
+        self._installed = False
+        try:
+            if signal.getsignal(signal.SIGINT) is self._handler:
+                signal.signal(signal.SIGINT, self._before)
+        except ValueError:  # pragma: no cover
+            pass
+    
+    def _note(self, signum, frame):
+        self.noted = True
+        if callable(self._before):
+            # (Python's own handler raises KeyboardInterrupt)
+            self._before(signum, frame)
+        else:
+            raise KeyboardInterrupt
+    
+    def check(self):
+        """
+            Raises:
+                KeyboardInterrupt: if an interrupt arrived since the 
+                    block was entered
+        """
+        
+        if self.noted:
+            raise KeyboardInterrupt
+    
+    def interrupted(self, failure):
+        """
+            What to raise for a failure of the block
+            
+            Args:
+                failure (BaseException): what the block raised
+            
+            Returns:
+                BaseException: the failure itself, or, when an 
+                    interrupt arrived and the failure is something 
+                    else (any other exception, also SystemExit, or 
+                    the failure of a batch worker that followed the 
+                    interrupt), a KeyboardInterrupt with the failure 
+                    as its cause
+        """
+        
+        if self.noted and not isinstance(failure, KeyboardInterrupt):
+            interrupt = KeyboardInterrupt(
+                "interrupted (the interrupt was reported as: {!r})".format(
+                    failure))
+            interrupt.__cause__ = failure
+            return interrupt
+        return failure
+
+
+def interruptible(items, interrupts=None):
+    """
+        The items of an iterable, for a loop that an interrupt must 
+        end: when an interrupt arrived and its KeyboardInterrupt was 
+        lost (see Interrupts), KeyboardInterrupt is raised before 
+        any further item is fetched (also the first: the interrupt 
+        may have been lost before the loop), and before an item that 
+        was fetched meanwhile is handed out
+        
+        Args:
+            items: an iterable
+            
+            interrupts (Interrupts): the notes to look at, of a 
+                block that was entered already (None: interrupts 
+                are noted while the items are iterated)
+        
+        Yields:
+            the items
+    """
+    
+    if interrupts is not None:
+        iterator = iter(items)
+        while True:
+            interrupts.check()
+            try:
+                item = next(iterator)
+            except StopIteration:
+                # (an interrupt that was lost while the end was 
+                # fetched)
+                interrupts.check()
+                return
+            interrupts.check()
+            yield item
+    with Interrupts() as interrupts:
+        for item in interruptible(items, interrupts):
+            yield item
+
+
 def stop_after_failure():
     """
         For the place where a command line tool catches its own 
