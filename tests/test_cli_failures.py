@@ -239,7 +239,8 @@ calls = []
 
 def loses_an_interrupt(self, *args, **kwargs):
     calls.append(1)
-    if len(calls) == 2:
+    open('predicted', 'w').close()
+    if len(calls) == 2 and os.environ.get('LOSE_IN') != 'loading':
         try:
             open('waiting', 'w').close()
             time.sleep(120)
@@ -252,7 +253,21 @@ def loses_an_interrupt(self, *args, **kwargs):
     return model_predict(self, *args, **kwargs)
 
 
+load_model = predict.loading.load_model
+
+
+def loses_an_interrupt_while_loading(path):
+    try:
+        open('waiting', 'w').close()
+        time.sleep(120)
+    except KeyboardInterrupt:
+        open('lost', 'w').close()
+    return load_model(path)
+
+
 tf.keras.Model.predict = loses_an_interrupt
+if os.environ.get('LOSE_IN') == 'loading':
+    predict.loading.load_model = loses_an_interrupt_while_loading
 predict.predict_main()
 """
 
@@ -488,6 +503,30 @@ def test_interrupt_that_python_loses_ends_bpnet_predict(
     assert code != 0, output[-3000:]
     assert "KeyboardInterrupt" in output
     print("ended {:.1f} s after the interrupt".format(seconds))
+    assert seconds < PROMPT
+    assert left == []
+
+
+@needs_proc
+def test_interrupt_lost_before_the_batches_ends_bpnet_predict(
+        synth_dataset, model_for_predictions, tmp_path):
+    """
+        An interrupt that is lost while the model is loaded ends the
+        tool before its first batch: the loop over the batches looks
+        at the notes the tool took from its start
+    """
+
+    code, output, seconds, left = run_until(
+        PREDICT_AND_LOSE_AN_INTERRUPT,
+        predict_args(synth_dataset, model_for_predictions, tmp_path),
+        str(tmp_path), {"WORKERS_OF": "test", "FAIL_IN": "never",
+                        "LOSE_IN": "loading"},
+        waits_for_the_interrupt,
+        then=lambda process: os.kill(process.pid, signal.SIGINT))
+    assert os.path.exists(str(tmp_path / "lost"))
+    assert code != 0, output[-3000:]
+    assert "KeyboardInterrupt" in output
+    assert not os.path.exists(str(tmp_path / "predicted"))
     assert seconds < PROMPT
     assert left == []
 

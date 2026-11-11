@@ -560,7 +560,9 @@ def interruptible(items, interrupts=None):
         The items of an iterable, for a loop that an interrupt must 
         end: when an interrupt arrived and its KeyboardInterrupt was 
         lost (see Interrupts), KeyboardInterrupt is raised before 
-        the next item is fetched, and again before it is handed out
+        any further item is fetched (also the first: the interrupt 
+        may have been lost before the loop), and before an item that 
+        was fetched meanwhile is handed out
         
         Args:
             items: an iterable
@@ -574,11 +576,15 @@ def interruptible(items, interrupts=None):
     """
     
     if interrupts is not None:
-        for item in items:
+        iterator = iter(items)
+        while True:
+            interrupts.check()
+            try:
+                item = next(iterator)
+            except StopIteration:
+                return
             interrupts.check()
             yield item
-            interrupts.check()
-        return
     with Interrupts() as interrupts:
         for item in interruptible(items, interrupts):
             yield item

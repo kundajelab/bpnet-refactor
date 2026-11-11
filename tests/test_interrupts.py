@@ -176,6 +176,39 @@ def test_interrupt_that_came_out_as_another_error():
         "interrupted (the interrupt was reported as: TypeError())")
 
 
+def lost_before_the_loop(queue):
+    fetched = []
+
+    def source():
+        for item in (1, 2):
+            fetched.append(item)
+            yield item
+
+    with generators.Interrupts() as interrupts:
+        try:
+            interrupt_myself()
+        except KeyboardInterrupt:
+            pass
+        taken = []
+        try:
+            for item in generators.interruptible(source(), interrupts):
+                taken.append(item)
+            result = "finished"
+        except KeyboardInterrupt:
+            result = "interrupted"
+    queue.put((result, taken, fetched))
+
+
+def test_interrupt_lost_before_the_loop_ends_it_before_the_first_item():
+    """
+        With the notes of a block that began before the loop, an
+        interrupt that was lost before the loop ends it before the
+        first item is fetched
+    """
+
+    assert in_a_process(lost_before_the_loop) == ("interrupted", [], [])
+
+
 def ignored_before(queue):
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     with generators.Interrupts() as interrupts:
