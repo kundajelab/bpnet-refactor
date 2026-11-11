@@ -26,6 +26,44 @@
       tests/test_shap_scores.py).
 
     The references get zero control inputs, as in bpnet-shap.
+
+    Everything is computed in float64. The explainer of bpnet-shap
+    computes in float32, and two of its steps are quotients of
+    differences that lose precision where the difference is small:
+
+    - the secant of a ReLU, where the pre-activations of the sequence
+      and of a reference lie on opposite sides of zero and close to
+      each other;
+    - the multiplier of a logit in the product w * l. In exact
+      arithmetic it is the mean of the two weights. The differences
+      that were seen fit an explainer that computes it as the quotient
+      0.5 * ((w_x l_x - w_x l_r) + (w_r l_x - w_r l_r)) / (l_x - l_r),
+      which is imprecise where a logit of the sequence and of a
+      reference nearly coincide. (What it does with logits that
+      coincide, or nearly, was not established: float32_allowance()
+      takes the multiplier as wholly uncertain when they are closer
+      than COINCIDE.)
+
+    An imprecise quotient moves the scores of all positions that the
+    unit or the output position sees. float32_allowance() computes, for
+    one sequence, how far these two effects can move each score; with
+    it the scores of bpnet-shap can be compared with the ones computed
+    here score by score.
+
+    What was seen in 30 runs of the tests with freshly trained models
+    (about 350 peaks per output): the counts scores never differed
+    from the ones computed here by more than the rounding of the file
+    and 2e-6 of the largest score of the peak. Of the profile scores,
+    those of 14 peaks were further off than the rounding and 1e-5 of
+    the largest score, by up to 3.4e-4; in the six peaks that were
+    looked at, within the window that an output position sees, and in
+    one of them a logit of the sequence and of a reference were 9e-7
+    apart at one output position (all others more than 4e-4).
+    Simulating the quotient in float32 for that peak reproduced the
+    pattern of the differences (correlation 0.97). In 16 of the runs
+    the allowance was computed as well: of 192 profile peaks, 31 had
+    scores more than 1e-6 beyond the rounding, and none of these
+    scores was further off than 0.2 of its allowance.
 """
 
 import numpy as np
@@ -36,16 +74,36 @@ import torch.nn.functional as F
 #: of the ReLU instead of the secant
 NEAR = 1e-6
 
+#: what float32 arithmetic leaves uncertain, for float32_allowance():
+#: a pre-activation, as a share of the largest pre-activation of its
+#: layer (float32 has 24 bits; eight units in the last place)
+RELU_NOISE = 2.0 ** -21
+#: and the multiplier of a logit: this times (|l_x| + |l_r|) /
+#: |l_x - l_r| of its value. (Each of the four products of the
+#: quotient is rounded to 2**-24 of its size, and so is one of the
+#: sums: at most 1.25 * 2**-24 by this ratio, to first order.)
+PRODUCT_NOISE = 2.0 ** -23
+#: logits that are closer than this may have their multiplier replaced
+#: by zero, or be anywhere near it
+COINCIDE = 1e-6
+#: quotients that are uncertain by less than these shares are left out
+#: of the allowance (many small ones remain; what they move is part of
+#: the tolerance of the test that uses the allowance)
+SMALLEST_RELU, SMALLEST_PRODUCT = 1e-4, 1e-5
+
 
 class _RescaledReLU(torch.autograd.Function):
     """
         A ReLU over a batch whose first half are the sequences and whose
-        second half are their references, row for row
+        second half are their references, row for row. `bump` (None, or
+        an array of the shape of the first half) is added to the secants
+        that are passed back.
     """
 
     @staticmethod
-    def forward(ctx, a):
+    def forward(ctx, a, bump):
         ctx.save_for_backward(a)
+        ctx.bump = bump
         return F.relu(a)
 
     @staticmethod
@@ -58,11 +116,9 @@ class _RescaledReLU(torch.autograd.Function):
             delta.abs() > NEAR, delta, torch.ones_like(delta))
         slope = torch.where(delta.abs() > NEAR, secant,
                             (a_x > 0).to(a.dtype))
-        return grad * torch.cat([slope, slope])
-
-
-def relu(a):
-    return _RescaledReLU.apply(a)
+        if ctx.bump is not None:
+            slope = slope + torch.as_tensor(ctx.bump, dtype=a.dtype)
+        return grad * torch.cat([slope, slope]), None
 
 
 def conv(x, kernel, bias, dilation=1):
@@ -82,10 +138,16 @@ def crop(x, length):
 
 
 def forward(weights, params, sequence, profile_bias=None, counts_bias=None,
-            name_prefix="main"):
+            name_prefix="main", bumps=None, seen=None):
     """
         The forward pass of tests/reference_model.py in torch, with the
         rescaled ReLUs
+
+        Args:
+            bumps (dict): number of a ReLU layer (in the order of the
+                forward pass) -> what to add to its secants
+            seen (list): if given, the pre-activations of every ReLU
+                layer are appended to it
 
         Returns:
             tuple: (profile logits (batch, output_len, tracks), log
@@ -96,6 +158,15 @@ def forward(weights, params, sequence, profile_bias=None, counts_bias=None,
     syntax = params["syntax_module_params"]
     assert motif["padding"] == syntax["padding"] == "valid"
     assert len(params["counts_head_params"]["units"]) == 1
+    layer = [0]
+
+    def relu(a):
+        bump = None if bumps is None else bumps.get(layer[0])
+        layer[0] += 1
+        if seen is not None:
+            seen.append(a.detach().numpy())
+        return _RescaledReLU.apply(a, bump)
+
     x = sequence
     n_motif = len(motif["kernel_sizes"])
     for i in range(n_motif):
@@ -132,20 +203,93 @@ def forward(weights, params, sequence, profile_bias=None, counts_bias=None,
     return profile, counts
 
 
-def explained(which, profile, counts):
+def meannormed(profile):
+    """
+        The logits of all positions of both strands minus their mean,
+        (batch, positions * tracks)
+    """
+
+    logits = profile.reshape(profile.shape[0], -1)
+    return logits - logits.mean(dim=1, keepdim=True)
+
+
+def paired_weights(logits):
+    """
+        The weights of the logits of a batch of sequences followed by
+        their references: the mean of the softmax of a sequence and of
+        its reference, (batch / 2, positions * tracks), not explained
+    """
+
+    w = torch.softmax(logits, dim=1).detach()
+    half = logits.shape[0] // 2
+    return 0.5 * (w[:half] + w[half:])
+
+
+def explained(which, profile, counts, bump=None):
     """
         The output that bpnet-shap explains, one value per row of a
         batch of sequences followed by their references
+
+        Args:
+            bump (numpy.ndarray): for the profile, what to add to the
+                weights of the logits (batch / 2, positions * tracks)
     """
 
     if which == "counts":
         return counts.sum(dim=-1)
-    logits = profile.reshape(profile.shape[0], -1)
-    logits = logits - logits.mean(dim=1, keepdim=True)
-    w = torch.softmax(logits, dim=1).detach()
-    half = logits.shape[0] // 2
-    w = 0.5 * (w[:half] + w[half:])
+    logits = meannormed(profile)
+    w = paired_weights(logits)
+    if bump is not None:
+        w = w + torch.as_tensor(bump, dtype=w.dtype)
     return (torch.cat([w, w]) * logits).sum(dim=1)
+
+
+def _pairs(sequence, references, profile_bias, counts_bias):
+    """
+        The batch of a sequence with each of the references: the
+        sequence as often as there are references, then the references;
+        the control inputs of the sequence, and zeros for the references
+    """
+
+    n = len(references)
+    x = np.concatenate([np.repeat(sequence[None], n, axis=0), references])
+    x = torch.tensor(x, dtype=torch.float64, requires_grad=True)
+    extra = {}
+    if profile_bias is not None:
+        pb = np.concatenate([np.repeat(profile_bias[None], n, axis=0),
+                             np.zeros((n,) + profile_bias.shape)])
+        cb = np.concatenate([np.repeat(counts_bias[None], n, axis=0),
+                             np.zeros((n,) + counts_bias.shape)])
+        extra = {"profile_bias": torch.tensor(pb, dtype=torch.float64),
+                 "counts_bias": torch.tensor(cb, dtype=torch.float64)}
+    return x, extra
+
+
+def _hypothetical(weights, params, which, sequence, references,
+                  profile_bias, counts_bias, bumps=None, weight_bump=None,
+                  seen=None):
+    """
+        The hypothetical contribution scores of a sequence with respect
+        to each of the references, (references, length, 4), and the
+        logits minus their mean of the batch
+    """
+
+    n = len(references)
+    x, extra = _pairs(sequence, references, profile_bias, counts_bias)
+    profile, counts = forward(weights, params, x, bumps=bumps, seen=seen,
+                              **extra)
+    target = explained(which, profile, counts, weight_bump)
+    # the multipliers of the sequence half (the target of a row depends
+    # on the reference half through the rescaled ReLUs only)
+    multipliers, = torch.autograd.grad(target[:n].sum(), x)
+    multipliers = (multipliers[:n] + multipliers[n:]).numpy()
+    hypothetical = np.zeros(multipliers.shape)
+    for base in range(sequence.shape[1]):
+        e = np.zeros(sequence.shape)
+        e[:, base] = 1.0
+        hypothetical[:, :, base] = ((e[None] - references) *
+                                    multipliers).sum(axis=-1)
+    return hypothetical, meannormed(profile).detach()
 
 
 def hypothetical_scores(weights, params, which, sequence, references,
@@ -167,27 +311,81 @@ def hypothetical_scores(weights, params, which, sequence, references,
             numpy.ndarray: (length, 4), float64
     """
 
+    hypothetical, _ = _hypothetical(weights, params, which, sequence,
+                                    references, profile_bias, counts_bias)
+    return hypothetical.mean(axis=0)
+
+
+def float32_allowance(weights, params, which, sequence, references,
+                      profile_bias=None, counts_bias=None):
+    """
+        How far the quotients that are imprecise in float32 (see the
+        top of this module) can move each hypothetical score of one
+        sequence
+
+        For every such quotient (the secant of one unit for one
+        reference, the multiplier of one logit for one reference) the
+        scores are computed again with the quotient changed by its
+        uncertainty; the scores are linear in each quotient, so that
+        the change of a score is its largest possible change from this
+        quotient. The allowance is the sum of the absolute changes.
+
+        Args:
+            as hypothetical_scores
+
+        Returns:
+            numpy.ndarray: (length, 4), float64, not negative; zero
+                where no imprecise quotient reaches
+    """
+
     n = len(references)
-    x = np.concatenate([np.repeat(sequence[None], n, axis=0), references])
-    x = torch.tensor(x, dtype=torch.float64, requires_grad=True)
-    extra = {}
-    if profile_bias is not None:
-        pb = np.concatenate([np.repeat(profile_bias[None], n, axis=0),
-                             np.zeros((n,) + profile_bias.shape)])
-        cb = np.concatenate([np.repeat(counts_bias[None], n, axis=0),
-                             np.zeros((n,) + counts_bias.shape)])
-        extra = {"profile_bias": torch.tensor(pb, dtype=torch.float64),
-                 "counts_bias": torch.tensor(cb, dtype=torch.float64)}
-    profile, counts = forward(weights, params, x, **extra)
-    target = explained(which, profile, counts)
-    # the multipliers of the sequence half (the target of a row depends
-    # on the reference half through the rescaled ReLUs only)
-    multipliers, = torch.autograd.grad(target[:n].sum(), x)
-    multipliers = (multipliers[:n] + multipliers[n:]).numpy()
-    hypothetical = np.zeros(sequence.shape)
-    for base in range(sequence.shape[1]):
-        e = np.zeros(sequence.shape)
-        e[:, base] = 1.0
-        hypothetical[:, base] = ((e[None] - references) *
-                                 multipliers).sum(axis=-1).mean(axis=0)
-    return hypothetical
+    seen = []
+    exact, logits = _hypothetical(weights, params, which, sequence,
+                                  references, profile_bias, counts_bias,
+                                  seen=seen)
+    #: (reference, ReLU layer or None for the product, index within
+    #: the layer or the logits, uncertainty of the quotient)
+    uncertain = []
+    for layer, a in enumerate(seen):
+        a_x, a_r = a[:n], a[n:]
+        delta = np.abs(a_x - a_r)
+        noise = RELU_NOISE * np.abs(a).max()
+        # the secant is 0 or 1 whatever the rounding when both are well
+        # on one side of zero
+        at_risk = (delta > 0) & (
+            ((a_x > 0) != (a_r > 0)) |
+            (np.minimum(np.abs(a_x), np.abs(a_r)) < noise))
+        with np.errstate(divide="ignore"):
+            share = np.minimum(1.0, 2.0 * noise / delta)
+        for index in zip(*np.nonzero(at_risk & (share > SMALLEST_RELU))):
+            uncertain.append((index[0], layer, index[1:], share[index]))
+    if which == "profile":
+        mean_weights = paired_weights(logits).numpy()
+        l_x, l_r = logits[:n].numpy(), logits[n:].numpy()
+        delta = np.abs(l_x - l_r)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            share = np.minimum(2.0, PRODUCT_NOISE *
+                               (np.abs(l_x) + np.abs(l_r)) / delta)
+        share[delta < COINCIDE] = 2.0
+        for index in zip(*np.nonzero(share > SMALLEST_PRODUCT)):
+            uncertain.append((index[0], None, index[1:],
+                              share[index] * mean_weights[index]))
+    if not uncertain:
+        return np.zeros(sequence.shape)
+
+    # one pair of the sequence and the reference for every uncertain
+    # quotient, with this quotient changed
+    of = np.array([entry[0] for entry in uncertain])
+    bumps = {layer: np.zeros((len(uncertain),) + a.shape[1:])
+             for layer, a in enumerate(seen)}
+    weight_bump = np.zeros((len(uncertain), logits.shape[1]))
+    for row, (_, layer, index, size) in enumerate(uncertain):
+        if layer is None:
+            weight_bump[(row,) + tuple(index)] = size
+        else:
+            bumps[layer][(row,) + tuple(index)] = size
+    changed, _ = _hypothetical(
+        weights, params, which, sequence, references[of], profile_bias,
+        counts_bias, bumps=bumps,
+        weight_bump=weight_bump if which == "profile" else None)
+    return np.abs(changed - exact[of]).sum(axis=0) / n

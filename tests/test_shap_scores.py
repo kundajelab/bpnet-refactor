@@ -312,11 +312,12 @@ def test_hypothetical_scores_of_every_base(with_control, without_control,
         three that are not in the sequence (TF-MoDISco reads them), are
         those of DeepLIFT with the rescale rule as computed here
         independently (tests/reference_deeplift.py), to the float16
-        rounding of the files. Six peaks of each model are checked.
-        The independent computation is written in PyTorch: the test is
-        skipped where PyTorch is not installed. (The references are
-        made with the shuffling of the package: what is checked is the
-        attribution given the references, not the shuffling.)
+        rounding of the files and the float32 arithmetic of the
+        explainer. Six peaks of each model are checked. The independent
+        computation is written in PyTorch: the test is skipped where
+        PyTorch is not installed. (The references are made with the
+        shuffling of the package: what is checked is the attribution
+        given the references, not the shuffling.)
     """
 
     torch = pytest.importorskip("torch")
@@ -326,6 +327,7 @@ def test_hypothetical_scores_of_every_base(with_control, without_control,
     d = run["dataset"]
     scores = run["scores"][which]
     weights = weights_by_layer_name(run["model"])
+    allowances = []
     for i in range(6):
         sequence = scores["input_seqs"][i].astype(np.float64)
         references = np.asarray(dinuc_shuffle(
@@ -338,34 +340,30 @@ def test_hypothetical_scores_of_every_base(with_control, without_control,
                      "counts_bias": counts_bias}
         ours = reference_deeplift.hypothetical_scores(
             weights, d["params"], which, sequence, references, **extra)
+        allowance = reference_deeplift.float32_allowance(
+            weights, d["params"], which, sequence, references, **extra)
         stored = scores["hyp_scores"][i].astype(np.float64)
-        assert_scores_of_every_base(stored, ours, i)
+        scale = np.abs(ours).max()
+        beyond = (np.abs(stored - ours) - float16_bound(ours) -
+                  allowance) / scale
+        assert beyond.max() <= TIGHT, (i, beyond.max())
+        allowances.append(allowance / scale)
         # the bases that are not there have scores of their own
-        assert np.abs(ours[sequence == 0]).max() > 0.1 * np.abs(ours).max()
+        assert np.abs(ours[sequence == 0]).max() > 0.1 * scale
+    # the allowance is small where no quotient is imprecise: most
+    # scores are checked to little more than the rounding of the file
+    assert np.median(allowances) <= TIGHT, np.median(allowances)
 
 
-#: Beyond the float16 rounding, the scores of bpnet-shap carry the
-#: float32 arithmetic of TensorFlow. For nearly all scores that is
-#: below 1e-6 of the largest score of the peak (TIGHT allows 1e-5).
-#: For the profile output a few scores of a peak can be further off:
-#: in 14 runs of this test with freshly trained models (168 peaks), 5
-#: peaks had scores beyond TIGHT, by at most 7e-5 of the largest score
-#: of the peak; in the two of them that were looked at, 1.1% and 0.3%
-#: of the scores of the peak. (The likely cause, not established: for
-#: the product of weights and logits the explainer divides by the
-#: change of each logit between the sequence and a reference, which is
-#: inaccurate in float32 where a logit hardly changes.) So nearly all
-#: scores must be within TIGHT, and every score within LOOSE.
-TIGHT, LOOSE, NEARLY_ALL = 1e-5, 1e-3, 0.95
-
-
-def assert_scores_of_every_base(stored, expected, peak):
-    scale = np.abs(expected).max()
-    difference = np.abs(stored - expected)
-    within = difference <= float16_bound(expected) + TIGHT * scale
-    assert within.mean() >= NEARLY_ALL, (peak, within.mean())
-    beyond = (difference - float16_bound(expected)).max() / scale
-    assert beyond <= LOOSE, (peak, beyond)
+#: Beyond the float16 rounding of the files, the scores of bpnet-shap
+#: carry the float32 arithmetic of its explainer. Two of its steps are
+#: quotients of differences that are imprecise where the difference is
+#: small (see tests/reference_deeplift.py); float32_allowance() there
+#: computes how far they can move each score of a peak. What is left
+#: after the rounding and this allowance must be below TIGHT, as a
+#: share of the largest score of the peak. (In 576 peaks of 24 runs
+#: with freshly trained models it was below 2e-7.)
+TIGHT = 1e-5
 
 
 def run_shap_cli(d, model, out_dir, input_data=None):
