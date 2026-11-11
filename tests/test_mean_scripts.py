@@ -575,30 +575,32 @@ def test_regions_that_overlap_each_other(tmp_path, monkeypatch, width):
     assert code == 0, output[-3000:]
     found, stored = regions_of_the_mean_file(out)
     assert found["pred_prof"].shape == (4, width, 2)
-    expected = expected_tracks(stored, found["pred_prof"][:, :, 1], sizes,
-                               width=width)
-    # the borders, said outright: 100 + (centre of 100 and of 103) ...
+    # the borders, said outright: the middle between the centres of
+    # the regions at 100 and 103, and of those at 103 and 106
     first = ((200 + width) // 2 + (206 + width) // 2) // 2
     second = ((206 + width) // 2 + (212 + width) // 2) // 2
     assert (first, second) == ((106, 109) if width == 10 else (105, 108))
     rows = {start: stored.index(("chr1", start)) for start in (100, 103, 106)}
-    profile = found["pred_prof"][:, :, 1]
-    by_hand = np.concatenate([
-        profile[rows[100], :first - 100],
-        profile[rows[103], first - 103:second - 103],
-        profile[rows[106], second - 106:]])
-    assert np.array_equal(expected["chr1"][100:106 + width], by_hand)
-    bw = pyBigWig.open(str(out / "mean_predictions_minus.bw"))
-    try:
-        for name, size in sizes:
-            values = np.array(bw.values(name, 0, size), dtype=np.float64)
-            there = ~np.isnan(expected[name])
-            assert np.array_equal(~np.isnan(values), there), name
-            np.testing.assert_allclose(values[there], expected[name][there],
-                                       rtol=1e-6, err_msg=name)
-    finally:
-        bw.close()
-    assert (~np.isnan(expected["chr1"])).sum() == 6 + width
+    for column, strand in enumerate(("plus", "minus")):
+        profile = found["pred_prof"][:, :, column]
+        expected = expected_tracks(stored, profile, sizes, width=width)
+        by_hand = np.concatenate([
+            profile[rows[100], :first - 100],
+            profile[rows[103], first - 103:second - 103],
+            profile[rows[106], second - 106:]])
+        assert np.array_equal(expected["chr1"][100:106 + width], by_hand)
+        assert (~np.isnan(expected["chr1"])).sum() == 6 + width
+        bw = pyBigWig.open(str(out / "mean_predictions_{}.bw".format(strand)))
+        try:
+            for name, size in sizes:
+                values = np.array(bw.values(name, 0, size), dtype=np.float64)
+                there = ~np.isnan(expected[name])
+                assert np.array_equal(~np.isnan(values), there), name
+                np.testing.assert_allclose(
+                    values[there], expected[name][there], rtol=1e-6,
+                    err_msg=name)
+        finally:
+            bw.close()
 
 
 def test_prediction_folds_with_other_regions_give_no_file_today(tmp_path):
