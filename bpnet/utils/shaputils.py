@@ -1,9 +1,9 @@
 ## Av's code with a bit of reformatting
 
 import numpy as np
-import tensorflow as tf
 
-# from deeplift.dinuc_shuffle import dinuc_shuffle
+# (TensorFlow is imported where it is needed: the shuffles are also
+# used where it is not installed)
 
 def combine_mult_and_diffref(mult, orig_inp, bg_data):
     to_return = []
@@ -82,10 +82,90 @@ def char_array_to_string(arr):
     Converts a NumPy array of byte-long ASCII codes into an ASCII string.
     e.g. [65, 67, 71, 84] becomes "ACGT".
     """
-    return arr.tostring().decode("ascii")
+    return arr.tobytes().decode("ascii")
 
 
-def dinuc_shuffle(seq, num_shufs, rng=None):
+def _walk(tokens, successors):
+    """
+        The tokens in the order of a walk over the positions: from
+        the first position, and from a position with token t to the
+        position that comes next in the list of successors of t (each
+        entry of a list is used once, in order)
+
+        Args:
+            tokens (numpy.ndarray): the token of every position
+            successors (list): for every token, the positions that
+                follow a position with this token, in the order the
+                walk is to take them
+
+        Returns:
+            numpy.ndarray: the tokens of the positions in the order
+                they are visited
+    """
+
+    tokens_list = tokens.tolist()
+    following = [iter(inds.tolist()) for inds in successors]
+    order = [0] * len(tokens_list)
+    ind = 0
+    for j in range(1, len(tokens_list)):
+        ind = next(following[tokens_list[ind]])
+        order[j] = ind
+    return tokens[order]
+
+
+#: the walk compiled by numba, once it has been asked for: [None] if
+#: numba is not installed or could not compile it
+_COMPILED_WALK = []
+
+
+def _compiled_walk():
+    """
+        The walk as a function compiled by numba (same arguments and
+        result as _walk), None where numba is not available
+    """
+
+    if _COMPILED_WALK:
+        return _COMPILED_WALK[0]
+    try:
+        import numba
+
+        @numba.njit
+        def visit(tokens, flat, counters, order):
+            ind = 0
+            for j in range(1, tokens.shape[0]):
+                t = tokens[ind]
+                ind = flat[counters[t]]
+                counters[t] += 1
+                order[j] = ind
+
+        def walk(tokens, successors):
+            # the lists of successors one after the other, and where
+            # the list of each token starts
+            flat = np.concatenate(successors).astype(np.int64)
+            counters = np.zeros(len(successors), dtype=np.int64)
+            counters[1:] = np.cumsum(
+                [len(inds) for inds in successors])[:-1]
+            order = np.zeros(len(tokens), dtype=np.int64)
+            visit(np.ascontiguousarray(tokens, dtype=np.int64), flat,
+                  counters, order)
+            return tokens[order]
+
+        # compile now: a failure is found here, not in a shuffle
+        walk(np.array([0, 1, 0]), [np.array([1]), np.array([2])])
+    except Exception:
+        walk = None
+    _COMPILED_WALK.append(walk)
+    return walk
+
+
+#: from this many positions to walk in one call on, the walk is done
+#: by the compiled function where numba is installed (compiling takes
+#: about half a second once per process; below, the walk in Python is
+#: used, which gives the same result)
+COMPILED_FROM = 20000
+
+
+def dinuc_shuffle(seq, num_shufs, rng=None, compiled=None):
     """
     Creates shuffles of the given sequence, in which dinucleotide frequencies
     are preserved.
@@ -94,10 +174,19 @@ def dinuc_shuffle(seq, num_shufs, rng=None):
             encodings
         `num_shufs`: the number of shuffles to create, N
         `rng`: a NumPy RandomState object, to use for performing shuffles
+        `compiled`: whether the walk over the positions is done by a
+            function compiled with numba (True, False; None: where
+            numba is installed, when N * L is at least COMPILED_FROM).
+            The shuffles do not depend on it.
     If `seq` is a string, returns a list of N strings of length L, each one
     being a shuffled version of `seq`. If `seq` is a 2D NumPy array, then the
     result is an N x L x D NumPy array of shuffled versions of `seq`, also
     one-hot encoded.
+
+    The shuffles of a sequence are those of the implementation this
+    function had before it was made faster, for the same `rng` (the
+    same random numbers are drawn in the same order; only the walk
+    that builds a shuffle from them is done differently).
     """
 
     if type(seq) is str:
@@ -131,24 +220,25 @@ def dinuc_shuffle(seq, num_shufs, rng=None):
             (num_shufs, seq_len, one_hot_dim), dtype=seq.dtype
         )
 
+    walk = _walk
+    if compiled or (compiled is None and
+                    num_shufs * len(tokens) >= COMPILED_FROM):
+        walk = _compiled_walk() or _walk
+
     for i in range(num_shufs):
+        if len(tokens) == 0:
+            # (as before: an empty sequence has no first position)
+            raise IndexError(
+                "index 0 is out of bounds for axis 0 with size 0")
+
         # Shuffle the next indices
         for t in range(len(chars)):
             inds = np.arange(len(shuf_next_inds[t]))
             inds[:-1] = rng.permutation(len(inds) - 1)  # Keep last index same
             shuf_next_inds[t] = shuf_next_inds[t][inds]
 
-        counters = [0] * len(chars)
-       
         # Build the resulting array
-        ind = 0
-        result = np.empty_like(tokens)
-        result[0] = tokens[ind]
-        for j in range(1, len(tokens)):
-            t = tokens[ind]
-            ind = shuf_next_inds[t][counters[t]]
-            counters[t] += 1
-            result[j] = tokens[ind]
+        result = walk(tokens, shuf_next_inds)
 
         if type(seq) is str:
             all_results.append(char_array_to_string(chars[result]))
@@ -180,6 +270,8 @@ def get_weightedsum_meannormed_logits(model, task_id,
     # Reshaping is done to be compatible with the single multinomial
     
         
+    import tensorflow as tf
+
     if orig_multi_loss:
         meannormed_logits = \
             (model.outputs[0][:, :, start_idx:end_idx] - \
