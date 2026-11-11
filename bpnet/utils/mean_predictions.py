@@ -5,6 +5,7 @@ import argparse
 import gc
 import pyBigWig
 import os
+import sys
 
 parser = argparse.ArgumentParser(description="Take a mean of prediction h5s and save the outputs as both hdf5 format and bigwigs. PROVIDE ABSOLUTE PATHS!")
 
@@ -28,90 +29,112 @@ def mean_predictions(predictions_list,h5_out_path):
     chrom_lst=[]
     start_lst=[]
     end_lst=[]
+    # the files that were read
+    read=[]
     for predictions_h5 in predictions_list:
         try:
-            f = h5py.File(predictions_h5, 'r')
-            coord_chrom = f['coords']['coords_chrom'][()]
-            coord_start = f['coords']['coords_start'][()]
-            coord_end = f['coords']['coords_end'][()]
-            order = np.argsort([str(coord_chrom[i])+"_"+str(coord_start[i])+"_"+str(coord_end[i]) for i in range(f['coords']['coords_chrom'][()].shape[0])])
-            pred_logcounts = f['predictions']['pred_logcounts'][()][order]
-            pred_logcounts_lst.append(pred_logcounts)
-            chrom_lst.append(coord_chrom[order])
-            start_lst.append(coord_start[order])
-            end_lst.append(coord_end[order])
+            # everything of a fold or nothing of it: a file that
+            # cannot be read whole is left out whole
+            with h5py.File(predictions_h5, 'r') as f:
+                coord_chrom = f['coords']['coords_chrom'][()]
+                coord_start = f['coords']['coords_start'][()]
+                coord_end = f['coords']['coords_end'][()]
+                pred_logcounts = f['predictions']['pred_logcounts'][()]
+                pred_prof = f['predictions']['pred_profs'][()]
+            order = np.argsort([str(coord_chrom[i])+"_"+str(coord_start[i])+"_"+str(coord_end[i]) for i in range(coord_chrom.shape[0])])
+            pred_logcounts = pred_logcounts[order]
+            pred_prof = pred_prof[order]
+        except Exception as error:
+            print(f'{predictions_h5} has problems or does not exist '
+                  f'({type(error).__name__}: {error})')
+            continue
 
-            pred_prof = f['predictions']['pred_profs'][()][order]
-            pred_profs_lst.append(pred_prof)
+        if np.any(pred_prof<=0) or np.any(pred_logcounts<=0):
+            # (said, and the file is used all the same, as it always
+            # was: a log count below zero is a count below one)
+            print(f'{predictions_h5} has profile values or log counts '
+                  f'that are not above zero')
 
-            pred_prof_sum = np.sum(pred_prof, axis=(1, 2), keepdims=True)
-            pred_prob = pred_prof/pred_prof_sum
+        read.append(predictions_h5)
+        pred_logcounts_lst.append(pred_logcounts)
+        chrom_lst.append(coord_chrom[order])
+        start_lst.append(coord_start[order])
+        end_lst.append(coord_end[order])
+        pred_profs_lst.append(pred_prof)
 
-            log_pred_prob = np.log(pred_prob)
-            log_pred_prob_lst.append(log_pred_prob)
+        pred_prof_sum = np.sum(pred_prof, axis=(1, 2), keepdims=True)
+        pred_prob = pred_prof/pred_prof_sum
 
-            pred_logcounts_both_st = np.log(pred_prof_sum)
-            pred_logcounts_both_st_lst.append(pred_logcounts_both_st)
-            
-            if np.any(pred_prof<=0) or np.any(pred_logcounts<=0):
-                raise ValueError(f'pred_prof or pred_logcounts less than or equal zero for {predictions_h5}')
-                
-            f.close()
-        except:
-            print(f'{predictions_h5} has problems or does not exist')
-            
-    if(sum([all(all(element == chrom_lst[0]) for element in chrom_lst),
-all(all(element == start_lst[0]) for element in start_lst),
-all(all(element == end_lst[0]) for element in end_lst)])==3):
+        log_pred_prob = np.log(pred_prob)
+        log_pred_prob_lst.append(log_pred_prob)
 
-        pred_logcounts_both_st_mean = np.nanmean(np.array(pred_logcounts_both_st_lst),axis=0)
+        pred_logcounts_both_st = np.log(pred_prof_sum)
+        pred_logcounts_both_st_lst.append(pred_logcounts_both_st)
 
-        num_examples = pred_logcounts_both_st_mean.shape[0]
+    if not read:
+        sys.exit(f'None of the prediction files could be read '
+                 f'({",".join(predictions_list)}): {h5_out_path} is not '
+                 f'written')
 
-        log_pred_prob_mean = np.nanmean(np.array(log_pred_prob_lst),axis=0)
+    # the folds must be of the same regions
+    for what, values in (('chromosomes', chrom_lst), ('starts', start_lst),
+                         ('ends', end_lst),
+                         ('numbers of predictions',
+                          [np.array(profiles.shape) for profiles in
+                           pred_profs_lst])):
+        for predictions_h5, value in zip(read[1:], values[1:]):
+            if not np.array_equal(value, values[0]):
+                sys.exit(f'{predictions_h5} and {read[0]} do not have the '
+                         f'same {what}: {h5_out_path} is not written')
 
-        exp_log_pred_prob_mean = np.exp(log_pred_prob_mean)
+    pred_logcounts_both_st_mean = np.nanmean(np.array(pred_logcounts_both_st_lst),axis=0)
 
-        exp_log_pred_prob_mean = exp_log_pred_prob_mean/np.sum(exp_log_pred_prob_mean, axis=(1, 2), keepdims=True)
+    num_examples = pred_logcounts_both_st_mean.shape[0]
 
-        pred_prof_mean = exp_log_pred_prob_mean * np.exp(pred_logcounts_both_st_mean)
+    log_pred_prob_mean = np.nanmean(np.array(log_pred_prob_lst),axis=0)
 
-        pred_logcounts_mean = np.log(np.sum(pred_prof_mean,axis=1))
+    exp_log_pred_prob_mean = np.exp(log_pred_prob_mean)
+
+    exp_log_pred_prob_mean = exp_log_pred_prob_mean/np.sum(exp_log_pred_prob_mean, axis=(1, 2), keepdims=True)
+
+    pred_prof_mean = exp_log_pred_prob_mean * np.exp(pred_logcounts_both_st_mean)
+
+    pred_logcounts_mean = np.log(np.sum(pred_prof_mean,axis=1))
 
 
-        f = h5py.File(h5_out_path, "w")
+    f = h5py.File(h5_out_path, "w")
 
-        coords_chrom_dset = f.create_dataset(
-            "coords_chrom", (num_examples,),
-            dtype=h5py.string_dtype(encoding="ascii")
-        )
-        coords_chrom_dset[:] = chrom_lst[0]
+    coords_chrom_dset = f.create_dataset(
+        "coords_chrom", (num_examples,),
+        dtype=h5py.string_dtype(encoding="ascii")
+    )
+    coords_chrom_dset[:] = chrom_lst[0]
 
-        coords_start_dset = f.create_dataset(
-            "coords_start", (num_examples,), dtype=int
-        )
-        coords_start_dset[:] = start_lst[0]
+    coords_start_dset = f.create_dataset(
+        "coords_start", (num_examples,), dtype=int
+    )
+    coords_start_dset[:] = start_lst[0]
 
-        coords_end_dset = f.create_dataset(
-            "coords_end", (num_examples,), dtype=int
-        )
-        coords_end_dset[:] = end_lst[0]
+    coords_end_dset = f.create_dataset(
+        "coords_end", (num_examples,), dtype=int
+    )
+    coords_end_dset[:] = end_lst[0]
 
-        pred_logcounts_dset = f.create_dataset(
-            "pred_logcounts", (num_examples, pred_logcounts_mean.shape[1]), dtype="f4"
-        )
-        pred_logcounts_dset[:, :] = pred_logcounts_mean
+    pred_logcounts_dset = f.create_dataset(
+        "pred_logcounts", (num_examples, pred_logcounts_mean.shape[1]), dtype="f4"
+    )
+    pred_logcounts_dset[:, :] = pred_logcounts_mean
 
-        pred_prof_dset = f.create_dataset(
-            "pred_prof", (num_examples, pred_prof_mean.shape[1], pred_prof_mean.shape[2]), dtype="f4"
-        )
-        pred_prof_dset[:, :, :] = pred_prof_mean
+    pred_prof_dset = f.create_dataset(
+        "pred_prof", (num_examples, pred_prof_mean.shape[1], pred_prof_mean.shape[2]), dtype="f4"
+    )
+    pred_prof_dset[:, :, :] = pred_prof_mean
 
-        f.close()
+    f.close()
 
-        del(log_pred_prob_mean,pred_prof_mean, exp_log_pred_prob_mean, pred_logcounts_mean,pred_logcounts_both_st_mean, chrom_lst,start_lst,end_lst,pred_logcounts_lst,pred_logcounts_both_st_lst,pred_profs_lst,log_pred_prob_lst)
+    del(log_pred_prob_mean,pred_prof_mean, exp_log_pred_prob_mean, pred_logcounts_mean,pred_logcounts_both_st_mean, chrom_lst,start_lst,end_lst,pred_logcounts_lst,pred_logcounts_both_st_lst,pred_profs_lst,log_pred_prob_lst)
 
-        gc.collect()
+    gc.collect()
 
 mean_predictions((args.prediction_h5s).split(","),f"{args.output_dir}/mean_predictions.h5")
 
