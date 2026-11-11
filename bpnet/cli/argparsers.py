@@ -361,6 +361,27 @@ def shap_scores_argsparser():
                     "be generated")
     parser.add_argument('--chrom-sizes', '-s', type=str,default=None, 
                         help="path to chromosome sizes file. if --generate-shap-bigWigs is True then chrom-sizes file need to provided to generate the shap bigwigs. Otherwise the --generate-shap-bigWigs option is ignored.")
+
+    # how the scores are computed
+    parser.add_argument('--backend', type=str,
+                        choices=["tensorflow", "pytorch"],
+                        default="tensorflow",
+                        help="what computes the scores: 'tensorflow' (the "
+                        "shap fork on the keras model) or 'pytorch' "
+                        "(tangermeme's DeepSHAP on the PyTorch model of "
+                        "the same saved model, for the same outputs and "
+                        "references; for models with two profile tracks "
+                        "whose activations are ReLU; needs PyTorch and "
+                        "tangermeme, not TensorFlow)")
+
+    parser.add_argument('--device', type=str, default=None,
+                        help="--backend pytorch: the device to compute "
+                        "on, a CUDA GPU or the CPU, for example cuda:0 or "
+                        "cpu (default: a GPU when there is one)")
+
+    parser.add_argument('--batch-size', type=int, default=128,
+                        help="--backend pytorch: pairs of a sequence and "
+                        "a reference per forward pass")
         
     return parser
 
