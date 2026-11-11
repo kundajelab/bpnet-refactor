@@ -332,11 +332,15 @@ def relu_uncertainty(a_x, a_r, largest):
         The multiplier is the secant (relu(a_x) - relu(a_r)) / (a_x -
         a_r), or the gradient of the ReLU at a_x when the two are
         closer than NEAR. With both pre-activations well on one side
-        of zero it is 0 or 1 whatever the rounding. Otherwise the
-        secant moves by about (the uncertainty of the difference) /
-        (the difference); and where rounding can decide between the
-        secant and the gradient, or the sign that the gradient goes
-        by, the multiplier may be anything from 0 to 1.
+        of zero it is 0 or 1 whatever the rounding, and so is the
+        gradient where a_x is well away from zero and the pair surely
+        closer than NEAR. Otherwise: a secant moves by about (the
+        uncertainty of the difference) / (the difference); and where
+        rounding can decide between the secant and the gradient, or
+        the sign that the gradient goes by, the multiplier may be
+        anything from 0 to 1. (Two pre-activations that are exactly
+        zero here need not be zero in float32: they are not taken as
+        settled.)
 
         Args:
             a_x, a_r (numpy.ndarray): pre-activations of the sequence
@@ -353,12 +357,16 @@ def relu_uncertainty(a_x, a_r, largest):
     # how far the difference of a pair may be off
     off = 2.0 * RELU_NOISE * largest + \
         2.0 ** -20 * (np.abs(a_x) + np.abs(a_r))
-    settled = ((a_x > off) & (a_r > off)) | ((a_x < -off) & (a_r < -off)) | \
-        ((a_x == 0) & (a_r == 0))
+    # the secant for sure, the gradient for sure, or either
+    secant = delta >= NEAR + off
+    gradient = delta <= NEAR - off
     with np.errstate(divide="ignore", invalid="ignore"):
-        share = np.minimum(1.0, off / delta)
-    share[delta < NEAR + off] = 1.0
-    share[settled] = 0.0
+        share = np.where(secant, np.minimum(1.0, off / delta), 1.0)
+    # both well on one side: the secant and the gradient are the same
+    # 0 or 1
+    share[((a_x > off) & (a_r > off)) | ((a_x < -off) & (a_r < -off))] = 0.0
+    # the gradient, at a sequence that is well away from zero
+    share[gradient & (np.abs(a_x) > off)] = 0.0
     return share
 
 
@@ -401,9 +409,10 @@ def float32_allowance(weights, params, which, sequence, references,
         mean_weights = paired_weights(logits).numpy()
         l_x, l_r = logits[:n].numpy(), logits[n:].numpy()
         delta = np.abs(l_x - l_r)
-        # (the quotient is not used below 1e-7)
+        # (the quotient is not used below 1e-7: no difference smaller
+        # than that divides)
         share = PRODUCT_NOISE * (np.abs(l_x) + np.abs(l_r)) / \
-            np.maximum(delta, 5e-8)
+            np.maximum(delta, 1e-7)
         # replaced by zero, or not: the whole multiplier, with room
         share[delta < COINCIDE] = np.maximum(share[delta < COINCIDE], 2.0)
         for index in zip(*np.nonzero(share > SMALLEST_PRODUCT)):

@@ -411,8 +411,7 @@ def test_reference_knows_where_float32_decides_the_branch():
     noise = 2.0 * rd.RELU_NOISE * largest
     assert 1e-6 < noise < 3e-6
     # both on one side: 0 or 1 whatever the rounding
-    for a_x, a_r in ((0.5, 0.3), (0.3, 0.5), (-0.5, -0.3), (1e-4, 2e-4),
-                     (0.0, 0.0)):
+    for a_x, a_r in ((0.5, 0.3), (0.3, 0.5), (-0.5, -0.3), (1e-4, 2e-4)):
         assert uncertainty(a_x, a_r, largest) == 0.0
     # on both sides, apart: the secant moves a little
     for a_x, a_r in ((0.3, -0.1), (-0.1, 0.3), (1e-4, -1e-4), (0.02, -0.03)):
@@ -428,6 +427,10 @@ def test_reference_knows_where_float32_decides_the_branch():
     for a_x, a_r in ((5e-7, -5e-7), (4e-7, -4e-7), (1e-7, 1.2e-7),
                      (1.5e-6, -1e-6), (0.0, 1e-8), (1e-8, 0.0)):
         assert uncertainty(a_x, a_r, largest) == 1.0
+    # two zeros: sums that cancel here need not cancel in float32,
+    # where the gradient then goes by the sign of what is left
+    assert uncertainty(0.0, 0.0, largest) == 1.0
+    assert uncertainty(0.0, 0.0, 1e-7) == 1.0
 
     # in a layer of small numbers the rounding is small too, and still
     # a pair that is as far apart as the number the explainer compares
@@ -437,6 +440,15 @@ def test_reference_knows_where_float32_decides_the_branch():
     half = float(np.float32(5e-7))
     assert uncertainty(half, -half, half) == 1.0
     assert uncertainty(4 * half, -4 * half, 4 * half) < 1e-5
+    # and a pair that is closer than that number for sure, with a
+    # sequence that is not at zero, gets the gradient for sure: 1 on
+    # the positive side, 0 on the other
+    assert uncertainty(1e-7, -1e-7, 1e-7) == 0.0
+    assert uncertainty(-1e-7, 1e-7, 1e-7) == 0.0
+    assert uncertainty(1e-7, 1.5e-7, 1e-7) == 0.0
+    # (not when the sequence itself is at zero)
+    assert uncertainty(0.0, 1e-7, 1e-7) == 1.0
+    assert uncertainty(1e-14, -1e-7, 1e-7) == 1.0
     # an array of any shape
     shares = rd.relu_uncertainty(np.full((2, 3, 4), 0.3),
                                  np.full((2, 3, 4), -0.1), 2.0)
