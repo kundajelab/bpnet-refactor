@@ -20,7 +20,9 @@
     prediction (model.predict, model(x)); it holds none of the training
     settings of CustomModel.
 
-    Reading the layer graph needs neither TensorFlow nor keras.
+    Reading the layer graph and the weights needs neither TensorFlow
+    nor keras (the variables of a SavedModel are read by
+    bpnet.model.checkpoint); building the keras model does.
 """
 
 import json
@@ -237,7 +239,9 @@ def _weights_in_saved_model(path):
     """
         The variables of every layer in a SavedModel's checkpoint
 
-        The checkpoint records the objects of the model as a graph:
+        The checkpoint (read without TensorFlow, see
+        bpnet.model.checkpoint) records the objects of the model as a
+        graph:
         the model refers to its layers with weights
         ('layer_with_weights-<i>'), each of which refers to its
         variables ('kernel', 'bias'). The graph is followed from the
@@ -246,10 +250,9 @@ def _weights_in_saved_model(path):
         it had in the model ('<layer>/kernel').
     """
 
-    import tensorflow as tf
+    from bpnet.model.checkpoint import Checkpoint
 
-    reader = tf.train.load_checkpoint(
-        os.path.join(path, "variables", "variables"))
+    reader = Checkpoint(os.path.join(path, "variables", "variables"))
     object_graph = memoryview(
         reader.get_tensor("_CHECKPOINTABLE_OBJECT_GRAPH"))
 

@@ -618,8 +618,7 @@ def load_model(path):
         Args:
             path (str): a SavedModel directory, or an HDF5 file
                 written by model.save(), of any TensorFlow version.
-                (Reading the weights of a SavedModel directory needs
-                TensorFlow to be installed; an HDF5 file does not.)
+                (TensorFlow does not need to be installed.)
 
         Returns:
             Model: in evaluation mode, with the saved weights
