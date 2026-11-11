@@ -931,12 +931,14 @@ def restore(prefix, dtype):
 
 
 # the names TensorFlow has for the types in its messages, where they
-# are not the names of the types (types whose values this program
-# cannot write down, resource and variant, are left out)
+# are not the names of the types; and the types whose values this
+# program cannot write down
 TYPES = {"float": "float32", "double": "float64", "half": "float16"}
 TYPES.update({name: name for name in (
     "int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64",
-    "bool", "string", "complex64", "complex128")})
+    "bool", "string", "complex64", "complex128", "bfloat16", "qint8",
+    "quint8", "qint16", "quint16", "qint32")})
+NOT_COMPARABLE = ("variant", "resource")
 
 results = []
 for prefix, dtype, how in json.load(open(sys.argv[1])):
@@ -950,8 +952,12 @@ for prefix, dtype, how in json.load(open(sys.argv[1])):
                 # type of the entry, and is asked again for that
                 found = re.search(
                     r"does not equal original dtype (\w+)", str(error))
+                if found and found.group(1) in NOT_COMPARABLE:
+                    results.append({"not comparable": found.group(1)})
+                    continue
                 other = TYPES.get(found.group(1)) if found else None
                 if other is None or other == dtype:
+                    # (no type, or one that does not exist: a refusal)
                     raise
                 tensor = restore(prefix, other)
         except tf.errors.OpError as error:
@@ -997,7 +1003,10 @@ def tensorflow_reads(tasks, work_dir, refusals):
 
         Returns:
             list: for each task {"shape", "dtype", "values"}, or
-                {"refused": the error of TensorFlow, "message"}
+                {"refused": the error of TensorFlow, "message"}, or
+                {"not comparable": the type of the entry} for a type
+                whose values cannot be written down here (which says
+                nothing about the file)
     """
 
     tasks_path = os.path.join(work_dir, "tasks.json")
@@ -1014,8 +1023,8 @@ def tensorflow_reads(tasks, work_dir, refusals):
         results = json.load(fh)
     assert len(results) == len(tasks)
     for result in results:
-        assert ("values" in result) != (result.get("refused") in refusals), \
-            result
+        assert ("values" in result) + ("not comparable" in result) + \
+            (result.get("refused") in refusals) == 1, result
     return results
 
 
@@ -1075,6 +1084,7 @@ def test_messages_of_the_index_as_tensorflow_reads_them(tf, tmp_path):
         else:
             assert "refused" in result, where
             counts["refused by both"] += 1
+    assert not any("not comparable" in result for result in results)
     assert min(counts["the same"], counts["read by TensorFlow only"],
                counts["refused by both"]) > 10, counts
     # the readers of the TensorFlow versions these tests have run on
@@ -1130,6 +1140,9 @@ def test_random_messages_as_tensorflow_reads_them(tf, tmp_path):
             assert any(text in ours["error"]
                        for text in MAY_BE_READ_BY_TENSORFLOW), where
             counts["read by TensorFlow only"] += 1
+        elif "not comparable" in theirs:
+            # (a type this reader does not have either: it refused)
+            counts["not comparable"] += 1
         else:
             counts["refused by both"] += 1
     assert counts["the same"] > 500 and counts["refused by both"] > 2000, \
