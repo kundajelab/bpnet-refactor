@@ -72,7 +72,7 @@ from bpnet.generators import windows
 from bpnet.utils.exceptionhandler import NoTracebackException
 from bpnet.utils.misc import gaussian1D_smoothing
 from contextlib import contextmanager
-from queue import Empty, Queue
+from queue import Empty, Full, Queue
 from threading import RLock, Thread
 import time
 import traceback
@@ -99,9 +99,37 @@ class WorkerFailure(object):
 #: delivered a batch is still running
 WORKER_POLL_SECONDS = 1.0
 
+#: seconds between two looks of a thread that collects batches, and 
+#: waits for room in the queue of the consumer, at whether the epoch 
+#: was stopped. A stop waits for these threads (with unbounded queues 
+#: they never waited for room): with WORKER_POLL_SECONDS an 
+#: interrupted or failed training could end up to a second later.
+COLLECTOR_POLL_SECONDS = 0.1
+
 #: seconds the worker processes of an epoch get to end after they were 
 #: asked to, before they are killed
 WORKER_STOP_SECONDS = 10.0
+
+#: number of batches a worker may have handed over that have not been 
+#: collected yet. A worker that has that many waits before it makes 
+#: the next one, instead of filling its memory with batches.
+WORKER_QUEUE_BATCHES = 2
+
+
+def consumer_queue_batches(workers):
+    """
+        Number of collected batches that may wait for the consumer. 
+        The threads that collect the batches of the workers wait 
+        when that many are there; then the workers wait too.
+        
+        Args:
+            workers (int): number of worker processes
+            
+        Returns:
+            int: between 2 and 8
+    """
+    
+    return max(2, min(8, 2 * workers))
 
 
 class Epoch(object):
@@ -130,6 +158,10 @@ class Epoch(object):
         self.stopped = False
         #: held while the workers of the epoch are being stopped
         self.lock = RLock()
+        #: what tells the workers whether their consumer is still 
+        #: there (see Consumer): its process id and the time it was 
+        #: started
+        self.consumer = process_identity()
 
 
 #: the epochs that are under way in this process, and the lock for 
@@ -209,6 +241,128 @@ def close_reading_end(mpq):
         return False
     reader.close()
     return True
+
+
+def process_start(pid):
+    """
+        When a process was started, as the kernel records it (clock 
+        ticks since the system was started). With the process id it 
+        tells a process from a later one that was given the same id: 
+        the two would have to be started within the same tick to be 
+        taken for each other.
+        
+        Args:
+            pid (int): process id
+        
+        Returns:
+            int: the start time, or None if the process has ended 
+                and only waits to be collected by its parent
+        
+        Raises:
+            OSError, ValueError, IndexError: when that cannot be 
+                told: there is no /proc (NotADirectoryError), or 
+                /proc has no entry for the process 
+                (FileNotFoundError: there is no such process, or it 
+                is hidden from this one)
+    """
+    
+    if not os.path.isdir("/proc/self"):
+        raise NotADirectoryError("/proc")
+    with open("/proc/{}/stat".format(pid), "rb") as stat:
+        fields = stat.read()
+    # "pid (name) state parent ...": the name may hold anything, 
+    # also spaces, parentheses and line ends
+    fields = fields.rsplit(b")", 1)[1].split()
+    if fields[0] in (b"Z", b"X"):
+        return None
+    return int(fields[19])
+
+
+def process_identity():
+    """
+        Returns:
+            tuple: (id of this process, its start time or None where 
+                that cannot be told)
+    """
+    
+    try:
+        started = process_start(os.getpid())
+    except (OSError, ValueError, IndexError):
+        started = None
+    return os.getpid(), started
+
+
+class Consumer(object):
+    """
+        In a worker process: the process that takes its batches, and 
+        whether it is still there
+        
+        A worker whose consumer was killed (out of memory, by a 
+        scheduler) makes batches for nobody, and can wait forever 
+        for room in its queue. It finds out in these ways:
+        
+        - its parent process is no longer the one that started it. 
+          With the "fork" and "spawn" start methods of 
+          multiprocessing the parent is the consumer.
+        - there is no process with the id of the consumer any more;
+        - the process with that id has ended and waits to be 
+          collected, or was started at another time than the 
+          consumer (it is a later process with the same id). 
+        
+        The last two also work with the "forkserver" start method, 
+        where the parent of a worker is the fork server, which 
+        outlives the consumer. Nothing here depends on what a 
+        process inherits when it is forked: a process that was 
+        forked from the consumer is another process.
+        
+        When in doubt the consumer counts as there: a worker that 
+        ends is reported by its consumer as a failure. The third way 
+        needs the entry of the consumer in /proc. Without it (no 
+        /proc, or the entry is hidden from the worker) a worker 
+        started by a fork server does not notice a consumer that 
+        has ended and is not collected by its parent, or whose id 
+        was given to another process. The worker is assumed to see 
+        the same process ids as its consumer.
+        
+        Args:
+            identity (tuple): (process id of the consumer, its start 
+                time or None), see process_identity (None: only the 
+                parent process is looked at)
+    """
+    
+    def __init__(self, identity=None):
+        self.parent = os.getppid()
+        self.pid, self.started = identity or (None, None)
+    
+    def gone(self):
+        """
+            Returns:
+                bool: True if the consumer has ended
+        """
+        
+        if os.getppid() != self.parent:
+            return True
+        if self.pid is None:
+            return False
+        
+        # is there a process with that id at all?
+        try:
+            os.kill(self.pid, 0)
+        except ProcessLookupError:
+            return True
+        except OSError:
+            # (not allowed to signal it: there is one)
+            pass
+        if self.started is None:
+            return False
+        
+        # there is one: has it ended, or is it another process?
+        try:
+            return process_start(self.pid) != self.started
+        except (OSError, ValueError, IndexError):
+            # (cannot be told, now or ever: no entry in /proc does 
+            # not mean that there is no such process)
+            return False
 
 
 def stop_workers(epoch):
@@ -885,7 +1039,7 @@ class MSequenceGenerator:
         """
         raise NotImplementedError("Method not implemented.")
 
-    def _proc_target(self, coords_df, mpq, proc_idx):
+    def _proc_target(self, coords_df, mpq, proc_idx, consumer=None):
         """
             Function that will be executed in a separate process.
             Takes a dataframe of peak coordinates and parses them in 
@@ -898,13 +1052,14 @@ class MSequenceGenerator:
                 
                 mpq (multiprocessing.Queue): The multiprocessing queue
                     to hold the batches
+                
+                proc_idx (int): number of the worker
+                
+                consumer (tuple): the identity of the process that 
+                    takes the batches (see Consumer)
         """
         
-        # The process that started this one takes its batches. (With 
-        # the "forkserver" start method the parent is the fork 
-        # server, which outlives the consumer: then the check below 
-        # never finds the consumer gone, as before there was a check.)
-        consumer = os.getppid()
+        consumer = Consumer(consumer)
         close_reading_end(mpq)
         
         # divide the coordinates dataframe into batches
@@ -919,7 +1074,7 @@ class MSequenceGenerator:
                 # the process that takes the batches is gone (it was 
                 # killed, for example): nobody waits for the rest, 
                 # and what is in the queue cannot be handed over
-                if os.getppid() != consumer:
+                if consumer.gone():
                     mpq.cancel_join_thread()
                     return
                     
@@ -942,20 +1097,55 @@ class MSequenceGenerator:
                 batch = self._generate_batch(batch_df)
                 
                 # add batch to the multiprocessing queue
-                mpq.put(batch)
+                if not self._hand_over(mpq, batch, consumer):
+                    return
         
                 cnt += 1
         except Exception:
             # the consumer waits for the batches of this process: tell 
             # it that no more will come, and why, then fail as before
-            mpq.put(WorkerFailure(proc_idx, traceback.format_exc()))
+            self._hand_over(mpq, WorkerFailure(
+                proc_idx, traceback.format_exc()), consumer)
             raise
         
         logging.debug(
             "{} process {} put {} batches into mpq".format(
                 self._mode, proc_idx, cnt))
             
-    def _stealer(self, mpq, q, num_batches, thread_id, proc=None):
+    def _hand_over(self, mpq, item, consumer):
+        """
+            In a worker process: put a batch (or the notice that the 
+            worker failed) into its queue, waiting while the queue is 
+            full
+            
+            Args:
+                mpq (multiprocessing.Queue): the queue of the worker
+                
+                item: what to put
+                
+                consumer (Consumer): the process that takes the 
+                    batches
+                
+            Returns:
+                bool: False if the consumer is gone; the worker has 
+                    nothing left to do then
+        """
+        
+        while True:
+            try:
+                mpq.put(item, timeout=WORKER_POLL_SECONDS)
+                return True
+            except Full:
+                # A worker that waits here may have nothing left to 
+                # write (small batches are in the pipe at once), so 
+                # that no failing write tells it that the consumer 
+                # is gone: it has to look.
+                if consumer.gone():
+                    mpq.cancel_join_thread()
+                    return False
+
+    def _stealer(self, mpq, q, num_batches, thread_id, proc=None, 
+                 epoch=None):
         """
             Thread target function to "get" (steal) from the
             multiprocessing queue and "put" in the regular queue
@@ -965,6 +1155,10 @@ class MSequenceGenerator:
             for example when memory ran out), a WorkerFailure goes 
             into the regular queue instead of a batch and the thread 
             ends.
+            
+            The regular queue has room for a few batches. While it 
+            is full the thread waits, and with it the worker; when 
+            the epoch is stopped meanwhile, the thread ends.
 
             Args:
                 mpq (multiprocessing.Queue): The multiprocessing queue
@@ -979,6 +1173,8 @@ class MSequenceGenerator:
                 
                 proc (multiprocessing.Process): the worker process 
                     that fills the multiprocessing queue
+                
+                epoch (Epoch): the epoch the thread belongs to
 
         """
         def ended(delivered):
@@ -1010,7 +1206,14 @@ class MSequenceGenerator:
                     # batch
                     item = ended(i)
                     break
-            q.put(item)
+            while True:
+                try:
+                    q.put(item, timeout=COLLECTOR_POLL_SECONDS)
+                    break
+                except Full:
+                    if epoch is not None and epoch.stopped:
+                        # nobody takes batches any more
+                        return
             if isinstance(item, WorkerFailure):
                 return
 
@@ -1047,7 +1250,7 @@ class MSequenceGenerator:
         threads = epoch.threads
                        
         # the regular queue
-        q = Queue()    
+        q = Queue(consumer_queue_batches(self._num_threads))
 
         # to make sure we dont flood the user with warning messages
         warning_dispatched = False
@@ -1063,7 +1266,7 @@ class MSequenceGenerator:
         # spawn processes that will generate batches of data and "put"
         # into the multiprocessing queues
         for i in range(self._num_threads):
-            mpq = mp.Queue()
+            mpq = mp.Queue(WORKER_QUEUE_BATCHES)
 
             # give each process a  copy of the slice of the dataframe 
             # of positives
@@ -1083,7 +1286,8 @@ class MSequenceGenerator:
                 # spawn and start the batch generation process. It is 
                 # recorded before it is started, so that the epoch 
                 # can end it whatever happens right after the start.
-                p = mp.Process(target=self._proc_target, args=[df, mpq, i])
+                p = mp.Process(target=self._proc_target, 
+                               args=[df, mpq, i, epoch.consumer])
                 procs.append(p)
                 mp_queues.append(mpq)
                 p.start()
@@ -1127,7 +1331,7 @@ class MSequenceGenerator:
                 
                 stealerThread = Thread(
                     target=self._stealer, 
-                    args=[mp_q, q, num_batches[i], i, procs[i]])
+                    args=[mp_q, q, num_batches[i], i, procs[i], epoch])
                 stealerThread.start()
                 threads.append(stealerThread)
             else:
@@ -1157,6 +1361,9 @@ class MSequenceGenerator:
         """
         
         if not complete:
+            # no more batches are taken: the collecting threads must 
+            # not wait for room in the queue of the consumer
+            epoch.stopped = True
             stop_workers(epoch)
         
         for j, proc in enumerate(epoch.procs):

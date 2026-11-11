@@ -61,6 +61,9 @@ class Worker(generators.MBPNetSequenceGenerator):
     ready = None
     #: seconds a worker goes on after it has handed over its last batch
     lingers = 0.0
+    #: a multiprocessing.Value in which the workers count themselves
+    #: when they have made and handed over all their batches
+    done = None
     #: number of batches after which a worker waits until it is ended
     #: (None: it does not)
     parks_after = None
@@ -69,14 +72,17 @@ class Worker(generators.MBPNetSequenceGenerator):
     threads_linger = 0.0
     threads_wait = 0.0
 
-    def _proc_target(self, coords_df, mpq, proc_idx):
+    def _proc_target(self, coords_df, mpq, proc_idx, *rest):
         self._worker = proc_idx
         if self.stubborn:
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
             if self.ready is not None:
                 with self.ready.get_lock():
                     self.ready.value += 1
-        super(Worker, self)._proc_target(coords_df, mpq, proc_idx)
+        super(Worker, self)._proc_target(coords_df, mpq, proc_idx, *rest)
+        if self.done is not None:
+            with self.done.get_lock():
+                self.done.value += 1
         time.sleep(self.lingers)
 
     def _stealer(self, *args):
@@ -918,6 +924,7 @@ def test_stop_in_a_forked_process_leaves_the_parents_epoch_alone(
 
 def holds_an_epoch(generator, queue):
     os.setsid()
+    multiprocessing.set_start_method(generator.start_method, force=True)
     batches = generator.gen()
     next(batches)
     queue.put([child.pid for child in multiprocessing.active_children()])
@@ -937,13 +944,30 @@ def ended(pid):
         return True
 
 
+def kill_with_its_session(process, others=()):
+    """
+        Kill a process that has a session of its own with everything
+        it started, and the processes `others` (ids) in any case
+    """
+
+    for pid in [-process.pid] + list(others):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    process.join()
+
+
 @pytest.mark.skipif(not os.path.isdir("/proc/self"),
                     reason="needs /proc to look at other processes")
-def test_workers_end_when_their_consumer_is_gone(synth_dataset):
+@pytest.mark.parametrize("method", ["fork", "forkserver", "spawn"])
+def test_workers_end_when_their_consumer_is_gone(synth_dataset, method):
     """
         The process that takes the batches is killed (out of memory,
         a scheduler): its workers find out at their next batch and
-        end, instead of making the rest of the epoch for nobody
+        end, instead of making the rest of the epoch for nobody. Also
+        when they were started by a fork server, which is their
+        parent then and is still there.
     """
 
     generator = make_generator(synth_dataset, batch_size=1)
@@ -952,10 +976,12 @@ def test_workers_end_when_their_consumer_is_gone(synth_dataset):
     # every batch after the first takes a quarter of a second: the
     # epoch would take a worker five seconds or more
     generator.delay = 0.25
+    generator.start_method = method
     queue = multiprocessing.Queue()
     consumer = multiprocessing.Process(target=holds_an_epoch,
                                        args=(generator, queue))
     consumer.start()
+    workers = []
     try:
         workers = queue.get(timeout=TIME_LIMIT)
         assert len(workers) == 2
@@ -967,29 +993,30 @@ def test_workers_end_when_their_consumer_is_gone(synth_dataset):
             "workers still running {:.1f} s after their consumer was " \
             "killed".format(time.time() - start)
     finally:
-        try:
-            os.killpg(consumer.pid, signal.SIGKILL)
-        except OSError:
-            pass
-        consumer.join()
+        kill_with_its_session(consumer, workers)
 
 
 def holds_an_epoch_whose_workers_are_done(generator, queue):
     os.setsid()
+    multiprocessing.set_start_method(generator.start_method, force=True)
+    generator.done = multiprocessing.Value("i", 0)
     batches = generator.gen()
     # the epoch starts; nothing collects the batches for a long time
     threading.Thread(target=next, args=(batches,), daemon=True).start()
-    # the workers make their batches at once; then they wait for them
-    # to be collected
-    time.sleep(2.0)
-    queue.put([child.pid for child in multiprocessing.active_children()])
+    # the workers make their batches (as many as their queues take), 
+    # and then wait for them to be collected before they end
+    done = wait_until(lambda: generator.done.value == 2)
+    time.sleep(1.0)
+    queue.put((done,
+               [child.pid for child in multiprocessing.active_children()]))
     time.sleep(TIME_LIMIT)
 
 
 @pytest.mark.skipif(not os.path.isdir("/proc/self"),
                     reason="needs /proc to look at other processes")
+@pytest.mark.parametrize("method", ["fork", "forkserver", "spawn"])
 def test_workers_with_batches_to_hand_over_end_when_their_consumer_is_gone(
-        synth_dataset):
+        synth_dataset, method):
     """
         The workers have made all their batches and wait for them to
         be taken. Their consumer is killed. They end instead of
@@ -997,26 +1024,29 @@ def test_workers_with_batches_to_hand_over_end_when_their_consumer_is_gone(
         queue, so that writing to it fails once the consumer is gone.
     """
 
+    # as many batches per worker as its queue takes: the worker does 
+    # not wait for room, but for its batches to be written at its end
     generator = make_generator(synth_dataset, batch_size=1)
-    assert generator.len() // 2 >= 20
+    rows = generator.len()
+    generator = make_generator(
+        synth_dataset, batch_size=rows // (2 * generators.WORKER_QUEUE_BATCHES))
+    assert generator.len() == 2 * generators.WORKER_QUEUE_BATCHES
     generator.threads_wait = float(TIME_LIMIT)
+    generator.start_method = method
     queue = multiprocessing.Queue()
     consumer = multiprocessing.Process(
         target=holds_an_epoch_whose_workers_are_done, args=(generator, queue))
     consumer.start()
+    workers = []
     try:
-        workers = queue.get(timeout=TIME_LIMIT)
-        assert len(workers) == 2
+        done, workers = queue.get(timeout=TIME_LIMIT)
+        assert done and len(workers) == 2
         assert not any(ended(pid) for pid in workers)
         os.kill(consumer.pid, signal.SIGKILL)
         consumer.join()
         assert wait_until(lambda: all(ended(pid) for pid in workers), 5.0)
     finally:
-        try:
-            os.killpg(consumer.pid, signal.SIGKILL)
-        except OSError:
-            pass
-        consumer.join()
+        kill_with_its_session(consumer, workers)
 
 
 def test_handle_on_the_reading_end_of_a_workers_queue():
