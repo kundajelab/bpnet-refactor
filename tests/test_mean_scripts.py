@@ -373,6 +373,19 @@ def test_difference_in_the_last_of_many_peaks_is_found(tmp_path):
     assert "do not have the same sequences" in output
     assert os.listdir(str(out)) == []
 
+    # a fold of the first 4,096 of these peaks, given first: the
+    # other fold has every peak of it and four more
+    os.mkdir(str(tmp_path / "shorter"))
+    shorter, _, _ = score_files(tmp_path / "shorter", folds=1,
+                                peaks=peaks[:4096])
+    code, output = run_script("mean_shap.py", [
+        "--counts_shaps", shorter[0] + "," + paths[0],
+        "--output_dir", out], tmp_path)
+    assert code == 1, output[-3000:]
+    assert "{} and {} do not have the same chromosomes".format(
+        paths[0], shorter[0]) in output
+    assert "Traceback" not in output and os.listdir(str(out)) == []
+
 
 def test_no_memory_for_a_fold_stops_the_script(tmp_path):
     """
