@@ -58,7 +58,9 @@ def save_scores(peaks_df, one_hot_sequences, hyp_shap_scores, output_fname):
         "coords_chrom", (num_examples,),
         dtype=h5py.string_dtype(encoding="ascii") 
     )
-    coords_chrom_dset[:] = coords_chrom.astype('U8')
+    # the names whole, as text of any length (they were cut to 8
+    # characters here, with pandas before 3)
+    coords_chrom_dset[:] = np.asarray(coords_chrom, dtype=str)
     
     coords_start_dset = f.create_dataset(
         "coords_start", (num_examples,), dtype="i4", 

@@ -1240,6 +1240,52 @@ def test_command_for_a_model_without_control_inputs(tmp_path):
             assert beyond.max() <= 1e-9 * np.abs(expected).max(), (which, i)
 
 
+def test_command_with_a_chromosome_of_a_long_name(command, tmp_path):
+    """
+        A chromosome whose name has more than 8 characters: the score
+        files, the peak file and the bigWigs of a run all name it
+        whole
+    """
+
+    import h5py
+    import pyBigWig
+    from tests import synth
+
+    name = "chrUn_KI270302v1_alt_of_a_long_name"
+    params = command["params"]
+    d = synth.make_dataset(str(tmp_path / "data"),
+                           input_len=params["input_len"],
+                           output_len=params["output_profile_len"],
+                           chroms=("chr1", "chr2", name))
+    out = tmp_path / "shap"
+    out.mkdir()
+    code, output = run_shap([
+        "--backend", "pytorch", "--device", "cpu",
+        "--reference-genome", d["fasta"],
+        "--input-seq-len", params["input_len"],
+        "--control-len", params["output_profile_len"],
+        "--model", command["model"], "--bed-file", d["peaks"],
+        "--chroms", name, "--input-data", d["input_json"],
+        "--num-shuffles", 2, "--seed", SEED, "--generate-shap-bigWigs",
+        "--chrom-sizes", d["chrom_sizes"], "--output-directory", out], out)
+    assert code == 0, output[-3000:]
+    with open(str(out / "peaks_valid_scores.bed")) as fh:
+        in_bed = [line.split("\t")[0] for line in fh]
+    assert len(in_bed) > 20 and set(in_bed) == {name}
+    for which in ("counts", "profile"):
+        with h5py.File(str(out / (which + "_scores.h5")), "r") as f:
+            stored = [c.decode() if isinstance(c, bytes) else c
+                      for c in f["coords_chrom"][:]]
+            start, end = int(f["coords_start"][0]), int(f["coords_end"][0])
+        assert stored == in_bed
+        bw = pyBigWig.open(str(out / (which + "_scores.bw")))
+        try:
+            values = np.array(bw.values(name, start, end))
+        finally:
+            bw.close()
+        assert np.isfinite(values).all() and np.abs(values).max() > 0
+
+
 def test_command_refuses_a_model_with_one_profile_track(tmp_path):
     """
         For a model with one profile track the TensorFlow backend
