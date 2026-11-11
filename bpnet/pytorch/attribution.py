@@ -39,10 +39,10 @@
     The scores are verified for models whose only nonlinear layers
     are ReLU, which is every model bpnet-train makes with its default
     architecture, on a CPU and on CUDA GPUs; a model with another
-    activation, or one in which the sequence goes through the
-    logsumexp that these models take of their control counts, is
-    refused (check_model), and so is another kind of device
-    (resolve_device).
+    activation, one in which the sequence goes through the logsumexp
+    that these models take of their control counts, or one whose
+    parameters are not float32 or float64 is refused (check_model),
+    and so is another kind of device (resolve_device).
 
     The scores are computed in the type of the model's parameters and
     nothing less: with every precision setting of PyTorch at full
@@ -95,6 +95,10 @@ def check_model(model):
           would take its gradient, which is not DeepLIFT. (Taken of
           control inputs, as bpnet-train builds it, no score of the
           sequence goes through it.)
+        - a model whose parameters are not all float32 or all float64
+          (the types the loader gives a model): the scores are
+          computed in the type of the parameters, and are compared
+          with the independent DeepLIFT in these two.
 
         Raises:
             ValueError: the model is such a model, or is not a model
@@ -105,6 +109,13 @@ def check_model(model):
         raise ValueError(
             "A model of bpnet.pytorch.model is expected, not a {}".format(
                 type(model).__name__))
+    types = {parameter.dtype for parameter in model.parameters()}
+    if len(types) != 1 or not types <= {torch.float32, torch.float64}:
+        raise ValueError(
+            "The scores of the PyTorch backend are computed in the type of "
+            "the model's parameters, float32 or float64; the parameters of "
+            "this model have the types {}".format(sorted(
+                str(dtype).replace("torch.", "") for dtype in types)))
     others = sorted({type(module).__name__ for module in model.modules()
                      if module is not model and
                      not isinstance(module, _VERIFIED_LAYERS)})
@@ -160,7 +171,16 @@ def resolve_device(device):
             "{}".format(device, found.type))
     if found.type == "cuda":
         seen = torch.cuda.device_count() if torch.cuda.is_available() else 0
-        if (found.index or 0) >= seen:
+        # the number of the GPU as it was given: torch.device keeps it
+        # in eight bits ('cuda:256' is cuda:0 to it, 'cuda:255' is
+        # 'cuda', 'cuda:128' is cuda:-128)
+        if isinstance(device, str):
+            index = int(device.partition(":")[2] or 0)
+        elif isinstance(device, int):
+            index = device
+        else:
+            index = found.index or 0
+        if not 0 <= index < seen:
             raise ValueError("device {}: PyTorch sees {} GPU(s) here".format(
                 device, seen))
     return found
@@ -295,14 +315,20 @@ class _FullPrecision(object):
 
         Before PyTorch 2.9 the older switches are all there is: the
         TF32 flag of cuDNN and the precision of matrix products are
-        set and put back.
+        set and put back. (Before PyTorch 2.0 the environment variable
+        TORCH_ALLOW_TF32_CUBLAS_OVERRIDE keeps TF32 on for matrix
+        products whatever is set; nothing is computed on a GPU then.)
 
         Args:
             device (torch.device): where the caller computes (None:
                 on the CPU)
+
+        Raises:
+            RuntimeError: PyTorch does not switch to full precision
     """
 
     def __init__(self, device=None):
+        self._gpu = device is not None and device.type == "cuda"
         self._autocast = ["cpu"]
         if device is not None and device.type != "cpu":
             self._autocast.append(device.type)
@@ -340,11 +366,22 @@ class _FullPrecision(object):
         read = getattr(torch._C, "_get_fp32_precision_getter", None)
         write = getattr(torch._C, "_set_fp32_precision_setter", None)
         if read is None or write is None:
-            cudnn = torch.backends.cudnn
+            cudnn, matmul = torch.backends.cudnn, torch.backends.cuda.matmul
             self._set(lambda value: setattr(cudnn, "allow_tf32", value),
                       cudnn.allow_tf32, False)
             self._set(torch.set_float32_matmul_precision,
                       torch.get_float32_matmul_precision(), "highest")
+            left = [name for name, flag in (
+                ("convolutions", cudnn.allow_tf32),
+                ("matrix products", matmul.allow_tf32)) if flag]
+            if left and self._gpu:
+                raise RuntimeError(
+                    "PyTorch {} keeps TF32 on for {} on a GPU (before "
+                    "PyTorch 2.0 the environment variable "
+                    "TORCH_ALLOW_TF32_CUBLAS_OVERRIDE does that): the "
+                    "scores are not computed with less than the precision "
+                    "of the model".format(
+                        torch.__version__, " and ".join(left)))
             return
         for backend, kind in _SETTINGS:
             was = read(backend, kind)

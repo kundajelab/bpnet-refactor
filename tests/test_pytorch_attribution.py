@@ -537,6 +537,24 @@ def test_models_with_other_nonlinear_layers_are_refused(case):
     # dropout does nothing when a model is evaluated
     model.layers[name] = torch.nn.Dropout(0.5)
     attribution.check_model(model)
+    # a model in half precision, or one of two types (the loader makes
+    # models of float32 or float64)
+    for change, types in (
+            (lambda m: m.half(), r"\['float16'\]"),
+            (lambda m: m.type(torch.bfloat16), r"\['bfloat16'\]"),
+            (lambda m: next(iter(m.layers.values())).float(),
+             r"\['float32', 'float64'\]")):
+        other = copy.deepcopy(case["model"])
+        change(other)
+        message = "float32 or float64; the parameters of this model have " \
+            "the types " + types
+        with pytest.raises(ValueError, match=message):
+            attribution.check_model(other)
+        with pytest.raises(ValueError, match=message):
+            attribution.hypothetical_scores(
+                other, "counts", case["sequences"], case["controls"],
+                num_shuffles=2, device="cpu")
+    attribution.check_model(copy.deepcopy(case["model"]).float())
     # what is not a model of this package has layers and steps that
     # nothing here knows
     for other in (torch.nn.Linear(2, 2), attribution.CountsTarget(model)):
@@ -603,11 +621,14 @@ def test_a_logsumexp_of_what_comes_from_the_sequence_is_refused(case, of):
     assert counts.shape == (2, 1) and bool(torch.isfinite(counts).all())
 
 
-def test_devices_the_scores_are_computed_on(case):
+def test_devices_the_scores_are_computed_on(case, monkeypatch):
     """
         A CPU or a CUDA GPU that PyTorch sees; without a device, a
         GPU when there is one. Anything else is refused before
-        anything is computed
+        anything is computed, also a GPU number that PyTorch would
+        take for another (it keeps the number in eight bits: cuda:256
+        is cuda:0 to it, cuda:255 the default GPU, cuda:128 a GPU
+        with a negative number)
     """
 
     cpu = torch.device("cpu")
@@ -629,7 +650,11 @@ def test_devices_the_scores_are_computed_on(case):
             ("cuda:{}".format(there), "device cuda:{}: PyTorch sees {} "
              r"GPU\(s\) here".format(there, there)),
             ("cuda:99", r"device cuda:99: PyTorch sees {} GPU\(s\) "
-             "here".format(there))):
+             "here".format(there)),
+            ("cuda:128", "device cuda:128: PyTorch sees"),
+            ("cuda:255", "device cuda:255: PyTorch sees"),
+            ("cuda:256", "device cuda:256: PyTorch sees"),
+            (torch.device("cuda:128"), "device cuda:-128: PyTorch sees")):
         if device == 3 and there > 3:
             continue
         with pytest.raises(ValueError, match=message):
@@ -642,6 +667,20 @@ def test_devices_the_scores_are_computed_on(case):
         with pytest.raises(ValueError, match=r"device cuda: PyTorch sees 0 "
                            r"GPU\(s\) here"):
             attribution.resolve_device("cuda")
+    # as if PyTorch saw one GPU: that one, and no number that wraps
+    # around to it
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+    for device in (None, "cuda", "cuda:0", torch.device("cuda"),
+                   torch.device("cuda:0")):
+        assert attribution.resolve_device(device) == torch.device(
+            "cuda" if device is None else device)
+    for device in ("cuda:1", "cuda:128", "cuda:255", "cuda:256", "cuda:257",
+                   "cuda:512", torch.device("cuda:1"),
+                   torch.device("cuda:128")):
+        with pytest.raises(ValueError, match=r"PyTorch sees 1 GPU\(s\) "
+                           "here"):
+            attribution.resolve_device(device)
 
 
 def fake_deep_lift_shap(order):
@@ -1210,6 +1249,10 @@ def test_command_refuses_what_the_backend_does_not_do(command, tmp_path):
             (["--device", "nowhere"], "--device nowhere: not a device of "
              "PyTorch"),
             (["--device", "cuda:0"], "--device cuda:0: PyTorch sees 0 "
+             "GPU(s) here"),
+            (["--device", "cuda:128"], "--device cuda:128: PyTorch sees 0 "
+             "GPU(s) here"),
+            (["--device", "cuda:256"], "--device cuda:256: PyTorch sees 0 "
              "GPU(s) here"),
             (["--device", "mps"], "--device mps: the scores are computed on "
              "a CPU or a CUDA GPU ('cpu', 'cuda', 'cuda:1', ...), not on a "

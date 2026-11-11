@@ -10,7 +10,10 @@
     process of its own. It needs PyTorch only (not tangermeme), and
     covers both generations of switches: the settings per backend and
     kind of operation of PyTorch 2.9 and later, and the older flags
-    that are all there is before.
+    that are all there is before. It runs twice: as PyTorch starts,
+    and as it starts with the environment variable
+    TORCH_ALLOW_TF32_CUBLAS_OVERRIDE, which switches TF32 on for
+    matrix products (and, before PyTorch 2.0, keeps it on).
 """
 
 import os
@@ -23,10 +26,13 @@ pytest.importorskip("torch")
 
 
 PRECISION = r'''
+import os
+
 import torch
 from bpnet.pytorch import attribution
 
 b = torch.backends
+OVERRIDE = os.environ.get("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE") == "1"
 read = getattr(torch._C, "_get_fp32_precision_getter", None)
 write = getattr(torch._C, "_set_fp32_precision_setter", None)
 NEWER = read is not None
@@ -134,13 +140,19 @@ def matmul(value):
 
 
 def check(name, setup, cudnn=False):
-    start_over(cudnn)
-    try:
-        setup()
-    except RuntimeError as error:
-        # (a precision this build of PyTorch does not have)
-        print("not possible here:", name, "-", str(error).split("\n")[0])
-        return
+    """
+        `setup`: what the caller did to a PyTorch that had just
+        started (None: nothing at all, the process as it is)
+    """
+    if setup is not None:
+        start_over(cudnn)
+        try:
+            setup()
+        except RuntimeError as error:
+            # (a precision this build of PyTorch does not have)
+            print("not possible here:", name, "-",
+                  str(error).split("\n")[0])
+            return
     before = state()
     with attribution._FullPrecision():
         inside = resolved() if NEWER else state()
@@ -149,7 +161,7 @@ def check(name, setup, cudnn=False):
     if NEWER:
         assert set(inside.values()) == {"ieee"}, (name, inside)
     else:
-        assert inside == (False, False, "highest"), (name, inside)
+        assert inside == (False, STUCK, "highest"), (name, inside)
     # as it was after a failure inside, too
     try:
         with attribution._FullPrecision():
@@ -162,8 +174,30 @@ def check(name, setup, cudnn=False):
 
 print("switches:", "newer" if NEWER else "older")
 at_start = state()
-check("as PyTorch starts", lambda: None)
+# before PyTorch 2.0 the environment variable keeps TF32 on for the
+# matrix products of a GPU, whatever is set
+STUCK = False
+if not NEWER:
+    torch.set_float32_matmul_precision("highest")
+    STUCK = b.cuda.matmul.allow_tf32
+    torch.set_float32_matmul_precision(at_start[2])
+    assert state() == at_start
+assert OVERRIDE or not STUCK
+if OVERRIDE:
+    # TF32 is on for matrix products from the start: as the precision
+    # "high", or (before PyTorch 2.0) in the flag alone, and stuck
+    assert (at_start[1:] if not NEWER else (
+        at_start["older"]["flag of matmul"],
+        at_start["older"]["matmul precision"])) == (
+            True, "highest" if STUCK else "high"), at_start
+check("as PyTorch starts", None)
 assert state() == at_start
+# the state the checks below start from: as PyTorch starts without
+# the environment variable
+start_over()
+usual = state()
+assert OVERRIDE or usual == at_start
+check("nothing set", lambda: None)
 check("matmul precision high", lambda: matmul("high"))
 check("matmul precision medium", lambda: matmul("medium"))
 check("flag of matmul on", lambda: flag(b.cuda.matmul, True))
@@ -200,7 +234,7 @@ if NEWER:
     check("matmul precision high, then generic ieee", lambda: (
         matmul("high"), setting("generic", "all", "ieee")))
     start_over()
-    assert state() == at_start, "the settings of cuDNN were written"
+    assert state() == usual, "the settings of cuDNN were written"
 
     # the review's cases, spelled out. A reduced precision above: what
     # follows it before follows it after
@@ -214,8 +248,8 @@ if NEWER:
     # and the settings of cuDNN follow as they did when PyTorch started
     with attribution._FullPrecision():
         pass
-    assert under("ieee") == at_start["generic ieee"]
-    assert state() == at_start
+    assert under("ieee") == usual["generic ieee"]
+    assert state() == usual
 
     # a PyTorch that does not take a setting is not computed with
     setting("mkldnn", "conv", "bf16")
@@ -255,6 +289,25 @@ if NEWER:
         flag(b.cudnn, False), setting("cuda", "all", "tf32"),
         setting("cuda", "rnn", "ieee")), cudnn=True)
 
+# computing on a GPU. With TF32 that cannot be switched off nothing
+# is computed there; on the CPU it is (TF32 is a matter of GPUs)
+start_over(cudnn=True)
+before = state()
+try:
+    with attribution._FullPrecision(torch.device("cuda")):
+        inside = resolved() if NEWER else state()
+except RuntimeError as error:
+    inside = None
+    assert STUCK and "keeps TF32 on for matrix products on a GPU" in \
+        str(error) and "TORCH_ALLOW_TF32_CUBLAS_OVERRIDE" in str(error), error
+assert (inside is None) == bool(STUCK), inside
+if NEWER:
+    assert set(inside.values()) == {"ieee"}, inside
+elif not STUCK:
+    assert inside == (False, False, "highest"), inside
+assert state() == before
+print("as before:", "a GPU, TF32 stuck" if STUCK else "a GPU")
+
 # the autocast of the caller: off inside, on again afterwards
 with torch.autocast("cpu", dtype=torch.bfloat16):
     with attribution._FullPrecision():
@@ -273,7 +326,9 @@ print("done")
 '''
 
 
-def test_precision_is_full_inside_and_as_it_was_afterwards():
+@pytest.mark.parametrize("override", [False, True], ids=[
+    "as PyTorch starts", "TORCH_ALLOW_TF32_CUBLAS_OVERRIDE"])
+def test_precision_is_full_inside_and_as_it_was_afterwards(override):
     """
         Inside the context in which the scores are computed every
         setting that decides the precision of a float32 computation
@@ -282,14 +337,20 @@ def test_precision_is_full_inside_and_as_it_was_afterwards():
         older TF32 flags, the newer settings per backend and
         operation with and without values of their own, and mixtures
         that PyTorch itself refuses to report. A setting that
-        followed the one above it follows it again.
+        followed the one above it follows it again. With the
+        environment variable that switches TF32 on for matrix
+        products: the same; where PyTorch (before 2.0) then keeps it
+        on whatever is set, nothing is computed on a GPU.
     """
 
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env = dict(os.environ, PYTHONPATH=repo, CUDA_VISIBLE_DEVICES="",
+               PYTHONDONTWRITEBYTECODE="1")
+    env.pop("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE", None)
+    if override:
+        env["TORCH_ALLOW_TF32_CUBLAS_OVERRIDE"] = "1"
     done = subprocess.run(
-        [sys.executable, "-c", PRECISION],
-        env=dict(os.environ, PYTHONPATH=repo, CUDA_VISIBLE_DEVICES="",
-                 PYTHONDONTWRITEBYTECODE="1"),
+        [sys.executable, "-c", PRECISION], env=env,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         universal_newlines=True, timeout=900)
     assert done.returncode == 0, done.stdout[-4000:]
@@ -297,11 +358,18 @@ def test_precision_is_full_inside_and_as_it_was_afterwards():
     assert lines[-1] == "done", done.stdout[-2000:]
     assert "autocast: off inside, on again afterwards" in lines
     checked = [line for line in lines if line.startswith("as before:")]
+    assert "as before: as PyTorch starts" in checked
     if "switches: newer" in lines:
-        assert len(checked) >= 28, checked
+        assert len(checked) >= 31, checked
         assert "as before: a setting that is not taken" in checked
         assert "as before: matmul precision medium, then matmul of " \
             "mkldnn tf32" in checked
+        assert "as before: a GPU" in checked
     else:
         assert "switches: older" in lines
-        assert len(checked) == 8, checked
+        assert len(checked) == 10, checked
+        # (PyTorch 2.0 to 2.8 switch TF32 off also with the variable)
+        import torch
+        stuck = override and int(torch.__version__.split(".")[0]) < 2
+        assert ("as before: a GPU, TF32 stuck" in checked) == stuck
+        assert ("as before: a GPU" in checked) == (not stuck)
