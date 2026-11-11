@@ -355,14 +355,104 @@ def test_hypothetical_scores_of_every_base(with_control, without_control,
     assert np.median(allowances) <= TIGHT, np.median(allowances)
 
 
+def test_reference_takes_the_branch_the_explainer_takes():
+    """
+        The rescale rule of the reference: the secant of a pair of
+        pre-activations, and the gradient at the sequence when the two
+        are closer than the number the explainer compares with (1e-6
+        as float32 has it: a pair that is exactly that far apart gets
+        the secant)
+    """
+
+    torch = pytest.importorskip("torch")
+    from tests import reference_deeplift as rd
+
+    half = float(np.float32(5e-7))
+    assert 2 * half == rd.NEAR < 1e-6
+    cases = [
+        (half, -half, 0.5), (-half, half, 0.5),
+        (4e-7, -4e-7, 1.0), (-4e-7, 4e-7, 0.0), (1e-9, 0.0, 1.0),
+        (0.3, -0.1, 0.75), (-0.1, 0.3, 0.75), (-0.3, 0.1, 0.25),
+        (0.2, 0.5, 1.0),
+        (-0.2, -0.5, 0.0), (0.2, 0.2, 1.0), (-0.2, -0.2, 0.0),
+        (0.0, 0.0, 0.0), (0.0, 0.5, 1.0), (0.5, 0.0, 1.0), (0.0, -0.5, 0.0)]
+    a = torch.tensor([[case[0] for case in cases],
+                      [case[1] for case in cases]], dtype=torch.float64,
+                     requires_grad=True)
+    out = rd._RescaledReLU.apply(a, None)
+    multipliers, = torch.autograd.grad(out[0].sum(), a)
+    np.testing.assert_allclose(multipliers[0].numpy(),
+                               [case[2] for case in cases], rtol=1e-12)
+    # with a bump: added to what is passed back
+    out = rd._RescaledReLU.apply(a, np.full((1, len(cases)), 0.25))
+    bumped, = torch.autograd.grad(out[0].sum(), a)
+    np.testing.assert_allclose(bumped[0].numpy(),
+                               multipliers[0].numpy() + 0.25, rtol=1e-12)
+
+
+def test_reference_knows_where_float32_decides_the_branch():
+    """
+        The uncertainty that float32_allowance gives the multiplier
+        of a ReLU pair: none when both pre-activations are well on
+        one side of zero, the whole multiplier where rounding can
+        decide between the secant and the gradient or the sign of the
+        gradient, and the uncertainty of the difference over the
+        difference otherwise
+    """
+
+    pytest.importorskip("torch")
+    from tests import reference_deeplift as rd
+
+    def uncertainty(a_x, a_r, largest):
+        return float(rd.relu_uncertainty(
+            np.array([a_x]), np.array([a_r]), largest)[0])
+
+    largest = 2.0
+    noise = 2.0 * rd.RELU_NOISE * largest
+    assert 1e-6 < noise < 3e-6
+    # both on one side: 0 or 1 whatever the rounding
+    for a_x, a_r in ((0.5, 0.3), (0.3, 0.5), (-0.5, -0.3), (1e-4, 2e-4),
+                     (0.0, 0.0)):
+        assert uncertainty(a_x, a_r, largest) == 0.0
+    # on both sides, apart: the secant moves a little
+    for a_x, a_r in ((0.3, -0.1), (-0.1, 0.3), (1e-4, -1e-4), (0.02, -0.03)):
+        expected = (noise + 2.0 ** -20 * (abs(a_x) + abs(a_r))) / \
+            abs(a_x - a_r)
+        assert uncertainty(a_x, a_r, largest) == pytest.approx(expected)
+        assert 0 < expected < 0.02
+    # one of them within the rounding of zero: on which side is it?
+    assert 0 < uncertainty(1e-7, 0.3, largest) < 1e-5
+    assert 0 < uncertainty(0.3, -1e-7, largest) < 1e-5
+    # close to each other and to zero: secant or gradient, and the
+    # sign of the gradient
+    for a_x, a_r in ((5e-7, -5e-7), (4e-7, -4e-7), (1e-7, 1.2e-7),
+                     (1.5e-6, -1e-6), (0.0, 1e-8), (1e-8, 0.0)):
+        assert uncertainty(a_x, a_r, largest) == 1.0
+
+    # in a layer of small numbers the rounding is small too, and still
+    # a pair that is as far apart as the number the explainer compares
+    # with is taken as undecided (the reference returned the gradient
+    # for it and the explainer the secant, before the reference
+    # compared with the same number)
+    half = float(np.float32(5e-7))
+    assert uncertainty(half, -half, half) == 1.0
+    assert uncertainty(4 * half, -4 * half, 4 * half) < 1e-5
+    # an array of any shape
+    shares = rd.relu_uncertainty(np.full((2, 3, 4), 0.3),
+                                 np.full((2, 3, 4), -0.1), 2.0)
+    assert shares.shape == (2, 3, 4) and (shares > 0).all()
+
+
 #: Beyond the float16 rounding of the files, the scores of bpnet-shap
 #: carry the float32 arithmetic of its explainer. Two of its steps are
 #: quotients of differences that are imprecise where the difference is
 #: small (see tests/reference_deeplift.py); float32_allowance() there
-#: computes how far they can move each score of a peak. What is left
+#: estimates how far they can move each score of a peak. What is left
 #: after the rounding and this allowance must be below TIGHT, as a
-#: share of the largest score of the peak. (In 576 peaks of 24 runs
-#: with freshly trained models it was below 2e-7.)
+#: share of the largest score of the peak. (Measured in 576 peaks of
+#: 24 runs with freshly trained models: below 2e-7.) The allowance is
+#: small for most scores and large where a quotient is imprecise: an
+#: error of bpnet-shap that touches only such scores can pass.
 TIGHT = 1e-5
 
 

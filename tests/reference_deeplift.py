@@ -39,16 +39,21 @@
       that were seen fit an explainer that computes it as the quotient
       0.5 * ((w_x l_x - w_x l_r) + (w_r l_x - w_r l_r)) / (l_x - l_r),
       which is imprecise where a logit of the sequence and of a
-      reference nearly coincide. (What it does with logits that
-      coincide, or nearly, was not established: float32_allowance()
-      takes the multiplier as wholly uncertain when they are closer
-      than COINCIDE.)
+      reference nearly coincide, and that replaces it by zero where
+      they differ by less than 1e-7. (Probed on a model with two
+      logits near 0.2: a score was zero when the logits differed by
+      8.9e-8, off by 9% at 1.04e-7 and at 2.1e-7, by 0.2% at 1e-6 and
+      at 1.5e-5, and right at 1.5e-3.)
 
     An imprecise quotient moves the scores of all positions that the
-    unit or the output position sees. float32_allowance() computes, for
-    one sequence, how far these two effects can move each score; with
-    it the scores of bpnet-shap can be compared with the ones computed
-    here score by score.
+    unit or the output position sees. float32_allowance() estimates,
+    for one sequence, how far these two effects can move each score;
+    with it the scores of bpnet-shap can be compared with the ones
+    computed here score by score. It is an estimate to first order,
+    with constants that were chosen with room and checked against
+    runs, not a proven bound: the errors of two quotients on one path
+    multiply, and what float32 does to a pre-activation is taken as a
+    share of the largest one of the layer.
 
     What was seen in 30 runs of the tests with freshly trained models
     (about 350 peaks per output): the counts scores never differed
@@ -71,8 +76,9 @@ import torch
 import torch.nn.functional as F
 
 #: pre-activations of a pair closer than this pass back the gradient
-#: of the ReLU instead of the secant
-NEAR = 1e-6
+#: of the ReLU instead of the secant (the number the explainer
+#: compares with in float32)
+NEAR = float(np.float32(1e-6))
 
 #: what float32 arithmetic leaves uncertain, for float32_allowance():
 #: a pre-activation, as a share of the largest pre-activation of its
@@ -84,7 +90,8 @@ RELU_NOISE = 2.0 ** -21
 #: sums: at most 1.25 * 2**-24 by this ratio, to first order.)
 PRODUCT_NOISE = 2.0 ** -23
 #: logits that are closer than this may have their multiplier replaced
-#: by zero, or be anywhere near it
+#: by zero (the explainer does that below 1e-7; which side a pair is
+#: on is decided in float32)
 COINCIDE = 1e-6
 #: quotients that are uncertain by less than these shares are left out
 #: of the allowance (many small ones remain; what they move is part of
@@ -113,8 +120,8 @@ class _RescaledReLU(torch.autograd.Function):
         a_x, a_r = a[:half], a[half:]
         delta = a_x - a_r
         secant = (F.relu(a_x) - F.relu(a_r)) / torch.where(
-            delta.abs() > NEAR, delta, torch.ones_like(delta))
-        slope = torch.where(delta.abs() > NEAR, secant,
+            delta.abs() >= NEAR, delta, torch.ones_like(delta))
+        slope = torch.where(delta.abs() >= NEAR, secant,
                             (a_x > 0).to(a.dtype))
         if ctx.bump is not None:
             slope = slope + torch.as_tensor(ctx.bump, dtype=a.dtype)
@@ -316,19 +323,59 @@ def hypothetical_scores(weights, params, which, sequence, references,
     return hypothetical.mean(axis=0)
 
 
+def relu_uncertainty(a_x, a_r, largest):
+    """
+        How uncertain float32 leaves what a ReLU passes back for a
+        sequence and a reference: the change of the multiplier that
+        rounding can cause, between 0 and 1
+
+        The multiplier is the secant (relu(a_x) - relu(a_r)) / (a_x -
+        a_r), or the gradient of the ReLU at a_x when the two are
+        closer than NEAR. With both pre-activations well on one side
+        of zero it is 0 or 1 whatever the rounding. Otherwise the
+        secant moves by about (the uncertainty of the difference) /
+        (the difference); and where rounding can decide between the
+        secant and the gradient, or the sign that the gradient goes
+        by, the multiplier may be anything from 0 to 1.
+
+        Args:
+            a_x, a_r (numpy.ndarray): pre-activations of the sequence
+                and of the reference
+            largest (float): the largest pre-activation of the layer,
+                to which the rounding of a pre-activation is taken to
+                be in proportion
+
+        Returns:
+            numpy.ndarray: like a_x
+    """
+
+    delta = np.abs(a_x - a_r)
+    # how far the difference of a pair may be off
+    off = 2.0 * RELU_NOISE * largest + \
+        2.0 ** -20 * (np.abs(a_x) + np.abs(a_r))
+    settled = ((a_x > off) & (a_r > off)) | ((a_x < -off) & (a_r < -off)) | \
+        ((a_x == 0) & (a_r == 0))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        share = np.minimum(1.0, off / delta)
+    share[delta < NEAR + off] = 1.0
+    share[settled] = 0.0
+    return share
+
+
 def float32_allowance(weights, params, which, sequence, references,
                       profile_bias=None, counts_bias=None):
     """
         How far the quotients that are imprecise in float32 (see the
         top of this module) can move each hypothetical score of one
-        sequence
+        sequence, to first order
 
         For every such quotient (the secant of one unit for one
         reference, the multiplier of one logit for one reference) the
         scores are computed again with the quotient changed by its
-        uncertainty; the scores are linear in each quotient, so that
-        the change of a score is its largest possible change from this
-        quotient. The allowance is the sum of the absolute changes.
+        uncertainty; with the other quotients fixed the scores are
+        linear in each quotient, so that the change of a score is its
+        largest possible change from this quotient alone. The
+        allowance is the sum of the absolute changes.
 
         Args:
             as hypothetical_scores
@@ -347,26 +394,18 @@ def float32_allowance(weights, params, which, sequence, references,
     #: the layer or the logits, uncertainty of the quotient)
     uncertain = []
     for layer, a in enumerate(seen):
-        a_x, a_r = a[:n], a[n:]
-        delta = np.abs(a_x - a_r)
-        noise = RELU_NOISE * np.abs(a).max()
-        # the secant is 0 or 1 whatever the rounding when both are well
-        # on one side of zero
-        at_risk = (delta > 0) & (
-            ((a_x > 0) != (a_r > 0)) |
-            (np.minimum(np.abs(a_x), np.abs(a_r)) < noise))
-        with np.errstate(divide="ignore"):
-            share = np.minimum(1.0, 2.0 * noise / delta)
-        for index in zip(*np.nonzero(at_risk & (share > SMALLEST_RELU))):
+        share = relu_uncertainty(a[:n], a[n:], np.abs(a).max())
+        for index in zip(*np.nonzero(share > SMALLEST_RELU)):
             uncertain.append((index[0], layer, index[1:], share[index]))
     if which == "profile":
         mean_weights = paired_weights(logits).numpy()
         l_x, l_r = logits[:n].numpy(), logits[n:].numpy()
         delta = np.abs(l_x - l_r)
-        with np.errstate(divide="ignore", invalid="ignore"):
-            share = np.minimum(2.0, PRODUCT_NOISE *
-                               (np.abs(l_x) + np.abs(l_r)) / delta)
-        share[delta < COINCIDE] = 2.0
+        # (the quotient is not used below 1e-7)
+        share = PRODUCT_NOISE * (np.abs(l_x) + np.abs(l_r)) / \
+            np.maximum(delta, 5e-8)
+        # replaced by zero, or not: the whole multiplier, with room
+        share[delta < COINCIDE] = np.maximum(share[delta < COINCIDE], 2.0)
         for index in zip(*np.nonzero(share > SMALLEST_PRODUCT)):
             uncertain.append((index[0], None, index[1:],
                               share[index] * mean_weights[index]))
