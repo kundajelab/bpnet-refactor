@@ -113,9 +113,11 @@ def without_control(tmp_path_factory):
 
 def float16_bound(values):
     """
-        The largest difference between a float64 value and its float16
-        rounding: half a unit in the last place (2**-11 relative), and
-        2**-25 for the values below the normal range of float16
+        A bound on the difference between a float64 value and its
+        float16 rounding: 2**-11 of the value (half a unit in the last
+        place is between half of that and that, so this is on the safe
+        side by up to a factor of two), and 2**-25 for the values below
+        the normal range of float16
     """
 
     return np.maximum(2.0 ** -11 * np.abs(values), 2.0 ** -25)
@@ -310,7 +312,11 @@ def test_hypothetical_scores_of_every_base(with_control, without_control,
         three that are not in the sequence (TF-MoDISco reads them), are
         those of DeepLIFT with the rescale rule as computed here
         independently (tests/reference_deeplift.py), to the float16
-        rounding of the files
+        rounding of the files. Six peaks of each model are checked.
+        The independent computation is written in PyTorch: the test is
+        skipped where PyTorch is not installed. (The references are
+        made with the shuffling of the package: what is checked is the
+        attribution given the references, not the shuffling.)
     """
 
     torch = pytest.importorskip("torch")
