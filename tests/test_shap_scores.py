@@ -88,11 +88,12 @@ def with_control(synth_dataset, tmp_path_factory):
     trained = run_trainer(synth_dataset, tmp_path_factory.mktemp("train"),
                           epochs=1)
     assert trained["code"] == 0, trained["output"][-3000:]
+    extra = ["--generate-shap-bigWigs",
+             "--chrom-sizes", synth_dataset["chrom_sizes"]]
     run = run_shap(synth_dataset, trained["model"],
-                   tmp_path_factory.mktemp("shap"),
-                   extra=["--generate-shap-bigWigs",
-                          "--chrom-sizes", synth_dataset["chrom_sizes"]])
-    return dict(run, model=trained["model"], dataset=synth_dataset)
+                   tmp_path_factory.mktemp("shap"), extra=extra)
+    return dict(run, model=trained["model"], dataset=synth_dataset,
+                extra=extra)
 
 
 @pytest.fixture(scope="module")
@@ -107,7 +108,41 @@ def without_control(tmp_path_factory):
     trained = run_trainer(d, tmp_path_factory.mktemp("train"), epochs=1)
     assert trained["code"] == 0, trained["output"][-3000:]
     run = run_shap(d, trained["model"], tmp_path_factory.mktemp("shap"))
-    return dict(run, model=trained["model"], dataset=d)
+    return dict(run, model=trained["model"], dataset=d, extra=[])
+
+
+def float16_bound(values):
+    """
+        The largest difference between a float64 value and its float16
+        rounding: half a unit in the last place (2**-11 relative), and
+        2**-25 for the values below the normal range of float16
+    """
+
+    return np.maximum(2.0 ** -11 * np.abs(values), 2.0 ** -25)
+
+
+def control_inputs(d, scores, row):
+    """
+        The control inputs bpnet-shap gives the model for the peak of a
+        row of a score file: the control tracks in the output window
+        around the summit, and the log of their totals plus one
+    """
+
+    chrom = scores["coords_chrom"][row]
+    chrom = chrom.decode() if isinstance(chrom, bytes) else str(chrom)
+    centre = (int(scores["coords_start"][row]) +
+              int(scores["coords_end"][row])) // 2
+    start = centre - d["output_len"] // 2
+    profile = []
+    for path in d["control"]:
+        bw = pyBigWig.open(path)
+        try:
+            profile.append(np.nan_to_num(np.array(
+                bw.values(chrom, start, start + d["output_len"]))))
+        finally:
+            bw.close()
+    profile = np.stack(profile, axis=-1)
+    return profile, np.log(profile.sum(axis=0) + 1)
 
 
 def test_peaks(d):
@@ -185,21 +220,32 @@ def test_counts_scores_add_up_to_the_difference_from_the_references(
             weights, d["params"], sequences.astype(np.float64))
         return logcounts.reshape(len(sequences), -1).sum(axis=1)
 
-    found, expected = [], []
+    found, expected, bound = [], [], []
     for i in range(len(scores["input_seqs"])):
         sequence = scores["input_seqs"][i].astype(np.float64)
         references = dinuc_shuffle(scores["input_seqs"][i], SHUFFLES,
                                    np.random.RandomState(SEED))
         expected.append(total_logcounts(sequence[None])[0] -
                         total_logcounts(np.asarray(references)).mean())
-        found.append((scores["hyp_scores"][i].astype(np.float64) *
-                      sequence).sum())
-    found, expected = np.array(found), np.array(expected)
+        held = scores["hyp_scores"][i].astype(np.float64) * sequence
+        found.append(held.sum())
+        bound.append(within_rounding(held, sequence))
+    found, expected, bound = map(np.array, (found, expected, bound))
     # the differences are not all alike, and the scores follow them
-    assert expected.std() > 10 * np.abs(found - expected).max()
-    # (the scores are stored as float16)
-    np.testing.assert_allclose(found, expected, rtol=0.02,
-                               atol=0.01 * np.abs(expected).max())
+    assert expected.std() > 100 * bound.max()
+    assert (np.abs(found - expected) <= bound).all(), \
+        np.abs(found - expected) / bound
+
+
+def within_rounding(held, sequence):
+    """
+        How far the sum of the stored scores of the bases that are there
+        may be from the exact sum: the float16 rounding of every score,
+        and the float32 arithmetic of TensorFlow
+    """
+
+    return float16_bound(held[sequence > 0]).sum() + \
+        1e-5 * np.abs(held).sum() + 1e-7
 
 
 def test_profile_scores_add_up_to_the_share_of_the_logits(without_control):
@@ -230,7 +276,7 @@ def test_profile_scores_add_up_to_the_share_of_the_logits(without_control):
         values = np.exp(values - values.max(axis=1, keepdims=True))
         return values / values.sum(axis=1, keepdims=True)
 
-    found, expected, whole = [], [], []
+    found, expected, whole, bound = [], [], [], []
     for i in range(len(scores["input_seqs"])):
         sequence = scores["input_seqs"][i].astype(np.float64)
         references = np.asarray(dinuc_shuffle(
@@ -242,15 +288,58 @@ def test_profile_scores_add_up_to_the_share_of_the_logits(without_control):
                          (of_sequence - of_references)).sum(axis=1).mean())
         whole.append((w_sequence * of_sequence).sum() -
                      (w_references * of_references).sum(axis=1).mean())
-        found.append((scores["hyp_scores"][i].astype(np.float64) *
-                      sequence).sum())
-    found, expected, whole = map(np.array, (found, expected, whole))
-    assert expected.std() > 100 * np.abs(found - expected).max()
-    np.testing.assert_allclose(found, expected, rtol=0.02,
-                               atol=0.01 * np.abs(expected).max())
+        held = scores["hyp_scores"][i].astype(np.float64) * sequence
+        found.append(held.sum())
+        bound.append(within_rounding(held, sequence))
+    found, expected, whole, bound = map(np.array,
+                                        (found, expected, whole, bound))
+    assert expected.std() > 100 * bound.max()
+    assert (np.abs(found - expected) <= bound).all(), \
+        np.abs(found - expected) / bound
     # and not to the change of the whole output, which is about twice
     # as large
     assert np.abs(found - whole).max() > 0.5 * expected.std()
+
+
+@pytest.mark.parametrize("which", ["counts", "profile"])
+@pytest.mark.parametrize("model", ["with control", "without control"])
+def test_hypothetical_scores_of_every_base(with_control, without_control,
+                                           model, which):
+    """
+        The scores of all four bases at every position, also of the
+        three that are not in the sequence (TF-MoDISco reads them), are
+        those of DeepLIFT with the rescale rule as computed here
+        independently (tests/reference_deeplift.py), to the float16
+        rounding of the files
+    """
+
+    torch = pytest.importorskip("torch")
+    from tests import reference_deeplift
+
+    run = with_control if model == "with control" else without_control
+    d = run["dataset"]
+    scores = run["scores"][which]
+    weights = weights_by_layer_name(run["model"])
+    for i in range(6):
+        sequence = scores["input_seqs"][i].astype(np.float64)
+        references = np.asarray(dinuc_shuffle(
+            scores["input_seqs"][i], SHUFFLES,
+            np.random.RandomState(SEED))).astype(np.float64)
+        extra = {}
+        if model == "with control":
+            profile_bias, counts_bias = control_inputs(d, scores, i)
+            extra = {"profile_bias": profile_bias,
+                     "counts_bias": counts_bias}
+        ours = reference_deeplift.hypothetical_scores(
+            weights, d["params"], which, sequence, references, **extra)
+        stored = scores["hyp_scores"][i].astype(np.float64)
+        # (and the float32 arithmetic of TensorFlow: up to 1.4e-6 of the
+        # largest score was seen for the profile with control inputs)
+        allowed = float16_bound(ours) + 1e-5 * np.abs(ours).max()
+        assert (np.abs(stored - ours) <= allowed).all(), \
+            (i, (np.abs(stored - ours) / allowed).max())
+        # the bases that are not there have scores of their own
+        assert np.abs(ours[sequence == 0]).max() > 0.1 * np.abs(ours).max()
 
 
 def run_shap_cli(d, model, out_dir, input_data=None):
@@ -297,6 +386,34 @@ def test_missing_input_data_file_is_reported(synth_dataset, with_control,
     assert "Traceback" not in output
 
 
+def assert_same_files(found_dir, expected_dir):
+    """
+        The two output directories of bpnet-shap hold the same files with
+        the same content: the score files array by array, the bigWigs,
+        statistics and peaks byte for byte, the settings but for the
+        output directory (the log has the times of the run)
+    """
+
+    names = sorted(os.listdir(expected_dir))
+    assert sorted(os.listdir(found_dir)) == names
+    for name in names:
+        found, expected = (os.path.join(found_dir, name),
+                           os.path.join(expected_dir, name))
+        if name.endswith(".log"):
+            continue
+        if name == "config.json":
+            with open(found) as a, open(expected) as b:
+                a, b = json.load(a), json.load(b)
+            a.pop("output_directory")
+            b.pop("output_directory")
+            assert a == b
+            continue
+        if name.endswith(".h5"):
+            continue
+        with open(found, "rb") as a, open(expected, "rb") as b:
+            assert a.read() == b.read(), name
+
+
 def assert_same_scores(found, expected):
     for which in ("counts", "profile"):
         assert sorted(found[which]) == sorted(expected[which])
@@ -330,8 +447,9 @@ def test_scores_are_those_of_the_model_loaded_by_keras(
 
     run = with_control if model == "with control" else without_control
     before = run_shap(run["dataset"], run["model"], tmp_path,
-                      code=SHAP_WITH_THE_KERAS_LOADER)
+                      code=SHAP_WITH_THE_KERAS_LOADER, extra=run["extra"])
     assert_same_scores(run["scores"], before["scores"])
+    assert_same_files(run["dir"], before["dir"])
 
 
 def test_scores_depend_on_the_references(with_control, tmp_path):
