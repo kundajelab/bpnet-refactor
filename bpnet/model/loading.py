@@ -61,26 +61,58 @@ def _varint(buffer, position):
         position += 1
         result |= (byte & 0x7F) << shift
         if not byte & 0x80:
-            return result, position
+            # (64 bits: what the tenth byte has beyond them is dropped,
+            # as protocol buffers do)
+            return result & 0xFFFFFFFFFFFFFFFF, position
         shift += 7
     raise ValueError(
         "Not a protocol buffer message (a number of more than ten bytes)")
 
 
+#: the kinds of field of the protocol buffer wire format ("wire types")
+_VARINT, _FIXED64, _BYTES, _FIXED32 = 0, 1, 2, 5
+
+
+def _int32(value):
+    """
+        A varint as the int32 field it is (the low 32 bits, signed)
+    """
+
+    value &= 0xFFFFFFFF
+    return value - (1 << 32) if value >> 31 else value
+
+
+def _int64(value):
+    """
+        A varint as the int64 field it is (signed)
+    """
+
+    return value - (1 << 64) if value >> 63 else value
+
+
 def _fields(buffer):
     """
-        The fields of a serialized protocol buffer message, in order
+        The fields of a serialized protocol buffer message, in order,
+        with their kind. A reader that knows the message takes a
+        field only when it has the kind the message gives it, and
+        passes over it otherwise, as protocol buffers do (a fixed
+        width field of eight bytes is not a message of eight bytes).
 
         Yields:
-            tuple: (field number, value); the value is an int for a
-                varint field and a memoryview for a length delimited
-                or fixed width field
+            tuple: (field number, kind, value); the value is an int
+                for a varint field (_VARINT) and a memoryview for a
+                length delimited (_BYTES) or fixed width field
+                (_FIXED64, _FIXED32)
     """
 
     position, end = 0, len(buffer)
     while position < end:
         key, position = _varint(buffer, position)
         number, wire_type = key >> 3, key & 7
+        if key >> 32 or number == 0:
+            raise ValueError(
+                "Not a protocol buffer message (field number {})".format(
+                    number))
         if wire_type == 0:
             value, position = _varint(buffer, position)
         elif wire_type == 2:
@@ -97,16 +129,17 @@ def _fields(buffer):
                     wire_type))
         if position > end:
             raise ValueError("Truncated protocol buffer message")
-        yield number, value
+        yield number, wire_type, value
 
 
 def _first(buffer, number):
     """
-        The first field with the given number, None if there is none
+        The first length delimited field (a message, a string) with
+        the given number, None if there is none
     """
 
-    for field_number, value in _fields(buffer):
-        if field_number == number:
+    for field_number, kind, value in _fields(buffer):
+        if field_number == number and kind == _BYTES:
             return value
     return None
 
@@ -144,11 +177,13 @@ def _metadata_in_keras_metadata_pb(data):
         'root'
     """
 
-    for number, node in _fields(data):
-        if number != 1:
+    for number, kind, node in _fields(data):
+        if number != 1 or kind != _BYTES:
             continue
         node_path, metadata = None, None
-        for field_number, value in _fields(node):
+        for field_number, field_kind, value in _fields(node):
+            if field_kind != _BYTES:
+                continue
             if field_number == 3:
                 node_path = bytes(value).decode("utf-8")
             elif field_number == 5:
@@ -265,54 +300,95 @@ def _weights_in_saved_model(path):
         raise CorruptCheckpointError(
             "{}: its object graph is not a message".format(
                 reader.index_path))
-    object_graph = memoryview(object_graph)
+    try:
+        variables = _variables_in_object_graph(memoryview(object_graph))
+    except ValueError as error:
+        raise CorruptCheckpointError(
+            "{}: its object graph cannot be read ({})".format(
+                reader.index_path, error))
+
+    found = {}
+    for variable_name, full_name, checkpoint_key in variables:
+        if checkpoint_key not in reader:
+            raise CorruptCheckpointError(
+                "{} has no tensor {}, which its object graph names "
+                "for {}".format(reader.index_path, checkpoint_key,
+                                full_name))
+        value = reader.get_tensor(checkpoint_key)
+        if isinstance(value, bytes) or value.dtype == object:
+            raise UnsupportedModelError(
+                "{}: variable {} holds text, not numbers".format(
+                    reader.index_path, full_name))
+        layer = full_name.rsplit("/", 1)[0]
+        found.setdefault(layer, {})[variable_name] = value
+    return found
+
+
+def _variables_in_object_graph(object_graph):
+    """
+        The variables of the layers with weights in the object graph
+        of a checkpoint (TrackableObjectGraph): its first object is
+        the model, which refers to its layers with weights, each of
+        which refers to its variables
+
+        Returns:
+            list: for each variable (its name in the layer, its full
+                name, the name of its tensor in the checkpoint)
+
+        Raises:
+            ValueError: the graph is not what the format says
+    """
 
     # TrackableObjectGraph.nodes
-    nodes = [node for number, node in _fields(object_graph) if number == 1]
+    nodes = [node for number, kind, node in _fields(object_graph)
+             if number == 1 and kind == _BYTES]
+    if not nodes:
+        raise ValueError("it has no objects")
 
     def children(node):
         # TrackableObject.children[i]: node_id, local_name
         found = []
-        for number, reference in _fields(node):
-            if number != 1:
+        for number, kind, reference in _fields(node):
+            if number != 1 or kind != _BYTES:
                 continue
             node_id, local_name = 0, ""
-            for field_number, value in _fields(reference):
-                if field_number == 1:
-                    node_id = value
-                elif field_number == 2:
+            for field_number, field_kind, value in _fields(reference):
+                if field_number == 1 and field_kind == _VARINT:
+                    node_id = _int32(value)
+                elif field_number == 2 and field_kind == _BYTES:
                     local_name = bytes(value).decode("utf-8")
+            if not 0 <= node_id < len(nodes):
+                raise ValueError(
+                    "an object refers to object {} of {}".format(
+                        node_id, len(nodes)))
             found.append((local_name, node_id))
         return found
 
     def variable(node):
         # TrackableObject.attributes[i]: name, full_name, checkpoint_key
-        for number, attribute in _fields(node):
-            if number != 2:
+        for number, kind, attribute in _fields(node):
+            if number != 2 or kind != _BYTES:
                 continue
             values = {n: bytes(v).decode("utf-8")
-                      for n, v in _fields(attribute) if n in (1, 2, 3)}
+                      for n, k, v in _fields(attribute)
+                      if n in (1, 2, 3) and k == _BYTES}
             if values.get(1) == "VARIABLE_VALUE":
-                return values.get(2, ""), values[3]
+                if not values.get(2) or not values.get(3):
+                    raise ValueError(
+                        "a variable without its name ({!r}) or without "
+                        "the name of its tensor ({!r})".format(
+                            values.get(2, ""), values.get(3, "")))
+                return values[2], values[3]
         return None
 
-    found = {}
+    found = []
     for local_name, node_id in children(nodes[0]):
         if not local_name.startswith("layer_with_weights-"):
             continue
         for variable_name, variable_id in children(nodes[node_id]):
-            entry = variable(nodes[variable_id])
-            if entry is None:
-                continue
-            full_name, checkpoint_key = entry
-            layer = full_name.rsplit("/", 1)[0]
-            if checkpoint_key not in reader:
-                raise CorruptCheckpointError(
-                    "{} has no tensor {}, which its object graph names "
-                    "for {}".format(reader.index_path, checkpoint_key,
-                                    full_name))
-            found.setdefault(layer, {})[variable_name] = \
-                reader.get_tensor(checkpoint_key)
+            names = variable(nodes[variable_id])
+            if names is not None:
+                found.append((variable_name,) + names)
     return found
 
 

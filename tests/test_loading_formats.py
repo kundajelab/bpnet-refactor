@@ -40,13 +40,51 @@ def test_fields_of_a_message():
     message = field(1, 5) + field(2, b"abc") + field(300, 2 ** 40 + 3) + \
         field(7, b"") + varint((4 << 3) | 5) + b"\x01\x02\x03\x04" + \
         varint((5 << 3) | 1) + bytes(range(8)) + field(2, b"x" * 300)
-    fields = [(n, v if isinstance(v, int) else bytes(v))
-              for n, v in loading._fields(memoryview(message))]
+    fields = [(n, k, v if isinstance(v, int) else bytes(v))
+              for n, k, v in loading._fields(memoryview(message))]
+    # with their kinds: 0 a number, 2 length delimited, 5 and 1 of
+    # fixed width (four and eight bytes)
     assert fields == [
-        (1, 5), (2, b"abc"), (300, 2 ** 40 + 3), (7, b""),
-        (4, b"\x01\x02\x03\x04"), (5, bytes(range(8))), (2, b"x" * 300)]
+        (1, 0, 5), (2, 2, b"abc"), (300, 0, 2 ** 40 + 3), (7, 2, b""),
+        (4, 5, b"\x01\x02\x03\x04"), (5, 1, bytes(range(8))),
+        (2, 2, b"x" * 300)]
+    assert (loading._VARINT, loading._FIXED64, loading._BYTES,
+            loading._FIXED32) == (0, 1, 2, 5)
     assert bytes(loading._first(memoryview(message), 2)) == b"abc"
     assert loading._first(memoryview(message), 9) is None
+    # a field of another kind is not the message that is looked for:
+    # eight bytes of fixed width that read as a message, a number
+    other = varint((2 << 3) | 1) + b"\x12\x02\x08\x01\x18\x00\x18\x00" + \
+        field(2, 7) + field(2, b"abc")
+    assert bytes(loading._first(memoryview(other), 2)) == b"abc"
+    assert loading._first(memoryview(other[:-5]), 2) is None
+    # the largest field number
+    largest = varint((2 ** 29 - 1) << 3) + b"\x01"
+    assert list(loading._fields(memoryview(largest))) == [(2 ** 29 - 1, 0, 1)]
+
+
+def test_numbers_of_a_message():
+    """
+        A number of a message takes at most ten bytes, of which 64
+        bits count (what the tenth byte has beyond them is dropped, as
+        protocol buffers do); a field of 32 bits keeps the low 32, and
+        the fields of both widths are signed
+    """
+
+    assert loading._varint(b"x\xac\x02", 1) == (300, 3)
+    assert loading._varint(b"\xff" * 9 + b"\x01", 0) == (2 ** 64 - 1, 10)
+    assert loading._varint(b"\xff" * 9 + b"\x7f", 0) == (2 ** 64 - 1, 10)
+    assert loading._varint(b"\x81" + b"\x80" * 8 + b"\x7e", 0) == (1, 10)
+    with pytest.raises(ValueError, match="more than ten bytes"):
+        loading._varint(b"\xff" * 10 + b"\x01", 0)
+    for value, as_32, as_64 in (
+            (0, 0, 0), (5, 5, 5), (2 ** 31 - 1, 2 ** 31 - 1, 2 ** 31 - 1),
+            (2 ** 31, -2 ** 31, 2 ** 31), (2 ** 32 - 1, -1, 2 ** 32 - 1),
+            (2 ** 32 + 1, 1, 2 ** 32 + 1), (2 ** 63 - 1, -1, 2 ** 63 - 1),
+            (2 ** 63, 0, -2 ** 63), (2 ** 64 - 1, -1, -1),
+            (2 ** 64 - 2 ** 31, -2 ** 31, -2 ** 31)):
+        assert loading._int32(value) == as_32
+        assert loading._int64(value) == as_64
 
 
 def test_truncated_or_foreign_data_is_not_read_as_a_message():
@@ -56,9 +94,23 @@ def test_truncated_or_foreign_data_is_not_read_as_a_message():
     for data in (b"\x80", b"\x08\xff\xff", field(2, b"abc")[:1] + b"\x80"):
         with pytest.raises(ValueError, match="Truncated"):
             list(loading._fields(memoryview(data)))
-    # wire type 3 (start group) is not used by these files
-    with pytest.raises(ValueError, match="wire type"):
-        list(loading._fields(memoryview(varint((1 << 3) | 3))))
+    # fields of fixed width that are cut short
+    for wire_type, length in ((5, 4), (1, 8)):
+        with pytest.raises(ValueError, match="Truncated"):
+            list(loading._fields(memoryview(
+                varint((1 << 3) | wire_type) + bytes(length - 1))))
+    # wire types 3 and 4 (groups) are not used by these files; 6 and 7
+    # do not exist
+    for wire_type in (3, 4, 6, 7):
+        with pytest.raises(ValueError, match="wire type"):
+            list(loading._fields(memoryview(varint((1 << 3) | wire_type))))
+    # there is no field number 0, and none of more than 29 bits (a
+    # field number with its kind has 32)
+    for data in (b"\x00\x01", field(0, b"abc"),
+                 varint((2 ** 29) << 3) + b"\x01",
+                 varint(2 ** 32 + (15 << 3)) + b"\x03"):
+        with pytest.raises(ValueError, match="field number"):
+            list(loading._fields(memoryview(data)))
 
 
 def keras_json(layers=()):

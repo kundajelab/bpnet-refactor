@@ -11,11 +11,15 @@
     Everything is checked the way TensorFlow checks it when it reads a
     checkpoint: the checksum of every block of the index and of every
     tensor that is read (CRC-32C). A file that is cut short or changed
-    is reported, not read as something else.
+    is reported, not read as something else: what these files say is
+    read as TensorFlow reads it, or not at all. (For files that no
+    writer makes the reader is the stricter of the two in places,
+    which the tests list.)
 
     What is not supported (and reported as such): variables that were
     saved in slices (partitioned variables), an index with compressed
-    blocks (TensorFlow does not write one), big endian data.
+    blocks (TensorFlow does not write one), big endian data, tensors
+    of more than 32 dimensions or marked as of unknown shape.
 """
 
 import os
@@ -23,7 +27,9 @@ import struct
 
 import numpy as np
 
-from bpnet.model.loading import UnsupportedModelError, _fields
+from bpnet.model.loading import (
+    UnsupportedModelError, _fields, _int32, _int64, _varint,
+    _BYTES, _FIXED32, _VARINT)
 
 
 class CorruptCheckpointError(ValueError):
@@ -356,22 +362,8 @@ _TYPES = {
     10: "?", 17: "<u2", 19: "<f2", 22: "<u4", 23: "<u8",
 }
 _STRING = 7
-
-
-def _message(value):
-    """
-        The fields of a message that is a field of another message
-    """
-
-    if isinstance(value, int):
-        raise ValueError("a number where a message is expected")
-    return _fields(value)
-
-
-def _integer(value):
-    if not isinstance(value, int):
-        raise ValueError("a message where a number is expected")
-    return value
+#: the most dimensions of an array (numpy 1)
+_MAX_RANK = 32
 
 
 class Checkpoint(object):
@@ -392,38 +384,45 @@ class Checkpoint(object):
             raise CorruptCheckpointError(
                 "{} has no header: it is not the index of a "
                 "checkpoint".format(self.index_path))
-        # BundleHeaderProto: num_shards, endianness, version
+        # BundleHeaderProto: num_shards, endianness, version. The
+        # messages of the index are read as protocol buffers read
+        # them: a field counts when it has the kind its message gives
+        # it and is passed over otherwise, a number has the width of
+        # its field (the numbers here: 32 bits, signed), and of a
+        # field that is there twice the last one counts
         shards, endianness, producer, consumer, bad = 0, 0, 0, 0, []
         try:
-            for number, value in _fields(memoryview(table.pop(b""))):
-                if number == 1:
-                    shards = _integer(value)
-                elif number == 2:
-                    endianness = _integer(value)
-                elif number == 3:
+            for number, kind, value in _fields(memoryview(table.pop(b""))):
+                if number == 1 and kind == _VARINT:
+                    shards = _int32(value)
+                elif number == 2 and kind == _VARINT:
+                    endianness = _int32(value)
+                elif number == 3 and kind == _BYTES:
                     # VersionDef: producer, min_consumer, bad_consumers
-                    for field, part in _message(value):
-                        if field == 1:
-                            producer = _integer(part)
-                        elif field == 2:
-                            consumer = _integer(part)
-                        elif field == 3 and isinstance(part, int):
-                            bad.append(part)
-                        elif field == 3:
+                    # (a list: one field each, or all in one field)
+                    for field, field_kind, part in _fields(value):
+                        if field == 1 and field_kind == _VARINT:
+                            producer = _int32(part)
+                        elif field == 2 and field_kind == _VARINT:
+                            consumer = _int32(part)
+                        elif field == 3 and field_kind == _VARINT:
+                            bad.append(_int32(part))
+                        elif field == 3 and field_kind == _BYTES:
                             position = 0
                             while position < len(part):
-                                one, position = _number(part, position)
-                                bad.append(one)
+                                one, position = _varint(part, position)
+                                bad.append(_int32(one))
         except ValueError as error:
             raise CorruptCheckpointError(
                 "{}: its header cannot be read ({})".format(
                     self.index_path, error))
         if endianness != 0:
             raise UnsupportedModelError(
-                "{}: the checkpoint was written on a big endian "
-                "machine".format(self.index_path))
+                "{}: the checkpoint was not written on a little endian "
+                "machine (endianness {})".format(
+                    self.index_path, endianness))
         # as TensorFlow checks the versions of a checkpoint it reads
-        if consumer > _VERSION or _VERSION in bad or producer >> 31:
+        if consumer > _VERSION or _VERSION in bad or producer < 0:
             raise UnsupportedModelError(
                 "{}: the checkpoint asks for another version of the "
                 "format than this reader has (version {}; written by {}, "
@@ -457,53 +456,71 @@ class Checkpoint(object):
         # (a field that is zero is not stored)
         entry = {"dtype": 0, "shape": [], "shard": 0, "offset": 0,
                  "size": 0, "crc": 0}
+        unknown_rank = sliced = False
         try:
-            for number, value in _fields(memoryview(message)):
-                if number == 1:
-                    entry["dtype"] = _integer(value)
-                elif number == 2:
-                    # TensorShapeProto: dim[i].size, unknown_rank
-                    for dim_number, dim in _message(value):
-                        if dim_number == 2:
+            for number, kind, value in _fields(memoryview(message)):
+                if number == 1 and kind == _VARINT:
+                    entry["dtype"] = _int32(value)
+                elif number == 2 and kind == _BYTES:
+                    # TensorShapeProto: dim[i] (size, name), unknown_rank
+                    for dim_number, dim_kind, dim in _fields(value):
+                        if dim_number == 2 and dim_kind == _BYTES:
                             size = 0
-                            for size_number, size_value in _message(dim):
-                                if size_number == 1:
-                                    size = _integer(size_value)
+                            for part, part_kind, part_value in _fields(dim):
+                                if part == 1 and part_kind == _VARINT:
+                                    size = _int64(part_value)
+                                elif part == 2 and part_kind == _BYTES:
+                                    # (the name of a dimension is text:
+                                    # protocol buffers do not read a
+                                    # message in which it is not)
+                                    bytes(part_value).decode("utf-8")
                             entry["shape"].append(size)
-                        elif dim_number == 3 and dim:
-                            raise UnsupportedModelError(
-                                "{}: tensor {} has no known shape".format(
-                                    self.index_path, key))
-                elif number == 3:
-                    entry["shard"] = _integer(value)
-                elif number == 4:
-                    entry["offset"] = _integer(value)
-                elif number == 5:
-                    entry["size"] = _integer(value)
-                elif number == 6:
-                    if isinstance(value, int) or len(value) != 4:
-                        raise ValueError("a checksum that is not 4 bytes")
+                        elif dim_number == 3 and dim_kind == _VARINT:
+                            unknown_rank = dim != 0
+                elif number == 3 and kind == _VARINT:
+                    entry["shard"] = _int32(value)
+                elif number == 4 and kind == _VARINT:
+                    entry["offset"] = _int64(value)
+                elif number == 5 and kind == _VARINT:
+                    entry["size"] = _int64(value)
+                elif number == 6 and kind == _FIXED32:
                     entry["crc"], = struct.unpack("<I", value)
-                elif number == 7:
-                    raise UnsupportedModelError(
-                        "{}: tensor {} was saved in slices (a partitioned "
-                        "variable)".format(self.index_path, key))
+                elif number == 7 and kind == _BYTES:
+                    sliced = True
+            if entry["offset"] < 0 or entry["size"] < 0:
+                raise ValueError("a negative offset or size")
             count = 1
             for size in entry["shape"]:
-                if size >> 63:
+                if size < 0:
                     raise ValueError("a dimension of unknown or negative "
                                      "size")
                 count *= size
             entry["count"] = count
-        except UnsupportedModelError:
-            raise
-        except (ValueError, TypeError, struct.error) as error:
+        except ValueError as error:
             raise CorruptCheckpointError(
                 "{}: the entry of tensor {} cannot be read ({})".format(
                     self.index_path, key, error))
+        if sliced:
+            raise UnsupportedModelError(
+                "{}: tensor {} was saved in slices (a partitioned "
+                "variable)".format(self.index_path, key))
+        if unknown_rank:
+            raise UnsupportedModelError(
+                "{}: tensor {} has no known shape".format(
+                    self.index_path, key))
+        if len(entry["shape"]) > _MAX_RANK:
+            raise UnsupportedModelError(
+                "{}: tensor {} has {} dimensions".format(
+                    self.index_path, key, len(entry["shape"])))
         return entry
 
-    def _bytes(self, key, entry):
+    def _read(self, key, entry, start, length):
+        """
+            `length` bytes of a tensor, from its byte `start`, after
+            checking that the data file holds what the index says the
+            tensor has
+        """
+
         path = "{}.data-{:05d}-of-{:05d}".format(
             self.prefix, entry["shard"], self.shards)
         if path not in self._files:
@@ -518,8 +535,13 @@ class Checkpoint(object):
                     path, key, entry["offset"] + entry["size"],
                     self._files[path]))
         with open(path, "rb") as fh:
-            fh.seek(entry["offset"])
-            return fh.read(entry["size"]), path
+            fh.seek(entry["offset"] + start)
+            data = fh.read(length)
+        if len(data) != length:
+            raise CorruptCheckpointError(
+                "{} is cut short: tensor {} has {} of {} bytes".format(
+                    path, key, len(data), length))
+        return data
 
     def get_tensor(self, key):
         """
@@ -547,37 +569,41 @@ class Checkpoint(object):
                     self.prefix, entry["shard"], self.shards, key, what))
 
         if entry["dtype"] == _STRING:
-            # the lengths of the strings (at least a byte each), a
-            # checksum of the lengths, the strings
-            if entry["size"] < count + 4:
+            # in the file: the lengths of the strings (one to ten
+            # bytes each), a checksum of the lengths, the strings.
+            # The lengths are read first; the strings are read when
+            # the lengths add up to the size the index gives (an
+            # index can claim any size)
+            size = entry["size"]
+            if size < count + 4:
                 raise corrupt("does not have the size its strings need")
-            data, _ = self._bytes(key, entry)
-            view = memoryview(data)
+            head = memoryview(self._read(
+                key, entry, 0, min(size, 10 * count + 4)))
             lengths, position, crc = [], 0, 0
             try:
                 for _ in range(count):
-                    length, position = _number(view, position)
+                    length, position = _number(head, position)
                     lengths.append(length)
                     crc = crc32c(struct.pack(
                         "<I" if length <= 0xFFFFFFFF else "<Q", length), crc)
             except ValueError:
                 raise corrupt("does not have the size its strings need")
-            if position + 4 + sum(lengths) != len(data):
+            if position + 4 + sum(lengths) != size:
                 raise corrupt("does not have the size its strings need")
-            stored, = struct.unpack("<I", view[position:position + 4])
+            stored, = struct.unpack("<I", head[position:position + 4])
             if _unmask(stored) != crc:
                 raise corrupt("does not have the checksum that is stored "
                               "with the lengths of its strings")
-            crc = crc32c(view[position:position + 4], crc)
-            position += 4
-            strings = []
-            for length in lengths:
-                strings.append(bytes(view[position:position + length]))
-                position += length
-            crc = crc32c(view[len(data) - sum(lengths):], crc)
-            if _unmask(entry["crc"]) != crc:
+            crc = crc32c(head[position:position + 4], crc)
+            body = memoryview(self._read(
+                key, entry, position + 4, sum(lengths)))
+            if _unmask(entry["crc"]) != crc32c(body, crc):
                 raise corrupt("does not have the checksum that is stored "
                               "with it")
+            strings, position = [], 0
+            for length in lengths:
+                strings.append(bytes(body[position:position + length]))
+                position += length
             if shape == ():
                 return strings[0]
             out = np.empty(count, dtype=object)
@@ -593,7 +619,7 @@ class Checkpoint(object):
         if count * dtype.itemsize != entry["size"]:
             raise corrupt("has {} bytes; its shape {} needs {}".format(
                 entry["size"], shape, count * dtype.itemsize))
-        data, _ = self._bytes(key, entry)
+        data = self._read(key, entry, 0, entry["size"])
         if _unmask(entry["crc"]) != crc32c(data):
             raise corrupt("does not have the checksum that is stored "
                           "with it")
