@@ -1,8 +1,5 @@
 ## Av's code with a bit of reformatting
 
-import os
-import threading
-
 import numpy as np
 
 # (TensorFlow is imported where it is needed: the shuffles are also
@@ -107,134 +104,17 @@ def _walk(tokens, successors):
     """
 
     tokens_list = tokens.tolist()
-    following = [iter(inds.tolist()) for inds in successors]
+    # for every token, what gives the next entry of its list
+    following = [iter(inds.tolist()).__next__ for inds in successors]
     order = [0] * len(tokens_list)
     ind = 0
     for j in range(1, len(tokens_list)):
-        ind = next(following[tokens_list[ind]])
+        ind = following[tokens_list[ind]]()
         order[j] = ind
     return tokens[order]
 
 
-#: the walk compiled by numba, once it has been asked for: [None] if
-#: numba is not installed or could not compile it
-_COMPILED_WALK = []
-#: held by the thread that compiles the walk
-_COMPILING = threading.Lock()
-#: the process that loaded this module
-_LOADED_IN = os.getpid()
-
-
-class _CompilerBusy(Exception):
-    """
-        numba's compiler is at work in another thread
-    """
-
-
-def _compile_walk():
-    """
-        Compile the walk with numba
-
-        numba compiles under a lock. It is taken here without waiting
-        and kept until the walk is compiled (it is reentrant: the
-        compilation takes it again), so that nothing here waits for
-        another thread's compilation.
-
-        Returns:
-            function: the walk (same arguments and result as _walk)
-
-        Raises:
-            _CompilerBusy: another thread holds numba's lock
-            Exception: numba is not installed, cannot be loaded, does
-                not keep its lock where this function looks for it,
-                or fails to compile
-    """
-
-    import numba
-    from numba.core.compiler_lock import global_compiler_lock
-
-    lock = global_compiler_lock._lock
-    if not lock.acquire(False):
-        raise _CompilerBusy()
-    try:
-        @numba.njit
-        def visit(tokens, flat, counters, order):
-            ind = 0
-            for j in range(1, tokens.shape[0]):
-                t = tokens[ind]
-                ind = flat[counters[t]]
-                counters[t] += 1
-                order[j] = ind
-
-        def walk(tokens, successors):
-            # the lists of successors one after the other, and where
-            # the list of each token starts
-            flat = np.concatenate(successors).astype(np.int64)
-            counters = np.zeros(len(successors), dtype=np.int64)
-            counters[1:] = np.cumsum(
-                [len(inds) for inds in successors])[:-1]
-            order = np.zeros(len(tokens), dtype=np.int64)
-            visit(np.ascontiguousarray(tokens, dtype=np.int64), flat,
-                  counters, order)
-            return tokens[order]
-
-        # compile now: a failure is found here, not in a shuffle
-        walk(np.array([0, 1, 0]), [np.array([1]), np.array([2])])
-        return walk
-    finally:
-        lock.release()
-
-
-def _compiled_walk():
-    """
-        The walk as a function compiled by numba (same arguments and
-        result as _walk), None where it is not to be had
-
-        It is compiled once per process, by the first thread that asks
-        for it. Nothing waits for a compilation: a thread that asks
-        while another compiles (this function or anything else that
-        numba compiles) gets None for the time being and walks in
-        Python.
-
-        A process that was forked from the one that loaded this
-        module does not compile: numba's compiler may have been at
-        work in another thread of its parent, whose lock would be
-        held here for good and whose state half made. Such a process
-        uses the compiled walk only if its parent had it before the
-        fork, and walks in Python otherwise. (A process started
-        afresh loads the module itself and compiles.)
-    """
-
-    if _COMPILED_WALK:
-        return _COMPILED_WALK[0]
-    if os.getpid() != _LOADED_IN:
-        return None
-    if not _COMPILING.acquire(False):
-        return None
-    try:
-        if _COMPILED_WALK:
-            return _COMPILED_WALK[0]
-        try:
-            walk = _compile_walk()
-        except _CompilerBusy:
-            return None
-        except Exception:
-            # no numba, or one that this module cannot use
-            walk = None
-        _COMPILED_WALK.append(walk)
-        return walk
-    finally:
-        _COMPILING.release()
-
-
-#: from this many positions to walk in one call on, the walk is done
-#: by the compiled function where numba is installed (compiling takes
-#: between a third of a second and a second, once per process; below,
-#: the walk in Python is used, which gives the same result)
-COMPILED_FROM = 20000
-
-
-def dinuc_shuffle(seq, num_shufs, rng=None, compiled=None):
+def dinuc_shuffle(seq, num_shufs, rng=None):
     """
     Creates shuffles of the given sequence, in which dinucleotide frequencies
     are preserved.
@@ -243,10 +123,6 @@ def dinuc_shuffle(seq, num_shufs, rng=None, compiled=None):
             encodings
         `num_shufs`: the number of shuffles to create, N
         `rng`: a NumPy RandomState object, to use for performing shuffles
-        `compiled`: whether the walk over the positions is done by a
-            function compiled with numba (True, False; None: where
-            numba is installed, when N * L is at least COMPILED_FROM).
-            The shuffles do not depend on it.
     If `seq` is a string, returns a list of N strings of length L, each one
     being a shuffled version of `seq`. If `seq` is a 2D NumPy array, then the
     result is an N x L x D NumPy array of shuffled versions of `seq`, also
@@ -255,7 +131,8 @@ def dinuc_shuffle(seq, num_shufs, rng=None, compiled=None):
     The shuffles of a sequence are those of the implementation this
     function had before it was made faster, for the same `rng` (the
     same random numbers are drawn in the same order; only the walk
-    that builds a shuffle from them is done differently).
+    that builds a shuffle from them is done differently: over lists
+    instead of numpy arrays one element at a time).
     """
 
     if type(seq) is str:
@@ -289,11 +166,6 @@ def dinuc_shuffle(seq, num_shufs, rng=None, compiled=None):
             (num_shufs, seq_len, one_hot_dim), dtype=seq.dtype
         )
 
-    walk = _walk
-    if compiled or (compiled is None and
-                    num_shufs * len(tokens) >= COMPILED_FROM):
-        walk = _compiled_walk() or _walk
-
     for i in range(num_shufs):
         if len(tokens) == 0:
             # (as before: an empty sequence has no first position)
@@ -307,7 +179,7 @@ def dinuc_shuffle(seq, num_shufs, rng=None, compiled=None):
             shuf_next_inds[t] = shuf_next_inds[t][inds]
 
         # Build the resulting array
-        result = walk(tokens, shuf_next_inds)
+        result = _walk(tokens, shuf_next_inds)
 
         if type(seq) is str:
             all_results.append(char_array_to_string(chars[result]))

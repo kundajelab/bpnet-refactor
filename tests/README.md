@@ -18,7 +18,7 @@ Tests run on the CPU. Set `BPNET_TEST_GPU=1` to let TensorFlow use a GPU.
 | `test_synth.py` | the builder itself |
 | `checks.py` | reference computations that share no code with the package: what a batch must contain, from the builder's arrays |
 | `test_sequence_ops.py` | one-hot encoding, reverse complement of sequences and profiles, rounding |
-| `test_dinuc_shuffle.py` | the dinucleotide shuffle that makes the references of `bpnet-shap` (`bpnet.utils.shaputils.dinuc_shuffle`): the same shuffles, and the same random numbers drawn, as the implementation it had before (`legacy_reference.py`) for strings and one hot arrays of every type, with and without N, whether the walk is done in Python or by the function numba compiles; that they are dinucleotide shuffles; which walk is used when |
+| `test_dinuc_shuffle.py` | the dinucleotide shuffle that makes the references of `bpnet-shap` (`bpnet.utils.shaputils.dinuc_shuffle`): the same shuffles as the implementation it had before (`legacy_reference.py`), and the random state left in the same state, for strings and one hot arrays of every type, with and without N, views and rows that are not one hot; that they are dinucleotide shuffles; the walk that builds a shuffle; what is not a sequence |
 | `test_peak_positions.py` | `getPeakPositions`: windows, chromosome-end filtering, index and chromosome selection, background sampling, weights |
 | `test_generators_synth.py` | `MBPNetSequenceGenerator` on the synthetic dataset: epoch composition (trimming, padding, background resampling), batch contents against the truth, jitter, reverse-complement copies, smoothed controls, unstranded / no-control / two-task layouts |
 | `test_sequtils.py` | peak loading, one-hot encoding, reverse complement |
