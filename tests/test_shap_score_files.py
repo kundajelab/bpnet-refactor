@@ -83,26 +83,75 @@ def test_what_a_score_file_holds(tmp_path):
         assert np.array_equal(f["input_seqs"][:], sequences)
 
 
-@pytest.mark.parametrize("kind", ["object", "numpy text", "pandas text",
-                                  "categories"])
-def test_names_in_the_types_a_table_of_peaks_can_have(tmp_path, kind):
+def read_like_the_command(tmp_path):
     """
-        The chromosome column as pandas reads it from a peak file
-        (Python text, or pandas' own text type), as a numpy array of
-        text, and as categories
+        The names as pandas reads them from a peak file, with the
+        call of bpnet-shap
     """
 
+    path = str(tmp_path / "peaks.bed")
+    with open(path, "w") as fh:
+        for i, name in enumerate(NAMES):
+            fh.write("\t".join([name, str(i * 100), str(i * 100 + 40), ".",
+                                "0", ".", "1.0", "-1", "-1", "20"]) + "\n")
+    return pd.read_csv(
+        path, sep="\t", header=None,
+        names=["chrom", "st", "stop", "name", "score", "strand", "signal",
+               "p", "q", "summit"])["chrom"]
+
+
+#: the types a chromosome column has: Python text in an object column
+#: (pandas before 3), pandas' own text type (the default of pandas 3),
+#: categories, and whatever the installed pandas makes of a peak file
+COLUMNS = {
+    "object": lambda tmp_path: pd.Series(NAMES, dtype=object),
+    "pandas text": lambda tmp_path: pd.Series(NAMES, dtype="string"),
+    "categories": lambda tmp_path: pd.Series(NAMES, dtype="category"),
+    "read from a peak file": read_like_the_command,
+}
+
+
+@pytest.mark.parametrize("kind", sorted(COLUMNS))
+def test_names_in_the_types_a_chromosome_column_has(tmp_path, kind):
     table = peaks(NAMES)
-    if kind == "numpy text":
-        table["chrom"] = np.array(NAMES)
-    elif kind == "pandas text":
-        table["chrom"] = table["chrom"].astype("string")
-    elif kind == "categories":
-        table["chrom"] = table["chrom"].astype("category")
+    table["chrom"] = COLUMNS[kind](tmp_path)
+    if kind == "object":
+        # (the type with which the names were cut, in any pandas)
+        assert table["chrom"].values.dtype == object
+    assert list(table["chrom"]) == NAMES
     sequences, scores = arrays(len(NAMES))
     path = str(tmp_path / "scores.h5")
     shap_scores.save_scores(table, sequences, scores, path)
     assert stored_names(path) == NAMES
+
+
+def test_files_for_short_names_are_what_they_were(tmp_path):
+    """
+        For names of up to 8 characters the file holds what the line
+        that cut the names wrote: the same names in the same type
+    """
+
+    names = ["c" * length for length in range(1, 9)] + ["chr1", "chrX"]
+    table = peaks(names)
+    table["chrom"] = pd.Series(names, dtype=object)
+    sequences, scores = arrays(len(names))
+    path = str(tmp_path / "scores.h5")
+    shap_scores.save_scores(table, sequences, scores, path)
+    before = str(tmp_path / "before.h5")
+    with h5py.File(before, "w") as f:
+        dset = f.create_dataset(
+            "coords_chrom", (len(names),),
+            dtype=h5py.string_dtype(encoding="ascii"))
+        dset[:] = table["chrom"].values.astype("U8")
+    with h5py.File(path, "r") as now, h5py.File(before, "r") as was:
+        assert now["coords_chrom"].dtype == was["coords_chrom"].dtype
+        assert h5py.check_string_dtype(now["coords_chrom"].dtype) == \
+            h5py.check_string_dtype(was["coords_chrom"].dtype)
+        found, expected = now["coords_chrom"][:], was["coords_chrom"][:]
+        assert found.dtype == expected.dtype
+        assert [type(name) for name in found] == \
+            [type(name) for name in expected]
+        assert list(found) == list(expected)
 
 
 def test_one_peak_and_one_long_name(tmp_path):
