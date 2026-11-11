@@ -214,107 +214,315 @@ def test_compiled_walk_is_made_once(monkeypatch):
                               shaputils._walk(tokens, successors))
 
 
-def test_numba_that_is_missing_or_fails(monkeypatch):
+def test_numba_that_is_missing_or_cannot_be_used(monkeypatch):
     """
-        Without numba, or with one that cannot compile the walk, the
-        walk in Python is used: no error, the same shuffles
+        Without numba, or with one that cannot be loaded, cannot
+        compile the walk, or does not keep its compiler lock where
+        this module takes it from, the walk in Python is used: no
+        error, the same shuffles
     """
 
+    import builtins
     import sys
 
     rng = np.random.RandomState(6)
     x = one_hot("".join(rng.choice(list("ACGT"), size=2114)))
     expected = dinuc_shuffle_v0(x, 20, np.random.RandomState(8))
 
+    def falls_back():
+        monkeypatch.setattr(shaputils, "_COMPILED_WALK", [])
+        assert shaputils._compiled_walk() is None
+        for compiled in (None, True):
+            assert np.array_equal(
+                dinuc_shuffle(x, 20, np.random.RandomState(8),
+                              compiled=compiled), expected)
+        assert shaputils._COMPILED_WALK == [None]
+
     # not installed
-    monkeypatch.setattr(shaputils, "_COMPILED_WALK", [])
-    monkeypatch.setitem(sys.modules, "numba", None)
-    assert shaputils._compiled_walk() is None
-    assert np.array_equal(dinuc_shuffle(x, 20, np.random.RandomState(8)),
-                          expected)
-    assert shaputils._COMPILED_WALK == [None]
-    monkeypatch.undo()
+    with monkeypatch.context() as patch:
+        patch.setitem(sys.modules, "numba", None)
+        falls_back()
     if not has_numba():
         return
 
-    # installed, and compiling fails
     import numba
+    from numba.core import compiler_lock
 
+    # installed, and its libraries cannot be loaded
+    real_import = builtins.__import__
+
+    def broken_import(name, *args, **kwargs):
+        if name == "numba" or name.startswith("numba."):
+            raise OSError("cannot open shared object file")
+        return real_import(name, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(builtins, "__import__", broken_import)
+        falls_back()
+
+    # compiling fails
     def fails(*args, **kwargs):
         raise RuntimeError("no compiler today")
 
+    with monkeypatch.context() as patch:
+        patch.setattr(numba, "njit", fails)
+        falls_back()
+    # (and the compiler's lock was let go)
+    assert not compiler_lock.global_compiler_lock._lock._is_owned()
+
+    # a numba that keeps its lock elsewhere, or whose lock is taken
+    # in another way
+    class NoLock(object):
+        pass
+
+    class OtherLock(object):
+        class _lock(object):
+            @staticmethod
+            def acquire():
+                return True
+
+            @staticmethod
+            def release():
+                pass
+
+    for other in (NoLock(), OtherLock()):
+        with monkeypatch.context() as patch:
+            patch.setattr(compiler_lock, "global_compiler_lock", other)
+            falls_back()
+
+    # none of this is remembered by the next process, and numba works
     monkeypatch.setattr(shaputils, "_COMPILED_WALK", [])
-    monkeypatch.setattr(numba, "njit", fails)
-    assert shaputils._compiled_walk() is None
-    for compiled in (None, True):
-        assert np.array_equal(
-            dinuc_shuffle(x, 20, np.random.RandomState(8), compiled=compiled),
-            expected)
+    assert shaputils._compiled_walk() is not None
 
 
-def test_nothing_waits_for_a_compilation(monkeypatch):
+THREADS = r"""
+import threading
+import numpy as np
+import numba
+from numba.core.compiler_lock import global_compiler_lock
+from bpnet.utils import shaputils
+from bpnet.utils.shaputils import dinuc_shuffle
+from tests.legacy_reference import dinuc_shuffle_v0
+
+rng = np.random.RandomState(9)
+x = np.zeros((2114, 4), dtype=np.int8)
+x[np.arange(2114), rng.randint(0, 4, size=2114)] = 1
+expected = dinuc_shuffle_v0(x, 20, np.random.RandomState(8))
+
+
+def shuffle():
+    return dinuc_shuffle(x, 20, np.random.RandomState(8), compiled=True)
+
+
+def elsewhere(function):
+    # the result of a function in another thread
+    result = []
+    thread = threading.Thread(target=lambda: result.append(function()))
+    thread.start()
+    thread.join()
+    return result[0]
+
+
+def lock_is_free():
+    def probe():
+        if global_compiler_lock._lock.acquire(False):
+            global_compiler_lock._lock.release()
+            return True
+        return False
+    return elsewhere(probe)
+
+
+# another thread compiles the walk: this one does not wait
+with shaputils._COMPILING:
+    assert elsewhere(shaputils._compiled_walk) is None
+    assert np.array_equal(elsewhere(shuffle), expected)
+assert shaputils._COMPILED_WALK == []
+
+# numba compiles something in another thread: the same
+with global_compiler_lock:
+    assert elsewhere(shaputils._compiled_walk) is None
+    assert np.array_equal(elsewhere(shuffle), expected)
+assert shaputils._COMPILED_WALK == [] and lock_is_free()
+
+# a compilation that fails lets go of numba's lock
+real = numba.njit
+numba.njit = lambda *args, **kwargs: 1 / 0
+assert shaputils._compiled_walk() is None
+assert shaputils._COMPILED_WALK == [None] and lock_is_free()
+numba.njit = real
+shaputils._COMPILED_WALK[:] = []
+
+# numba's lock is held while the walk is compiled, by this thread, and
+# free afterwards
+held = []
+
+
+def watching(*args, **kwargs):
+    held.append(global_compiler_lock._lock._is_owned())
+    return real(*args, **kwargs)
+
+
+numba.njit = watching
+start = threading.Event()
+results = []
+
+
+def one_of_several():
+    start.wait()
+    results.append(shuffle())
+
+
+threads = [threading.Thread(target=one_of_several) for _ in range(6)]
+for thread in threads:
+    thread.start()
+start.set()
+for thread in threads:
+    thread.join()
+numba.njit = real
+# several threads at once: one walk was compiled, all shuffles are right
+# (numba calls njit for pieces of its own while it compiles: every
+# call found the lock held by its thread)
+assert held and all(held), held
+assert len(results) == 6
+assert all(np.array_equal(result, expected) for result in results)
+assert len(shaputils._COMPILED_WALK) == 1
+assert shaputils._COMPILED_WALK[0] is not None
+assert shaputils._compiled_walk() is shaputils._COMPILED_WALK[0]
+assert lock_is_free() and not shaputils._COMPILING.locked()
+assert np.array_equal(shuffle(), expected)
+print("all as expected")
+"""
+
+
+FORKS = r"""
+import os, signal, sys, threading
+import numpy as np
+from numba.core.compiler_lock import global_compiler_lock
+from bpnet.utils import shaputils
+from bpnet.utils.shaputils import dinuc_shuffle
+from tests.legacy_reference import dinuc_shuffle_v0
+
+text = "ACGT" * 600
+expected = dinuc_shuffle_v0(text, 20, np.random.RandomState(1))
+
+
+def right():
+    return dinuc_shuffle(text, 20, np.random.RandomState(1)) == expected
+
+
+def in_a_child(check):
+    # the exit status of a forked process that runs the check, which
+    # must be through within a minute
+    pid = os.fork()
+    if pid == 0:
+        signal.alarm(60)
+        try:
+            ok = check()
+        except BaseException:
+            ok = False
+        os._exit(0 if ok else 3)
+    return os.waitpid(pid, 0)[1]
+
+
+def in_a_new_thread(check):
+    result = []
+    thread = threading.Thread(target=lambda: result.append(check()))
+    thread.start()
+    thread.join()
+    return result[0]
+
+
+def walks_in_python():
+    # right shuffles, from the main thread and from a new one (which
+    # may get the identity of a thread of the parent), nothing compiled
+    return right() and in_a_new_thread(right) and \
+        shaputils._COMPILED_WALK == [] and \
+        shaputils._compiled_walk() is None
+
+
+# a thread of this process holds the compiler's lock, as a thread
+# that compiles does; a process forked now inherits it held, by nobody
+held, release = threading.Event(), threading.Event()
+
+
+def hold_compiler():
+    with global_compiler_lock:
+        held.set()
+        release.wait()
+
+
+thread = threading.Thread(target=hold_compiler)
+thread.start()
+held.wait()
+assert in_a_child(walks_in_python) == 0
+# and a child of such a child
+assert in_a_child(lambda: in_a_child(walks_in_python) == 0) == 0
+release.set()
+thread.join()
+
+# forked while nothing is compiling, before the walk is compiled: the
+# child does not compile either (it cannot know)
+assert shaputils._COMPILED_WALK == []
+assert in_a_child(walks_in_python) == 0
+
+# this process compiles; a process forked afterwards has the walk
+assert right() and shaputils._COMPILED_WALK[0] is not None
+compiled = shaputils._COMPILED_WALK[0]
+
+
+def uses_the_compiled_walk():
+    return right() and in_a_new_thread(right) and \
+        shaputils._compiled_walk() is compiled
+
+
+assert in_a_child(uses_the_compiled_walk) == 0
+print("all as expected")
+"""
+
+
+def in_a_process(script):
+    import os
+    import subprocess
+    import sys
+
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    done = subprocess.run(
+        [sys.executable, "-c", script], cwd=repo,
+        env=dict(os.environ, PYTHONPATH=repo, PYTHONDONTWRITEBYTECODE="1"),
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        universal_newlines=True, timeout=180)
+    assert done.returncode == 0, done.stdout[-3000:]
+    assert "all as expected" in done.stdout, done.stdout[-3000:]
+
+
+def test_nothing_waits_for_a_compilation():
     """
-        One thread compiles the walk; a thread that asks meanwhile
-        walks in Python instead of waiting, and so does one that asks
-        while numba compiles something else. Afterwards the compiled
-        walk is there, made once.
+        One thread compiles the walk, holding numba's compiler lock
+        for the time; a thread that asks meanwhile, or while numba
+        compiles something else, walks in Python instead of waiting.
+        Several threads at once get one compiled walk and the same
+        shuffles, and the locks are free afterwards, also when the
+        compilation fails. (In a process of its own: a thread that
+        waited after all would be left behind.)
     """
 
     if not has_numba():
         pytest.skip("numba is not installed")
-    import threading
+    in_a_process(THREADS)
 
-    from numba.core.compiler_lock import global_compiler_lock
 
-    rng = np.random.RandomState(9)
-    x = one_hot("".join(rng.choice(list("ACGT"), size=2114)))
-    expected = dinuc_shuffle_v0(x, 20, np.random.RandomState(8))
-    monkeypatch.setattr(shaputils, "_COMPILED_WALK", [])
+def test_forked_processes_do_not_compile():
+    """
+        A process that is forked while a thread of its parent compiles
+        with numba inherits the compiler's lock, held by nobody: a
+        shuffle in it must not compile (it would wait forever). No
+        forked process compiles; one that is forked after its parent
+        compiled the walk uses that. The shuffles are the same in all.
+    """
 
-    def from_another_thread(function):
-        result = []
-        thread = threading.Thread(
-            target=lambda: result.append(function()), daemon=True)
-        thread.start()
-        thread.join(60)
-        assert not thread.is_alive()
-        return result[0]
-
-    # this thread is "compiling"
-    with shaputils._COMPILING:
-        assert from_another_thread(shaputils._compiled_walk) is None
-        assert np.array_equal(from_another_thread(lambda: dinuc_shuffle(
-            x, 20, np.random.RandomState(8))), expected)
-    assert shaputils._COMPILED_WALK == []
-    # numba is compiling something
-    with global_compiler_lock:
-        assert from_another_thread(shaputils._numba_is_compiling)
-        assert from_another_thread(shaputils._compiled_walk) is None
-        assert np.array_equal(from_another_thread(lambda: dinuc_shuffle(
-            x, 20, np.random.RandomState(8), compiled=True)), expected)
-    assert shaputils._COMPILED_WALK == []
-    assert not shaputils._numba_is_compiling()
-
-    # several threads at once: one function, the same shuffles
-    results, threads = [], []
-    start = threading.Event()
-
-    def shuffle():
-        start.wait()
-        results.append(dinuc_shuffle(x, 20, np.random.RandomState(8)))
-
-    for _ in range(6):
-        threads.append(threading.Thread(target=shuffle, daemon=True))
-        threads[-1].start()
-    start.set()
-    for thread in threads:
-        thread.join(120)
-        assert not thread.is_alive()
-    assert len(results) == 6
-    assert all(np.array_equal(result, expected) for result in results)
-    assert len(shaputils._COMPILED_WALK) == 1
-    assert shaputils._COMPILED_WALK[0] is not None
-    assert shaputils._compiled_walk() is shaputils._COMPILED_WALK[0]
+    if not has_numba():
+        pytest.skip("numba is not installed")
+    in_a_process(FORKS)
 
 
 def test_walk_that_another_thread_has_just_compiled_is_used(monkeypatch):
@@ -336,62 +544,6 @@ def test_walk_that_another_thread_has_just_compiled_is_used(monkeypatch):
     monkeypatch.setattr(shaputils, "_COMPILING", JustReleased())
     assert shaputils._compiled_walk() == "the walk of the other thread"
     assert shaputils._COMPILED_WALK == ["the walk of the other thread"]
-
-
-FORKED_WHILE_COMPILING = """
-import os, signal, sys, threading
-import numpy as np
-from numba.core.compiler_lock import global_compiler_lock
-from bpnet.utils.shaputils import dinuc_shuffle
-from tests.legacy_reference import dinuc_shuffle_v0
-
-held, release = threading.Event(), threading.Event()
-
-def hold_compiler():
-    with global_compiler_lock:
-        held.set()
-        release.wait()
-
-thread = threading.Thread(target=hold_compiler)
-thread.start()
-held.wait()
-pid = os.fork()
-if pid == 0:
-    # the lock of the compiler is held here by a thread that does not
-    # exist in this process
-    signal.alarm(20)
-    text = "ACGT" * 600
-    same = dinuc_shuffle(text, 20, np.random.RandomState(1)) == \
-        dinuc_shuffle_v0(text, 20, np.random.RandomState(1))
-    os._exit(0 if same else 3)
-release.set()
-thread.join()
-print("child:", os.waitpid(pid, 0)[1])
-"""
-
-
-def test_process_forked_while_numba_compiles():
-    """
-        A process that is forked while a thread of its parent compiles
-        with numba inherits the compiler's lock, held: a shuffle in it
-        must not try to compile (it would wait forever), and gives the
-        same shuffles
-    """
-
-    if not has_numba():
-        pytest.skip("numba is not installed")
-    import os
-    import subprocess
-    import sys
-
-    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    done = subprocess.run(
-        [sys.executable, "-c", FORKED_WHILE_COMPILING], cwd=repo,
-        env=dict(os.environ, PYTHONPATH=repo, PYTHONDONTWRITEBYTECODE="1"),
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        universal_newlines=True, timeout=120)
-    assert done.returncode == 0, done.stdout[-2000:]
-    assert "child: 0" in done.stdout, done.stdout[-2000:]
 
 
 def test_without_a_random_state():

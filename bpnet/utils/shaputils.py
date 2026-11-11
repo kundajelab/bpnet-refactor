@@ -1,5 +1,6 @@
 ## Av's code with a bit of reformatting
 
+import os
 import threading
 
 import numpy as np
@@ -120,77 +121,105 @@ def _walk(tokens, successors):
 _COMPILED_WALK = []
 #: held by the thread that compiles the walk
 _COMPILING = threading.Lock()
+#: the process that loaded this module
+_LOADED_IN = os.getpid()
 
 
-def _numba_is_compiling():
+class _CompilerBusy(Exception):
     """
-        Whether numba's compiler is at work in another thread: its
-        lock cannot be had. (In a process that was forked while a
-        thread of its parent compiled, the lock is held for good by a
-        thread that does not exist here; compiling would wait forever.)
+        numba's compiler is at work in another thread
     """
 
-    try:
-        from numba.core.compiler_lock import global_compiler_lock
 
-        lock = global_compiler_lock._lock
-    except (ImportError, AttributeError):
-        return False
+def _compile_walk():
+    """
+        Compile the walk with numba
+
+        numba compiles under a lock. It is taken here without waiting
+        and kept until the walk is compiled (it is reentrant: the
+        compilation takes it again), so that nothing here waits for
+        another thread's compilation.
+
+        Returns:
+            function: the walk (same arguments and result as _walk)
+
+        Raises:
+            _CompilerBusy: another thread holds numba's lock
+            Exception: numba is not installed, cannot be loaded, does
+                not keep its lock where this function looks for it,
+                or fails to compile
+    """
+
+    import numba
+    from numba.core.compiler_lock import global_compiler_lock
+
+    lock = global_compiler_lock._lock
     if not lock.acquire(False):
-        return True
-    lock.release()
-    return False
+        raise _CompilerBusy()
+    try:
+        @numba.njit
+        def visit(tokens, flat, counters, order):
+            ind = 0
+            for j in range(1, tokens.shape[0]):
+                t = tokens[ind]
+                ind = flat[counters[t]]
+                counters[t] += 1
+                order[j] = ind
+
+        def walk(tokens, successors):
+            # the lists of successors one after the other, and where
+            # the list of each token starts
+            flat = np.concatenate(successors).astype(np.int64)
+            counters = np.zeros(len(successors), dtype=np.int64)
+            counters[1:] = np.cumsum(
+                [len(inds) for inds in successors])[:-1]
+            order = np.zeros(len(tokens), dtype=np.int64)
+            visit(np.ascontiguousarray(tokens, dtype=np.int64), flat,
+                  counters, order)
+            return tokens[order]
+
+        # compile now: a failure is found here, not in a shuffle
+        walk(np.array([0, 1, 0]), [np.array([1]), np.array([2])])
+        return walk
+    finally:
+        lock.release()
 
 
 def _compiled_walk():
     """
         The walk as a function compiled by numba (same arguments and
-        result as _walk), None where numba is not available
+        result as _walk), None where it is not to be had
 
         It is compiled once per process, by the first thread that asks
         for it. Nothing waits for a compilation: a thread that asks
         while another compiles (this function or anything else that
         numba compiles) gets None for the time being and walks in
-        Python, and so does, for good, a process that was forked
-        while a thread of its parent was compiling.
+        Python.
+
+        A process that was forked from the one that loaded this
+        module does not compile: numba's compiler may have been at
+        work in another thread of its parent, whose lock would be
+        held here for good and whose state half made. Such a process
+        uses the compiled walk only if its parent had it before the
+        fork, and walks in Python otherwise. (A process started
+        afresh loads the module itself and compiles.)
     """
 
     if _COMPILED_WALK:
         return _COMPILED_WALK[0]
+    if os.getpid() != _LOADED_IN:
+        return None
     if not _COMPILING.acquire(False):
         return None
     try:
         if _COMPILED_WALK:
             return _COMPILED_WALK[0]
-        if _numba_is_compiling():
-            return None
         try:
-            import numba
-
-            @numba.njit
-            def visit(tokens, flat, counters, order):
-                ind = 0
-                for j in range(1, tokens.shape[0]):
-                    t = tokens[ind]
-                    ind = flat[counters[t]]
-                    counters[t] += 1
-                    order[j] = ind
-
-            def walk(tokens, successors):
-                # the lists of successors one after the other, and
-                # where the list of each token starts
-                flat = np.concatenate(successors).astype(np.int64)
-                counters = np.zeros(len(successors), dtype=np.int64)
-                counters[1:] = np.cumsum(
-                    [len(inds) for inds in successors])[:-1]
-                order = np.zeros(len(tokens), dtype=np.int64)
-                visit(np.ascontiguousarray(tokens, dtype=np.int64), flat,
-                      counters, order)
-                return tokens[order]
-
-            # compile now: a failure is found here, not in a shuffle
-            walk(np.array([0, 1, 0]), [np.array([1]), np.array([2])])
+            walk = _compile_walk()
+        except _CompilerBusy:
+            return None
         except Exception:
+            # no numba, or one that this module cannot use
             walk = None
         _COMPILED_WALK.append(walk)
         return walk
