@@ -19,9 +19,10 @@ from tensorflow.keras.optimizers import Adam
 from bpnet.model import loading
 from bpnet.model.custommodel import CustomModel
 
-from tests.model_helpers import (make_tasks, random_batch,
+from tests.model_helpers import (FIXTURE_MODELS, FIXTURE_VERSIONS,
+                                 fixture_files, make_tasks, random_batch,
                                  randomize_weights, small_params,
-                                 weights_by_layer)
+                                 unpack_fixture_models, weights_by_layer)
 from tests.saved_weights import weights_by_layer_name
 from tests.test_arch import FORWARD_CASES, build, forward_case, predict
 
@@ -114,15 +115,6 @@ def test_dropout_of_a_loaded_model_is_inactive_in_prediction(saved):
     first = predict(loaded, saved["inputs"])
     second = predict(loaded, saved["inputs"])
     assert all(np.array_equal(a, b) for a, b in zip(first, second))
-
-
-#: the models of the saved-model fixtures in tests/data/saved_models:
-#: directory name in the archive -> (architecture variant, saved after
-#: training steps with the optimizer's state, also saved as HDF5)
-FIXTURE_MODELS = {
-    "released_structure": ("two strands with control", True, True),
-    "hidden_counts_layers": ("counts head with hidden layers", False, False),
-}
 
 
 def weight_digests(model):
@@ -448,11 +440,6 @@ def test_keras_own_loader_fails_once_a_model_was_built(tmp_path):
 
 # -------------------- models saved by other versions --------------------
 
-FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data",
-                        "saved_models")
-FIXTURE_VERSIONS = ["2.4.1", "2.11.0", "2.15.1"]
-
-
 @pytest.fixture(scope="module", params=FIXTURE_VERSIONS)
 def fixture_models(request, tmp_path_factory):
     """
@@ -460,29 +447,9 @@ def fixture_models(request, tmp_path_factory):
         tests/data/saved_models/make_fixtures.py), unpacked
     """
 
-    import tarfile
-
-    name = "tf{}".format(request.param)
     target = str(tmp_path_factory.mktemp("fixtures"))
-    with tarfile.open(os.path.join(FIXTURES, name + ".tar.gz")) as tar:
-        members = tar.getmembers()
-        # only plain files and directories below the archive's folder
-        for member in members:
-            parts = member.name.split("/")
-            assert member.isfile() or member.isdir(), member.name
-            assert parts[0] == name and ".." not in parts, member.name
-            assert not os.path.isabs(member.name), member.name
-        tar.extractall(target, members=members)
-    return {"version": request.param, "dir": os.path.join(target, name)}
-
-
-def fixture_files():
-    files = []
-    for directory, (_, _, hdf5) in sorted(FIXTURE_MODELS.items()):
-        files.append((directory, "model"))
-        if hdf5:
-            files.append((directory, "model.h5"))
-    return files
+    return {"version": request.param,
+            "dir": unpack_fixture_models(request.param, target)}
 
 
 @pytest.mark.parametrize("directory,file_name", fixture_files())
