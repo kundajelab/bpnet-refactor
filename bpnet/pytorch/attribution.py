@@ -29,24 +29,31 @@
 
     Both rely on the layout of a batch inside deep_lift_shap
     (sequences, then references, row for row). The layout is looked
-    at once per process with a small model that notes what it is
-    given (_check_layout), so that a later tangermeme with another
-    layout is refused instead of giving other scores; and the tests
-    compare the scores with an independent DeepLIFT.
+    at with a small model that notes what it is given (_check_layout:
+    once per process for a deep_lift_shap, a kind of device, a type
+    and with or without control inputs, called as the scores call
+    it), so that a later tangermeme with another layout is refused
+    instead of giving other scores; and the tests compare the scores
+    with an independent DeepLIFT.
 
     The scores are verified for models whose only nonlinear layers
     are ReLU, which is every model bpnet-train makes with its default
-    architecture; a model with another activation is refused.
+    architecture, on a CPU and on CUDA GPUs; a model with another
+    activation, or one in which the sequence goes through the
+    logsumexp that these models take of their control counts, is
+    refused (check_model), and so is another kind of device
+    (resolve_device).
 
     The scores are computed in the type of the model's parameters and
-    nothing less: on a GPU with TF32 switched off, without the
-    reduced precision that torch.set_float32_matmul_precision allows,
-    and outside any autocast of the caller. PyTorch lets cuDNN
-    compute convolutions in TF32 (10 bits of mantissa) by default on
-    the GPUs that have it; with it, 4% of the profile scores of a
-    trained ENCODE model were more than 1e-5 of the largest score of
-    their peak off, by up to 9e-4; without it, all were within 5e-8
-    of an independent float64 computation, at the same speed.
+    nothing less: with every precision setting of PyTorch at full
+    precision (no TF32 on a GPU, no bfloat16 inside matrix products on
+    a CPU) and outside any autocast of the caller, and with all of it
+    as it was afterwards (_FullPrecision). PyTorch lets cuDNN compute
+    convolutions in TF32 (10 bits of mantissa) by default on the GPUs
+    that have it; with it, 4% of the profile scores of a trained
+    ENCODE model were more than 1e-5 of the largest score of their
+    peak off, by up to 9e-4; without it, all were within 5e-8 of an
+    independent float64 computation, at the same speed.
 """
 
 import contextlib
@@ -55,7 +62,7 @@ import warnings
 import numpy as np
 import torch
 
-from bpnet.pytorch.model import channels_first, channels_last
+from bpnet.pytorch.model import Model, channels_first, channels_last
 from bpnet.utils.shaputils import dinuc_shuffle
 
 
@@ -65,18 +72,39 @@ from bpnet.utils.shaputils import dinuc_shuffle
 _VERIFIED_LAYERS = (torch.nn.Conv1d, torch.nn.Linear, torch.nn.Dropout,
                     torch.nn.ReLU, torch.nn.ModuleDict)
 
+#: the layers that a model computes with a function and without a
+#: module of their own, and that are linear. deep_lift_shap finds the
+#: layers it has rules for by their modules; of a layer without one it
+#: takes the gradient, which is what DeepLIFT does with a linear layer
+_LINEAR_FUNCTIONS = ("Cropping1D", "Add", "Concatenate",
+                     "GlobalAveragePooling1D", "Flatten")
+
 
 def check_model(model):
     """
-        Refuse a model with a layer for which the scores of this
-        module are not verified (an activation other than ReLU:
-        deep_lift_shap has rules for many of them, and none of them
-        has been compared with bpnet-shap)
+        Refuse a model for which the scores of this module are not
+        verified:
+
+        - a model with an activation other than ReLU (deep_lift_shap
+          has rules for many of them, and none of them has been
+          compared with bpnet-shap);
+        - a model in which the sequence goes through a layer that is
+          not linear and has no module: the logsumexp that the models
+          of this package take of their control counts, taken of
+          something that is computed from the sequence. deep_lift_shap
+          would take its gradient, which is not DeepLIFT. (Taken of
+          control inputs, as bpnet-train builds it, no score of the
+          sequence goes through it.)
 
         Raises:
-            ValueError: the model has such a layer
+            ValueError: the model is such a model, or is not a model
+                of bpnet.pytorch.model
     """
 
+    if not isinstance(model, Model):
+        raise ValueError(
+            "A model of bpnet.pytorch.model is expected, not a {}".format(
+                type(model).__name__))
     others = sorted({type(module).__name__ for module in model.modules()
                      if module is not model and
                      not isinstance(module, _VERIFIED_LAYERS)})
@@ -85,6 +113,57 @@ def check_model(model):
             "The scores of the PyTorch backend are verified for models "
             "whose only nonlinear layers are ReLU; this model has layers "
             "of the kind {}".format(", ".join(others)))
+    # what is computed from the sequence (the first input), and the
+    # layers on the way that deep_lift_shap does not see
+    reached, unseen = set(model.input_names[:1]), []
+    for name, kind, sources in model.steps():
+        if reached.isdisjoint(sources):
+            continue
+        reached.add(name)
+        if name not in model.layers and kind not in _LINEAR_FUNCTIONS:
+            unseen.append("{} ({})".format(name, kind))
+    if unseen:
+        raise ValueError(
+            "The scores of the PyTorch backend are verified for models "
+            "whose only nonlinear layers are ReLU; this model computes "
+            "the layer {} from the sequence".format(", ".join(unseen)))
+
+
+def resolve_device(device):
+    """
+        The device the scores are computed on
+
+        Args:
+            device (str or torch.device): None: a GPU when PyTorch
+                sees one, the CPU otherwise
+
+        Returns:
+            torch.device
+
+        Raises:
+            ValueError: not a device of PyTorch; a device that is
+                neither a CPU nor a CUDA GPU (the scores are verified
+                on these); a GPU that PyTorch does not see
+    """
+
+    if device is None:
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    try:
+        found = torch.device(device)
+    except (RuntimeError, ValueError, TypeError) as error:
+        raise ValueError("device {}: not a device of PyTorch ({})".format(
+            device, str(error).split("\n")[0]))
+    if found.type not in ("cpu", "cuda"):
+        raise ValueError(
+            "device {}: the scores are computed on a CPU or a CUDA GPU "
+            "('cpu', 'cuda', 'cuda:1', ...), not on a device of the kind "
+            "{}".format(device, found.type))
+    if found.type == "cuda":
+        seen = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        if (found.index or 0) >= seen:
+            raise ValueError("device {}: PyTorch sees {} GPU(s) here".format(
+                device, seen))
+    return found
 
 
 class _Layout(torch.nn.Module):
@@ -97,60 +176,79 @@ class _Layout(torch.nn.Module):
         self.weight = torch.nn.Parameter(torch.ones(1))
         self.seen = []
 
-    def forward(self, sequence, mark):
-        self.seen.append((sequence.detach().clone(), mark.detach().clone()))
+    def forward(self, sequence, mark=None):
+        self.seen.append(tuple(
+            None if given is None else given.detach().cpu().double()
+            for given in (sequence, mark)))
         return (self.weight * sequence).sum(dim=(1, 2)).unsqueeze(-1)
 
 
-_LAYOUT_CHECKED = []
+#: what the layout has been looked at for: (deep_lift_shap, kind of
+#: device, type, with extra inputs or without)
+_LAYOUT_CHECKED = set()
 
 
-def _check_layout(deep_lift_shap):
+def _check_layout(deep_lift_shap, device, dtype, extra):
     """
         Is a batch inside deep_lift_shap what the targets of this
         module take it to be: the sequences of the pairs of the batch,
         then the reference of each pair in the same order, and the
-        extra inputs of the sequences for both halves? Looked at once
-        per process, with three sequences, two references each and
-        batches of four pairs.
+        extra inputs of the sequences for both halves? Looked at with
+        three sequences, two references each and batches of four
+        pairs, in a call like those of the scores (sequences as small
+        integers, hypothetical scores, the device and the type of the
+        model, extra inputs when the model has control inputs); once
+        per process for each such combination.
+
+        Args:
+            deep_lift_shap (callable): tangermeme's
+            device (torch.device): where the scores are computed
+            dtype (torch.dtype): the type of the model's parameters
+            extra (bool): the model has control inputs
 
         Raises:
             RuntimeError: the layout is another one (a tangermeme
                 this module was not written for)
     """
 
-    if _LAYOUT_CHECKED:
+    key = (deep_lift_shap, device.type, dtype, bool(extra))
+    if key in _LAYOUT_CHECKED:
         return
     # sequence i is all base i; its reference j has base 3 at
     # position j and base i elsewhere: all rows are different
     length, shuffles = 4, 2
-    x = torch.zeros(3, 4, length)
-    references = torch.zeros(3, shuffles, 4, length)
+    x = torch.zeros(3, 4, length, dtype=torch.int8)
+    references = torch.zeros(3, shuffles, 4, length, dtype=torch.int8)
     for i in range(3):
         x[i, i] = 1
         for j in range(shuffles):
             references[i, j, i] = 1
             references[i, j, :, j] = 0
             references[i, j, 3, j] = 1
-    marks = torch.tensor([[1.0], [2.0], [3.0]])
-    layout = _Layout()
+    marks = torch.tensor([[1.0], [2.0], [3.0]], dtype=torch.float64)
+    layout = _Layout().type(dtype)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        deep_lift_shap(layout, x, args=(marks,), references=references,
-                       batch_size=4, device="cpu", dtype=torch.float32,
+        deep_lift_shap(layout, x,
+                       args=(marks.type(dtype),) if extra else None,
+                       references=references, hypothetical=True,
+                       batch_size=4, device=device, dtype=dtype,
                        only_warn=True)
     pair, as_expected = 0, bool(layout.seen)
     for sequence, mark in layout.seen:
         half = sequence.shape[0] // 2
         as_expected = as_expected and sequence.shape[0] == 2 * half and \
-            mark.shape[0] == 2 * half
+            (mark is not None) == bool(extra) and \
+            (mark is None or mark.shape[0] == 2 * half)
         for row in range(half if as_expected else 0):
             i, j = divmod(pair, shuffles)
             as_expected = as_expected and i < 3 and \
-                torch.equal(sequence[row], x[i]) and \
-                torch.equal(sequence[half + row], references[i, j]) and \
-                torch.equal(mark[row], marks[i]) and \
-                torch.equal(mark[half + row], marks[i])
+                torch.equal(sequence[row], x[i].double()) and \
+                torch.equal(sequence[half + row],
+                            references[i, j].double()) and \
+                (mark is None or (
+                    torch.equal(mark[row], marks[i]) and
+                    torch.equal(mark[half + row], marks[i])))
             pair += 1
     if not as_expected or pair != 3 * shuffles:
         import tangermeme
@@ -160,85 +258,105 @@ def _check_layout(deep_lift_shap):
             "then their references, row for row): its scores would not be "
             "those of bpnet-shap".format(
                 getattr(tangermeme, "__version__", "(unknown version)")))
-    _LAYOUT_CHECKED.append(True)
+    _LAYOUT_CHECKED.add(key)
+
+
+#: the precision settings of PyTorch 2.9 and later, (backend, kind of
+#: operation), each after the one it follows while it has no value of
+#: its own: an operation follows its backend, a backend 'generic'
+_SETTINGS = (("generic", "all"), ("cuda", "all"), ("mkldnn", "all"),
+             ("cuda", "conv"), ("cuda", "rnn"), ("cuda", "matmul"),
+             ("mkldnn", "conv"), ("mkldnn", "rnn"), ("mkldnn", "matmul"))
 
 
 class _FullPrecision(object):
     """
-        While inside: float32 is float32. No TF32 on the GPU
-        (convolutions and matrix products), no reduced precision of
-        matrix products (torch.set_float32_matmul_precision), no
-        autocast of the caller; afterwards every setting as it was.
+        While inside: float32 is float32. No TF32 on a GPU, no
+        bfloat16 inside the matrix products and convolutions of a CPU,
+        no autocast of the caller on the CPU and on the device given;
+        afterwards everything as it was.
 
-        PyTorch has three sets of switches for this, which it keeps
-        side by side: torch.set_float32_matmul_precision, the older
-        'allow_tf32' flags, and (PyTorch 2.9 and later) a setting per
-        backend and kind of operation, 'fp32_precision'. Each is read
-        before any is changed and put back in the order in which the
-        later ones overwrite the earlier ones; a switch that cannot be
-        read (PyTorch refuses to report one that disagrees with the
-        others) is left alone.
+        PyTorch 2.9 and later decide what a computation does by a
+        setting per backend and kind of operation ('fp32_precision'),
+        and a setting without a value of its own follows the one above
+        it (the operation its backend, the backend 'generic'). PyTorch
+        reports a setting only as it resolves: one that follows cannot
+        be told from one that has the same value of its own, and so
+        could not be put back as it was. The settings are therefore
+        gone through from the top. 'generic' (which follows nothing)
+        is set to full precision; a setting below that then still
+        reads something else has that value of its own. Only such
+        settings are written, and each is put back to what it read.
+        The older switches (torch.set_float32_matmul_precision and
+        the 'allow_tf32' flags) are left alone: no computation of
+        these versions reads them, and setting them writes settings.
+        (While inside, PyTorch may refuse to report an older switch,
+        as it does for one that disagrees with the settings.)
+
+        Before PyTorch 2.9 the older switches are all there is: the
+        TF32 flag of cuDNN and the precision of matrix products are
+        set and put back.
+
+        Args:
+            device (torch.device): where the caller computes (None:
+                on the CPU)
     """
 
+    def __init__(self, device=None):
+        self._autocast = ["cpu"]
+        if device is not None and device.type != "cpu":
+            self._autocast.append(device.type)
+
     def __enter__(self):
-        backends = torch.backends
-
-        def readable(read):
-            # (older PyTorch does not have every switch, and says so
-            # in several ways)
-            try:
-                return read()
-            except (RuntimeError, AttributeError, AssertionError):
-                return None
-
-        matmul = readable(lambda: torch.get_float32_matmul_precision())
-        flags = [(backends.cudnn, "allow_tf32")]
-        if matmul is None:
-            # (no such setting in this PyTorch, or the backends were
-            # set one by one in a way it cannot say)
-            flags.append((backends.cuda.matmul, "allow_tf32"))
-        holders = [("cuda", "matmul"), ("mkldnn", "matmul")] + [
-            (backend, kind) for backend in ("cudnn", "mkldnn")
-            for kind in ("conv", "rnn")]
-        settings = [getattr(getattr(backends, backend, None), kind, None)
-                    for backend, kind in holders]
-        # what is there now ...
-        flags = [(holder, name, readable(lambda: getattr(holder, name)))
-                 for holder, name in flags]
-        before = [(setting, readable(lambda: setting.fp32_precision))
-                  for setting in settings]
-        before = [(setting, value) for setting, value in before
-                  if value is not None]
-        settings = [setting for setting, _ in before]
-        # ... full precision ...
-        if matmul is not None:
-            torch.set_float32_matmul_precision("highest")
-        for holder, name, value in flags:
-            if value is not None:
-                setattr(holder, name, False)
-        for setting in settings:
-            setting.fp32_precision = "ieee"
-
-        # ... and how to put it back
-        def undo():
-            if matmul is not None:
-                torch.set_float32_matmul_precision(matmul)
-            for holder, name, value in flags:
-                if value is not None:
-                    setattr(holder, name, value)
-            for setting, value in before:
-                setting.fp32_precision = value
-
-        self._undo = undo
+        #: (how to write a switch, what it was), in the order written
+        self._written = []
         self._contexts = contextlib.ExitStack()
-        for device_type in ("cpu", "cuda"):
-            if device_type == "cpu" or torch.cuda.is_available():
+        try:
+            self._switch()
+            for device_type in self._autocast:
                 self._contexts.enter_context(torch.autocast(
                     device_type=device_type, enabled=False))
+        except BaseException:
+            self.__exit__()
+            raise
+        return self
 
     def __exit__(self, *failure):
         self._contexts.close()
-        self._undo()
+        # the last one written first
+        while self._written:
+            write, was = self._written.pop()
+            write(was)
+
+    def _set(self, write, was, value):
+        write(value)
+        self._written.append((write, was))
+
+    def _switch(self):
+        read = getattr(torch._C, "_get_fp32_precision_getter", None)
+        write = getattr(torch._C, "_set_fp32_precision_setter", None)
+        if read is None or write is None:
+            cudnn = torch.backends.cudnn
+            self._set(lambda value: setattr(cudnn, "allow_tf32", value),
+                      cudnn.allow_tf32, False)
+            self._set(torch.set_float32_matmul_precision,
+                      torch.get_float32_matmul_precision(), "highest")
+            return
+        for backend, kind in _SETTINGS:
+            was = read(backend, kind)
+            if was != "ieee":
+                self._set(lambda value, backend=backend, kind=kind:
+                          write(backend, kind, value), was, "ieee")
+        left = ["{} {}: {}".format(backend, kind, read(backend, kind))
+                for backend, kind in _SETTINGS
+                if read(backend, kind) != "ieee"]
+        if left:
+            raise RuntimeError(
+                "PyTorch {} does not take the precision settings of "
+                "bpnet.pytorch.attribution ({} after setting them to "
+                "ieee): the scores are not computed with less than the "
+                "precision of the model".format(
+                    torch.__version__, ", ".join(left)))
 
 
 def _no_control_for_the_references(control):
@@ -367,8 +485,8 @@ def hypothetical_scores(model, which, sequences, controls=None,
             seed (int): seed of the shuffles
             batch_size (int): pairs of a sequence and a reference per
                 forward pass (the model sees twice as many rows)
-            device (str or torch.device): where to compute; None: a
-                GPU when there is one
+            device (str or torch.device): where to compute, a CPU
+                or a CUDA GPU; None: a GPU when there is one
             chunk (int): sequences whose references are held in
                 memory at a time
             progress (callable): called with the number of sequences
@@ -383,8 +501,9 @@ def hypothetical_scores(model, which, sequences, controls=None,
         Raises:
             ValueError: the model has a layer for which the scores
                 are not verified (check_model), the inputs are not
-                what the model takes, or a number of shuffles, a
-                batch size or a chunk below 1
+                what the model takes, a number of shuffles, a batch
+                size or a chunk below 1, or a device that is not
+                there or neither a CPU nor a CUDA GPU
             RuntimeError: the installed tangermeme lays out its
                 batches in another way than this module relies on
     """
@@ -408,7 +527,7 @@ def hypothetical_scores(model, which, sequences, controls=None,
         raise ValueError("which: 'counts' or 'profile', not {!r}".format(
             which))
     check_model(model)
-    _check_layout(deep_lift_shap)
+    device = resolve_device(device)
     targets = [kinds[name](model) for name in names_of_targets]
     names = model.input_names[1:]
     controls = dict(controls or {})
@@ -429,7 +548,8 @@ def hypothetical_scores(model, which, sequences, controls=None,
     was_training = model.training
     model.eval()
     try:
-        with _FullPrecision():
+        with _FullPrecision(device):
+            _check_layout(deep_lift_shap, device, dtype, bool(names))
             _score(deep_lift_shap, targets, sequences, controls, names,
                    num_shuffles, seed, batch_size, device, chunk, progress,
                    dtype, outs)

@@ -390,6 +390,23 @@ class Model(torch.nn.Module):
     # running
     # ----------------------------------------------------------------
 
+    def steps(self):
+        """
+            The layers in the order in which forward() computes them
+
+            Returns:
+                list: for every layer (name, kind, names of the layers
+                    whose outputs it takes). The kind is the class of
+                    the Keras layer ('InputLayer', 'Conv1D', 'Add',
+                    ...), and 'LogSumExp' for the Lambda layer of the
+                    control counts. A layer that is computed by a
+                    module has it in `layers` under its name; the
+                    others are computed by functions.
+        """
+
+        return [(name, kind, list(sources))
+                for name, kind, sources, _ in self._steps]
+
     def forward(self, *inputs, **named):
         """
             Args:

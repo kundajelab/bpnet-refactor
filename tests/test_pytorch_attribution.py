@@ -314,132 +314,6 @@ def test_autocast_of_the_caller_does_not_change_the_scores(case):
         assert np.array_equal(a, b)
 
 
-#: every precision switch of torch, set in several ways, before and
-#: after the context in which the scores are computed (in a process of
-#: its own: the switches are global)
-PRECISION_SWITCHES = r'''
-import torch
-from bpnet.pytorch import attribution
-
-b = torch.backends
-NEWER = True
-try:
-    b.cudnn.conv.fp32_precision
-except (AttributeError, AssertionError):
-    NEWER = False
-PATHS = ["cuda.matmul", "cudnn", "cudnn.conv", "cudnn.rnn", "mkldnn",
-         "mkldnn.matmul", "mkldnn.conv", "mkldnn.rnn"]
-
-
-def holder(path):
-    found = b
-    for part in path.split("."):
-        found = getattr(found, part)
-    return found
-
-
-def state():
-    readers = {"flag of cuDNN": lambda: b.cudnn.allow_tf32,
-               "flag of matmul": lambda: b.cuda.matmul.allow_tf32,
-               "matmul precision": torch.get_float32_matmul_precision}
-    if NEWER:
-        readers["all"] = lambda: b.fp32_precision
-        for path in PATHS:
-            readers[path] = lambda path=path: holder(path).fp32_precision
-    out = {}
-    for name, read in readers.items():
-        try:
-            out[name] = read()
-        except Exception as error:
-            out[name] = "not readable: " + type(error).__name__
-    return out
-
-
-def fresh():
-    if NEWER:
-        for path, value in (("cuda.matmul", "ieee"), ("mkldnn.matmul", "ieee"),
-                            ("mkldnn.conv", "none"), ("mkldnn.rnn", "none")):
-            holder(path).fp32_precision = value
-    torch.set_float32_matmul_precision("highest")
-    b.cudnn.allow_tf32 = True
-    if NEWER:
-        b.cudnn.conv.fp32_precision = "tf32"
-        b.cudnn.rnn.fp32_precision = "tf32"
-
-
-def flag(of, value):
-    setattr(of, "allow_tf32", value)
-
-
-def setting(path, value):
-    holder(path).fp32_precision = value
-
-
-setups = {
-    "as PyTorch starts": lambda: None,
-    "matmul precision high":
-        lambda: torch.set_float32_matmul_precision("high"),
-    "matmul precision medium":
-        lambda: torch.set_float32_matmul_precision("medium"),
-    "flag of cuDNN off": lambda: flag(b.cudnn, False),
-    "flag of matmul on": lambda: flag(b.cuda.matmul, True),
-    "both flags on": lambda: (flag(b.cudnn, True), flag(b.cuda.matmul, True)),
-}
-if NEWER:
-    setups.update({
-        "convolutions ieee, rnn tf32": lambda: setting("cudnn.conv", "ieee"),
-        "convolutions tf32 after the flag was off":
-            lambda: (flag(b.cudnn, False), setting("cudnn.conv", "tf32")),
-        "mkldnn convolutions bf16": lambda: setting("mkldnn.conv", "bf16"),
-        "matmul of cuda alone tf32": lambda: setting("cuda.matmul", "tf32"),
-        "medium, then the flag of matmul off": lambda: (
-            torch.set_float32_matmul_precision("medium"),
-            flag(b.cuda.matmul, False)),
-    })
-for name, setup in setups.items():
-    fresh()
-    setup()
-    before = state()
-    with attribution._FullPrecision():
-        inside = state()
-    after = state()
-    assert after == before, (name, before, after)
-    # inside: full precision wherever a switch can be read, and what
-    # could be read before can be read
-    for key, value in inside.items():
-        readable = not str(value).startswith("not readable")
-        assert readable or str(before[key]).startswith("not readable"), \
-            (name, key, inside)
-        assert not readable or value in (False, "highest", "ieee", "none"), \
-            (name, key, inside)
-    if NEWER:
-        assert inside["cudnn.conv"] == inside["cuda.matmul"] == "ieee", inside
-    print("as before:", name)
-print("settings checked:", len(setups))
-'''
-
-
-def test_precision_switches_are_left_as_they_were():
-    """
-        Inside the context in which the scores are computed every
-        precision switch of PyTorch says full precision; afterwards
-        each is what it was, however the caller had set them (the
-        matmul precision, the older TF32 flags, the newer settings per
-        backend, and mixtures that PyTorch itself refuses to report)
-    """
-
-    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    done = subprocess.run(
-        [sys.executable, "-c", PRECISION_SWITCHES],
-        env=dict(os.environ, PYTHONPATH=repo, CUDA_VISIBLE_DEVICES="",
-                 PYTHONDONTWRITEBYTECODE="1"),
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        universal_newlines=True, timeout=600)
-    assert done.returncode == 0, done.stdout[-3000:]
-    assert "settings checked: " in done.stdout
-    assert done.stdout.count("as before:") >= 6
-
-
 def test_type_of_the_sequences_does_not_matter(case):
     expected = scores(case, "profile")
     for dtype in (np.int8, np.float32, bool):
@@ -663,6 +537,111 @@ def test_models_with_other_nonlinear_layers_are_refused(case):
     # dropout does nothing when a model is evaluated
     model.layers[name] = torch.nn.Dropout(0.5)
     attribution.check_model(model)
+    # what is not a model of this package has layers and steps that
+    # nothing here knows
+    for other in (torch.nn.Linear(2, 2), attribution.CountsTarget(model)):
+        with pytest.raises(ValueError, match="A model of bpnet.pytorch.model "
+                           "is expected, not a " + type(other).__name__):
+            attribution.check_model(other)
+
+
+def with_logsumexp(params, of):
+    """
+        A model without control inputs whose two log counts go through
+        the logsumexp that the models of this package take of their
+        control counts: directly ('counts'), or together with an input
+        of two values, the input first ('both')
+    """
+
+    architecture, weights = without_control(params, counts=2)
+    layers, taken = architecture["layers"], ["logcounts_predictions"]
+    if of == "both":
+        layers.append(entry("InputLayer", "other",
+                            batch_input_shape=[None, 2]))
+        layers.append(entry("Concatenate", "together",
+                            ["other", "logcounts_predictions"], axis=-1))
+        architecture["input_layers"].append(["other", 0, 0])
+        taken = ["together"]
+    layers.append(entry("Lambda", "main_logsumexp_counts_bias_0", taken))
+    architecture["output_layers"][1][0] = "main_logsumexp_counts_bias_0"
+    return pytorch_model.from_architecture(architecture, weights)
+
+
+@pytest.mark.parametrize("of", ["counts", "both"])
+def test_a_logsumexp_of_what_comes_from_the_sequence_is_refused(case, of):
+    """
+        The logsumexp of the control counts has no module, so
+        deep_lift_shap does not see it and takes its gradient. That is
+        nothing to the scores while it is taken of control inputs, as
+        in the models of bpnet-train (the model with control inputs
+        here has one, and is scored like the reference); a model that
+        takes it of something computed from the sequence is refused
+    """
+
+    kinds = [kind for _, kind, _ in case["model"].steps()]
+    assert ("LogSumExp" in kinds) == bool(case["controls"])
+    attribution.check_model(case["model"])
+
+    params = small_params()
+    model = with_logsumexp(params, of)
+    message = "only nonlinear layers are ReLU; this model computes the " \
+        "layer main_logsumexp_counts_bias_0 \\(LogSumExp\\) from the " \
+        "sequence"
+    with pytest.raises(ValueError, match=message):
+        attribution.check_model(model)
+    sequences = random_sequences(2, params["input_len"], seed=4)
+    controls = {"other": np.ones((2, 2))} if of == "both" else None
+    with pytest.raises(ValueError, match=message):
+        attribution.hypothetical_scores(
+            model, "counts", sequences, controls, num_shuffles=2,
+            device="cpu")
+    # the model itself computes: it is the scores that are not verified
+    extra = [torch.ones(2, 2, dtype=torch.float64)] if of == "both" else []
+    with torch.no_grad():
+        _, counts = model(torch.tensor(pytorch_model.channels_first(
+            sequences)), *extra)
+    assert counts.shape == (2, 1) and bool(torch.isfinite(counts).all())
+
+
+def test_devices_the_scores_are_computed_on(case):
+    """
+        A CPU or a CUDA GPU that PyTorch sees; without a device, a
+        GPU when there is one. Anything else is refused before
+        anything is computed
+    """
+
+    cpu = torch.device("cpu")
+    assert attribution.resolve_device("cpu") == cpu
+    assert attribution.resolve_device(cpu) == cpu
+    there = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    assert attribution.resolve_device(None) == torch.device(
+        "cuda" if there else "cpu")
+    if there:
+        assert attribution.resolve_device("cuda:0") == torch.device("cuda:0")
+    for device, message in (
+            ("nowhere", "device nowhere: not a device of PyTorch"),
+            (3, "device 3: "),
+            ("mps", "device mps: the scores are computed on a CPU or a CUDA "
+             "GPU .*, not on a device of the kind mps"),
+            ("xpu", "not on a device of the kind xpu"),
+            ("meta", "not on a device of the kind meta"),
+            (torch.device("meta"), "device meta: .* of the kind meta"),
+            ("cuda:{}".format(there), "device cuda:{}: PyTorch sees {} "
+             r"GPU\(s\) here".format(there, there)),
+            ("cuda:99", r"device cuda:99: PyTorch sees {} GPU\(s\) "
+             "here".format(there))):
+        if device == 3 and there > 3:
+            continue
+        with pytest.raises(ValueError, match=message):
+            attribution.resolve_device(device)
+        with pytest.raises(ValueError, match=message):
+            attribution.hypothetical_scores(
+                case["model"], "counts", case["sequences"], case["controls"],
+                num_shuffles=2, device=device)
+    if not there:
+        with pytest.raises(ValueError, match=r"device cuda: PyTorch sees 0 "
+                           r"GPU\(s\) here"):
+            attribution.resolve_device("cuda")
 
 
 def fake_deep_lift_shap(order):
@@ -673,14 +652,15 @@ def fake_deep_lift_shap(order):
     """
 
     def deep_lift_shap(model, X, args=None, references=None, batch_size=32,
-                       **settings):
+                       dtype=torch.float32, **settings):
         pairs = [(i, j) for i in range(X.shape[0])
                  for j in range(references.shape[1])]
         for start in range(0, len(pairs), batch_size):
             batch = pairs[start:start + batch_size]
-            x = torch.stack([X[i] for i, _ in batch]).float()
-            r = torch.stack([references[i, j] for i, j in batch]).float()
-            a = torch.stack([args[0][i] for i, _ in batch]).float()
+            x = torch.stack([X[i] for i, _ in batch]).type(dtype)
+            r = torch.stack([references[i, j] for i, j in batch]).type(dtype)
+            a = None if args is None else torch.stack(
+                [args[0][i] for i, _ in batch]).type(dtype)
             given = order(x, r, a)
             if given is not None:
                 model(*given)
@@ -689,28 +669,40 @@ def fake_deep_lift_shap(order):
     return deep_lift_shap
 
 
+def twice(a):
+    return None if a is None else torch.cat([a, a])
+
+
+#: ways to lay out a batch of sequences x, their references r and the
+#: extra inputs a of the sequences (None when there are none)
 LAYOUTS = {
-    "as tangermeme 1.6": lambda x, r, a: (
-        torch.cat([x, r]), torch.cat([a, a])),
-    "references first": lambda x, r, a: (
-        torch.cat([r, x]), torch.cat([a, a])),
+    "as tangermeme 1.6": lambda x, r, a: (torch.cat([x, r]), twice(a)),
+    "references first": lambda x, r, a: (torch.cat([r, x]), twice(a)),
     "sequences and references in turn": lambda x, r, a: (
         torch.stack([x, r], dim=1).reshape((-1,) + x.shape[1:]),
-        a.repeat_interleave(2, dim=0)),
+        None if a is None else a.repeat_interleave(2, dim=0)),
     "references in another order": lambda x, r, a: (
-        torch.cat([x, r.flip(0)]), torch.cat([a, a])),
+        torch.cat([x, r.flip(0)]), twice(a)),
+    "sequences in another order": lambda x, r, a: (
+        torch.cat([x.flip(0), r]), twice(a)),
+    "sequences only": lambda x, r, a: (x, a),
+    "the model is not called": lambda x, r, a: None,
+}
+
+#: ways that differ from tangermeme 1.6 in the extra inputs alone
+LAYOUTS_OF_EXTRA_INPUTS = {
     "no extra inputs for the references": lambda x, r, a: (
         torch.cat([x, r]), torch.cat([a, torch.zeros_like(a)])),
     "extra inputs of the references in another order": lambda x, r, a: (
         torch.cat([x, r]), torch.cat([a, a.flip(0)])),
     "extra inputs of the sequences in another order": lambda x, r, a: (
         torch.cat([x, r]), torch.cat([a.flip(0), a])),
-    "sequences only": lambda x, r, a: (x, a),
-    "the model is not called": lambda x, r, a: None,
+    "extra inputs left out": lambda x, r, a: (torch.cat([x, r]), None),
 }
 
 
-@pytest.mark.parametrize("layout", sorted(LAYOUTS))
+@pytest.mark.parametrize(
+    "layout", sorted(LAYOUTS) + sorted(LAYOUTS_OF_EXTRA_INPUTS))
 def test_layout_of_a_batch_is_looked_at(case, monkeypatch, layout):
     """
         The targets rely on how deep_lift_shap lays out a batch: the
@@ -721,32 +713,89 @@ def test_layout_of_a_batch_is_looked_at(case, monkeypatch, layout):
 
     from tangermeme import deep_lift_shap as module
 
-    monkeypatch.setattr(attribution, "_LAYOUT_CHECKED", [])
-    fake = fake_deep_lift_shap(LAYOUTS[layout])
+    monkeypatch.setattr(attribution, "_LAYOUT_CHECKED", set())
+    cpu, double = torch.device("cpu"), torch.float64
+    extra_inputs_only = layout in LAYOUTS_OF_EXTRA_INPUTS
+    fake = fake_deep_lift_shap(
+        dict(LAYOUTS, **LAYOUTS_OF_EXTRA_INPUTS)[layout])
     if layout == "as tangermeme 1.6":
-        attribution._check_layout(fake)
-        assert attribution._LAYOUT_CHECKED == [True]
-        # (looked at once per process: not again)
-        attribution._check_layout(None)
+        attribution._check_layout(fake, cpu, double, True)
+        attribution._check_layout(fake, cpu, double, False)
+        assert attribution._LAYOUT_CHECKED == {
+            (fake, "cpu", double, True), (fake, "cpu", double, False)}
         return
-    with pytest.raises(RuntimeError, match="hands a model other batches"):
-        attribution._check_layout(fake)
-    assert attribution._LAYOUT_CHECKED == []
+    for extra in (True,) if extra_inputs_only else (True, False):
+        with pytest.raises(RuntimeError, match="hands a model other batches"):
+            attribution._check_layout(fake, cpu, double, extra)
+    assert attribution._LAYOUT_CHECKED == set()
+    if extra_inputs_only and not case["controls"]:
+        # (a model without control inputs has no extra inputs)
+        return
     monkeypatch.setattr(module, "deep_lift_shap", fake)
     with pytest.raises(RuntimeError, match="hands a model other batches"):
         scores(case, "counts")
 
 
 def test_layout_of_the_installed_tangermeme(case, monkeypatch):
-    from tangermeme.deep_lift_shap import deep_lift_shap
+    """
+        The installed deep_lift_shap lays out its batches as the
+        targets take them to be, with and without extra inputs, for
+        float64 and float32. Scoring looks at it in a call like its
+        own (sequences as small integers, hypothetical scores, the
+        type of the model, extra inputs when the model has control
+        inputs), once for each such way of calling and again for
+        another deep_lift_shap.
+    """
 
-    monkeypatch.setattr(attribution, "_LAYOUT_CHECKED", [])
-    attribution._check_layout(deep_lift_shap)
-    assert attribution._LAYOUT_CHECKED == [True]
-    # scoring looks at it when it has not been looked at
-    monkeypatch.setattr(attribution, "_LAYOUT_CHECKED", [])
+    from tangermeme import deep_lift_shap as module
+
+    real = module.deep_lift_shap
+    cpu = torch.device("cpu")
+    monkeypatch.setattr(attribution, "_LAYOUT_CHECKED", set())
+    for dtype in (torch.float64, torch.float32):
+        for extra in (True, False):
+            attribution._check_layout(real, cpu, dtype, extra)
+    assert len(attribution._LAYOUT_CHECKED) == 4
+
+    looked = []
+
+    def watching(model, X, **settings):
+        if isinstance(model, attribution._Layout):
+            looked.append((X.dtype, settings["references"].dtype,
+                           settings["args"] is not None,
+                           settings["hypothetical"], settings["dtype"],
+                           str(settings["device"])))
+        return real(model, X, **settings)
+
+    def other(model, X, **settings):
+        return watching(model, X, **settings)
+
+    with_controls = bool(case["controls"])
+    as_scores_call = [torch.int8, torch.int8, with_controls, True]
+    monkeypatch.setattr(attribution, "_LAYOUT_CHECKED", set())
+    monkeypatch.setattr(module, "deep_lift_shap", watching)
+    first = scores(case, "counts", num_shuffles=2)
+    assert looked == [tuple(as_scores_call + [torch.float64, "cpu"])]
+    assert attribution._LAYOUT_CHECKED == {
+        (watching, "cpu", torch.float64, with_controls)}
+    # not again for the same way of calling ...
+    assert np.array_equal(scores(case, "counts", num_shuffles=2), first)
+    scores(case, "profile", num_shuffles=2)
+    assert len(looked) == 1
+    # ... again for a model of another type, and for another
+    # deep_lift_shap
+    single = copy.deepcopy(case["model"]).float()
+    attribution.hypothetical_scores(
+        single, "counts", case["sequences"], case["controls"],
+        num_shuffles=2, device="cpu")
+    assert looked[1:] == [tuple(as_scores_call + [torch.float32, "cpu"])]
+    monkeypatch.setattr(module, "deep_lift_shap", other)
     scores(case, "counts", num_shuffles=2)
-    assert attribution._LAYOUT_CHECKED == [True]
+    assert len(looked) == 3 and looked[2] == looked[0]
+    assert attribution._LAYOUT_CHECKED == {
+        (watching, "cpu", torch.float64, with_controls),
+        (watching, "cpu", torch.float32, with_controls),
+        (other, "cpu", torch.float64, with_controls)}
 
 
 def test_arguments_that_are_refused(case):
@@ -812,12 +861,31 @@ def test_model_is_left_as_it_was(case):
     assert all(p.grad is None for p in model.parameters())
 
 
-def test_no_tf32_while_the_scores_are_computed(case, monkeypatch):
+def precision_settings():
+    """
+        What decides the precision of a float32 computation in this
+        PyTorch, as PyTorch reports it
+    """
+
+    read = getattr(torch._C, "_get_fp32_precision_getter", None)
+    if read is None:
+        return (torch.backends.cudnn.allow_tf32,
+                torch.get_float32_matmul_precision())
+    return tuple(read(backend, kind) for backend, kind in (
+        ("generic", "all"), ("cuda", "all"), ("cuda", "conv"),
+        ("cuda", "rnn"), ("cuda", "matmul"), ("mkldnn", "all"),
+        ("mkldnn", "conv"), ("mkldnn", "rnn"), ("mkldnn", "matmul")))
+
+
+def test_full_precision_while_the_scores_are_computed(case, monkeypatch):
     """
         On a GPU, PyTorch computes convolutions in TF32 unless told
-        otherwise, which is not precise enough for these scores: it
-        is switched off while they are computed, and as it was
-        afterwards (also after a failure)
+        otherwise, which is not precise enough for these scores; and
+        a caller may have asked for less precision still. While the
+        scores are computed (and while the layout of a batch is looked
+        at) every setting is at full precision, and afterwards as it
+        was, also after a failure. (How the settings are put back in
+        every case: tests/test_pytorch_precision.py.)
     """
 
     import tangermeme.deep_lift_shap
@@ -826,35 +894,46 @@ def test_no_tf32_while_the_scores_are_computed(case, monkeypatch):
     real = tangermeme.deep_lift_shap.deep_lift_shap
 
     def watching(*args, **kwargs):
-        seen.append((torch.backends.cudnn.allow_tf32,
-                     torch.backends.cuda.matmul.allow_tf32))
+        seen.append(precision_settings())
         return real(*args, **kwargs)
 
     def failing(*args, **kwargs):
+        seen.append(precision_settings())
         raise RuntimeError("no scores today")
 
-    def flags():
-        return (torch.backends.cudnn.allow_tf32,
-                torch.backends.cuda.matmul.allow_tf32)
-
-    at_first = flags()
+    # a reduced precision that can be put back exactly afterwards:
+    # the top setting of PyTorch 2.9 and later, the flag of cuDNN
+    # before
+    newer = hasattr(torch._C, "_get_fp32_precision_getter")
+    if newer:
+        was = torch.backends.fp32_precision
+        torch.backends.fp32_precision = "tf32"
+        full = ("ieee",) * 9
+    else:
+        was = torch.backends.cudnn.allow_tf32
+        torch.backends.cudnn.allow_tf32 = True
+        full = (False, "highest")
     try:
-        for before in ((True, True), (True, False), (False, False)):
-            torch.backends.cudnn.allow_tf32 = before[0]
-            torch.backends.cuda.matmul.allow_tf32 = before[1]
-            monkeypatch.setattr(tangermeme.deep_lift_shap, "deep_lift_shap",
-                                watching)
+        before = precision_settings()
+        assert before != full and ("tf32" in before or before[0] is True)
+        monkeypatch.setattr(attribution, "_LAYOUT_CHECKED", set())
+        monkeypatch.setattr(tangermeme.deep_lift_shap, "deep_lift_shap",
+                            watching)
+        scores(case, "counts")
+        assert precision_settings() == before
+        monkeypatch.setattr(tangermeme.deep_lift_shap, "deep_lift_shap",
+                            failing)
+        with pytest.raises(RuntimeError, match="no scores today"):
             scores(case, "counts")
-            assert flags() == before
-            monkeypatch.setattr(tangermeme.deep_lift_shap, "deep_lift_shap",
-                                failing)
-            with pytest.raises(RuntimeError, match="no scores today"):
-                scores(case, "counts")
-            assert flags() == before
+        assert precision_settings() == before
     finally:
-        torch.backends.cudnn.allow_tf32, \
-            torch.backends.cuda.matmul.allow_tf32 = at_first
-    assert seen == [(False, False)] * 3
+        if newer:
+            torch.backends.fp32_precision = was
+        else:
+            torch.backends.cudnn.allow_tf32 = was
+    # the look at the layout, the scores of the five sequences in one
+    # chunk, and the call that failed
+    assert seen == [full] * 3
 
 
 def test_progress_is_reported(case):
@@ -1131,7 +1210,12 @@ def test_command_refuses_what_the_backend_does_not_do(command, tmp_path):
             (["--device", "nowhere"], "--device nowhere: not a device of "
              "PyTorch"),
             (["--device", "cuda:0"], "--device cuda:0: PyTorch sees 0 "
-             "GPU(s) here")):
+             "GPU(s) here"),
+            (["--device", "mps"], "--device mps: the scores are computed on "
+             "a CPU or a CUDA GPU ('cpu', 'cuda', 'cuda:1', ...), not on a "
+             "device of the kind mps"),
+            (["--device", "xpu"], "not on a device of the kind xpu"),
+            (["--device", "meta"], "not on a device of the kind meta")):
         code, output = run_shap(
             command["arguments"] + extra + ["--output-directory", tmp_path],
             tmp_path)

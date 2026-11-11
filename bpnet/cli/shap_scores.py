@@ -100,7 +100,6 @@ def shap_scores(args, shap_dir):
                 "with one multinomial over both strands; --task-id and "
                 "--orig-multi-loss are not supported with it")
         try:
-            import torch
             from bpnet.pytorch import attribution
             from bpnet.pytorch import model as pytorch_model
             import tangermeme  # noqa: F401
@@ -114,20 +113,12 @@ def shap_scores(args, shap_dir):
                 raise NoTracebackException(
                     "--backend pytorch: {} must be at least 1, not "
                     "{}".format(name, value))
-        if args.device is not None:
-            try:
-                device = torch.device(args.device)
-            except (RuntimeError, ValueError) as error:
-                raise NoTracebackException(
-                    "--device {}: not a device of PyTorch ({})".format(
-                        args.device, str(error).split("\n")[0]))
-            if device.type == "cuda" and (
-                    not torch.cuda.is_available() or
-                    (device.index or 0) >= torch.cuda.device_count()):
-                raise NoTracebackException(
-                    "--device {}: PyTorch sees {} GPU(s) here".format(
-                        args.device, torch.cuda.device_count()
-                        if torch.cuda.is_available() else 0))
+        try:
+            # (a CPU or a CUDA GPU that is there, before any data is
+            # read)
+            device = attribution.resolve_device(args.device)
+        except ValueError as error:
+            raise NoTracebackException("--{}".format(error))
         try:
             model = pytorch_model.load_model(args.model)
         except (OSError, ValueError) as error:
@@ -344,7 +335,7 @@ def shap_scores(args, shap_dir):
     if pytorch:
         counts_shap_scores, profile_shap_scores = pytorch_shap_scores(
             args, model, attribution, X, bias_profile_input,
-            bias_counts_input)
+            bias_counts_input, device)
     else:
         # inline function to handle dinucleotide shuffling
         def data_func(model_inputs):
@@ -454,7 +445,7 @@ def shap_scores(args, shap_dir):
                 
         
 def pytorch_shap_scores(args, model, attribution, X, bias_profile_input,
-                        bias_counts_input):
+                        bias_counts_input, device):
     """
         The scores by the PyTorch backend: tangermeme's DeepSHAP on
         the PyTorch model, with the references and the outputs of the
@@ -471,11 +462,12 @@ def pytorch_shap_scores(args, model, attribution, X, bias_profile_input,
         for name in model.input_names[1:]:
             controls[name] = bias_profile_input \
                 if len(model.shapes[name]) == 2 else bias_counts_input
-    logging.info("Generating 'counts' and 'profile' shap scores (PyTorch)")
+    logging.info("Generating 'counts' and 'profile' shap scores (PyTorch, "
+                 "on {})".format(device))
     return attribution.hypothetical_scores(
         model, ("counts", "profile"), X, controls,
         num_shuffles=args.num_shuffles, seed=args.seed,
-        batch_size=args.batch_size, device=args.device,
+        batch_size=args.batch_size, device=device,
         progress=lambda done: logging.info(
             "{} of {} sequences".format(done, len(X))))
 

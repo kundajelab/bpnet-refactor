@@ -154,6 +154,51 @@ def test_graph_written_by_hand():
                                rtol=1e-12, atol=1e-12)
 
 
+def test_layers_in_the_order_they_are_computed():
+    """
+        steps(): every layer with its kind and the layers it takes,
+        each after those it takes; the layers that a module computes
+        are those in `layers`, the others are computed by functions
+    """
+
+    architecture, weights = hand_made()
+    model = pytorch_model.from_architecture(architecture, weights)
+    steps = model.steps()
+    assert steps == [
+        ("sequence", "InputLayer", []), ("control", "InputLayer", []),
+        ("first", "Conv1D", ["sequence"]), ("dilated", "Conv1D", ["first"]),
+        ("cropped", "Cropping1D", ["first"]),
+        ("sum", "Add", ["dilated", "cropped"]),
+        ("sum_relu", "ReLU", ["sum"]),
+        ("pooled", "GlobalAveragePooling1D", ["sum_relu"]),
+        ("from_pooled", "Dense", ["pooled"]),
+        ("flat", "Flatten", ["sum_relu"]), ("dropped", "Dropout", ["flat"]),
+        ("from_flat", "Dense", ["dropped"]),
+        ("leaky", "LeakyReLU", ["from_flat"]),
+        ("x_logsumexp_counts_bias_0", "LogSumExp", ["control"]),
+        ("together", "Concatenate",
+         ["from_pooled", "leaky", "x_logsumexp_counts_bias_0"]),
+        ("out", "Dense", ["together"])]
+    assert [name for name, _, _ in steps if name in model.layers] == [
+        "first", "dilated", "sum_relu", "from_pooled", "dropped",
+        "from_flat", "leaky", "out"]
+    # what is returned is not the model's own: changing it changes
+    # nothing
+    steps[2][2].append("control")
+    steps.pop()
+    assert model.steps()[2] == ("first", "Conv1D", ["sequence"])
+    assert len(model.steps()) == 16
+    # the layers listed the other way round: each still after those
+    # it takes
+    other = pytorch_model.from_architecture(
+        dict(architecture, layers=architecture["layers"][::-1]), weights)
+    seen = set()
+    for name, _, sources in other.steps():
+        assert set(sources) <= seen
+        seen.add(name)
+    assert len(seen) == 16
+
+
 @pytest.mark.parametrize("width,dilation", [
     (3, 1), (4, 1), (2, 3), (4, 3), (3, 2), (6, 5), (1, 1)])
 def test_same_padding_as_tensorflow_defines_it(width, dilation):

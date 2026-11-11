@@ -376,8 +376,8 @@ def shap_scores_argsparser():
 
     parser.add_argument('--device', type=str, default=None,
                         help="--backend pytorch: the device to compute "
-                        "on, for example cuda:0 or cpu (default: a GPU "
-                        "when there is one)")
+                        "on, a CUDA GPU or the CPU, for example cuda:0 or "
+                        "cpu (default: a GPU when there is one)")
 
     parser.add_argument('--batch-size', type=int, default=128,
                         help="--backend pytorch: pairs of a sequence and "
