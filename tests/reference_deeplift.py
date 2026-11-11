@@ -97,6 +97,9 @@ COINCIDE = 1e-6
 #: of the allowance (many small ones remain; what they move is part of
 #: the tolerance of the test that uses the allowance)
 SMALLEST_RELU, SMALLEST_PRODUCT = 1e-4, 1e-5
+#: pairs of a sequence and a reference that float32_allowance() runs
+#: through the model at a time
+PAIRS_AT_A_TIME = 256
 
 
 class _RescaledReLU(torch.autograd.Function):
@@ -359,7 +362,7 @@ def relu_uncertainty(a_x, a_r, largest):
         2.0 ** -20 * (np.abs(a_x) + np.abs(a_r))
     # the secant for sure, the gradient for sure, or either
     secant = delta >= NEAR + off
-    gradient = delta <= NEAR - off
+    gradient = delta < NEAR - off
     with np.errstate(divide="ignore", invalid="ignore"):
         share = np.where(secant, np.minimum(1.0, off / delta), 1.0)
     # both well on one side: the secant and the gradient are the same
@@ -422,18 +425,23 @@ def float32_allowance(weights, params, which, sequence, references,
         return np.zeros(sequence.shape)
 
     # one pair of the sequence and the reference for every uncertain
-    # quotient, with this quotient changed
-    of = np.array([entry[0] for entry in uncertain])
-    bumps = {layer: np.zeros((len(uncertain),) + a.shape[1:])
-             for layer, a in enumerate(seen)}
-    weight_bump = np.zeros((len(uncertain), logits.shape[1]))
-    for row, (_, layer, index, size) in enumerate(uncertain):
-        if layer is None:
-            weight_bump[(row,) + tuple(index)] = size
-        else:
-            bumps[layer][(row,) + tuple(index)] = size
-    changed, _ = _hypothetical(
-        weights, params, which, sequence, references[of], profile_bias,
-        counts_bias, bumps=bumps,
-        weight_bump=weight_bump if which == "profile" else None)
-    return np.abs(changed - exact[of]).sum(axis=0) / n
+    # quotient, with this quotient changed; a limited number of pairs
+    # at a time (a model of real size has thousands of them)
+    allowance = np.zeros(sequence.shape)
+    for start in range(0, len(uncertain), PAIRS_AT_A_TIME):
+        some = uncertain[start:start + PAIRS_AT_A_TIME]
+        of = np.array([entry[0] for entry in some])
+        bumps = {layer: np.zeros((len(some),) + a.shape[1:])
+                 for layer, a in enumerate(seen)}
+        weight_bump = np.zeros((len(some), logits.shape[1]))
+        for row, (_, layer, index, size) in enumerate(some):
+            if layer is None:
+                weight_bump[(row,) + tuple(index)] = size
+            else:
+                bumps[layer][(row,) + tuple(index)] = size
+        changed, _ = _hypothetical(
+            weights, params, which, sequence, references[of], profile_bias,
+            counts_bias, bumps=bumps,
+            weight_bump=weight_bump if which == "profile" else None)
+        allowance += np.abs(changed - exact[of]).sum(axis=0)
+    return allowance / n

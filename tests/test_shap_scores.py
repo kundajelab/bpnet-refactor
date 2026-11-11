@@ -449,6 +449,19 @@ def test_reference_knows_where_float32_decides_the_branch():
     # (not when the sequence itself is at zero)
     assert uncertainty(0.0, 1e-7, 1e-7) == 1.0
     assert uncertainty(1e-14, -1e-7, 1e-7) == 1.0
+    # the margins on both sides of that number: closer than it by more
+    # than the difference can be off, the gradient for sure; further
+    # by more than that, the secant for sure; in between, either
+    largest = half
+    off = 2.0 * rd.RELU_NOISE * largest + 2.0 ** -20 * 2 * half
+    assert 1.4e-12 < off < 1.5e-12
+    for change, expected in ((-2e-12, 0.0), (-1e-12, 1.0), (0.0, 1.0),
+                             (1e-12, 1.0), (2e-12, off / rd.NEAR)):
+        a = (rd.NEAR + change) / 2
+        assert uncertainty(a, -a, largest) == pytest.approx(
+            expected, rel=1e-4), change
+    assert 1e-6 < off / rd.NEAR < 2e-6
+
     # an array of any shape
     shares = rd.relu_uncertainty(np.full((2, 3, 4), 0.3),
                                  np.full((2, 3, 4), -0.1), 2.0)
