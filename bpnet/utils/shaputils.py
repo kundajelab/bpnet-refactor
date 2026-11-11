@@ -1,9 +1,9 @@
 ## Av's code with a bit of reformatting
 
 import numpy as np
-import tensorflow as tf
 
-# from deeplift.dinuc_shuffle import dinuc_shuffle
+# (TensorFlow is imported where it is needed: the shuffles are also
+# used where it is not installed)
 
 def combine_mult_and_diffref(mult, orig_inp, bg_data):
     to_return = []
@@ -82,7 +82,36 @@ def char_array_to_string(arr):
     Converts a NumPy array of byte-long ASCII codes into an ASCII string.
     e.g. [65, 67, 71, 84] becomes "ACGT".
     """
-    return arr.tostring().decode("ascii")
+    return arr.tobytes().decode("ascii")
+
+
+def _walk(tokens, successors):
+    """
+        The tokens in the order of a walk over the positions: from
+        the first position, and from a position with token t to the
+        position that comes next in the list of successors of t (each
+        entry of a list is used once, in order)
+
+        Args:
+            tokens (numpy.ndarray): the token of every position
+            successors (list): for every token, the positions that
+                follow a position with this token, in the order the
+                walk is to take them
+
+        Returns:
+            numpy.ndarray: the tokens of the positions in the order
+                they are visited
+    """
+
+    tokens_list = tokens.tolist()
+    # for every token, what gives the next entry of its list
+    following = [iter(inds.tolist()).__next__ for inds in successors]
+    order = [0] * len(tokens_list)
+    ind = 0
+    for j in range(1, len(tokens_list)):
+        ind = following[tokens_list[ind]]()
+        order[j] = ind
+    return tokens[order]
 
 
 def dinuc_shuffle(seq, num_shufs, rng=None):
@@ -98,6 +127,12 @@ def dinuc_shuffle(seq, num_shufs, rng=None):
     being a shuffled version of `seq`. If `seq` is a 2D NumPy array, then the
     result is an N x L x D NumPy array of shuffled versions of `seq`, also
     one-hot encoded.
+
+    The shuffles of a sequence are those of the implementation this
+    function had before it was made faster, for the same `rng` (the
+    same random numbers are drawn in the same order; only the walk
+    that builds a shuffle from them is done differently: over lists
+    instead of numpy arrays one element at a time).
     """
 
     if type(seq) is str:
@@ -132,23 +167,19 @@ def dinuc_shuffle(seq, num_shufs, rng=None):
         )
 
     for i in range(num_shufs):
+        if len(tokens) == 0:
+            # (as before: an empty sequence has no first position)
+            raise IndexError(
+                "index 0 is out of bounds for axis 0 with size 0")
+
         # Shuffle the next indices
         for t in range(len(chars)):
             inds = np.arange(len(shuf_next_inds[t]))
             inds[:-1] = rng.permutation(len(inds) - 1)  # Keep last index same
             shuf_next_inds[t] = shuf_next_inds[t][inds]
 
-        counters = [0] * len(chars)
-       
         # Build the resulting array
-        ind = 0
-        result = np.empty_like(tokens)
-        result[0] = tokens[ind]
-        for j in range(1, len(tokens)):
-            t = tokens[ind]
-            ind = shuf_next_inds[t][counters[t]]
-            counters[t] += 1
-            result[j] = tokens[ind]
+        result = _walk(tokens, shuf_next_inds)
 
         if type(seq) is str:
             all_results.append(char_array_to_string(chars[result]))
@@ -180,6 +211,8 @@ def get_weightedsum_meannormed_logits(model, task_id,
     # Reshaping is done to be compatible with the single multinomial
     
         
+    import tensorflow as tf
+
     if orig_multi_loss:
         meannormed_logits = \
             (model.outputs[0][:, :, start_idx:end_idx] - \
