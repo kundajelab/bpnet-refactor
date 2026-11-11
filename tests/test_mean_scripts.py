@@ -43,6 +43,34 @@ def run_script(name, arguments, cwd):
     return done.returncode, done.stdout
 
 
+#: a script run in a Python in which opening one file (the first
+#: argument) fails for want of memory
+NO_MEMORY_FOR_ONE_FILE = """
+import runpy, sys
+import h5py
+real = h5py.File
+too_large, script = sys.argv[1:3]
+def failing(path, *args, **kwargs):
+    if str(path) == too_large:
+        raise MemoryError("no memory for " + str(path))
+    return real(path, *args, **kwargs)
+h5py.File = failing
+sys.argv = [script] + sys.argv[3:]
+runpy.run_path(script, run_name="__main__")
+"""
+
+
+def run_without_memory_for(path, name, arguments, cwd):
+    done = subprocess.run(
+        [sys.executable, "-c", NO_MEMORY_FOR_ONE_FILE, str(path),
+         os.path.join(REPO, "bpnet", "utils", name)] +
+        [str(a) for a in arguments], cwd=str(cwd),
+        env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"),
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        universal_newlines=True, timeout=600)
+    return done.returncode, done.stdout
+
+
 def text(names):
     return [name.decode() if isinstance(name, bytes) else str(name)
             for name in names]
@@ -277,7 +305,8 @@ def test_fold_that_is_not_there_is_left_out_today(tmp_path):
 
 
 @pytest.mark.parametrize("other", ["chromosomes", "starts", "ends",
-                                   "sequences", "numbers of scores"])
+                                   "sequences", "numbers of scores",
+                                   "fewer peaks first"])
 def test_folds_that_do_not_agree_are_an_error(tmp_path, other):
     """
         Folds that are not of the same peaks and the same sequences
@@ -287,12 +316,17 @@ def test_folds_that_do_not_agree_are_an_error(tmp_path, other):
     """
 
     paths, sequences, _ = score_files(tmp_path, folds=3)
-    if other == "numbers of scores":
-        # a fold of fewer peaks, with coordinates of its own
+    differs = paths[2]
+    if other in ("numbers of scores", "fewer peaks first"):
+        # a fold of fewer peaks (the first peaks of the others), as
+        # the last fold or as the first
         os.mkdir(str(tmp_path / "fewer"))
         fewer, _, _ = score_files(tmp_path / "fewer", folds=1,
                                   peaks=PEAKS[:-1])
-        paths[2] = fewer[0]
+        if other == "fewer peaks first":
+            paths[0], differs = fewer[0], paths[1]
+        else:
+            paths[2] = differs = fewer[0]
         other = "chromosomes"
     else:
         with h5py.File(paths[2], "r+") as f:
@@ -308,9 +342,68 @@ def test_folds_that_do_not_agree_are_an_error(tmp_path, other):
         "--counts_shaps", ",".join(paths), "--output_dir", out], tmp_path)
     assert code == 1, output[-3000:]
     assert "{} and {} do not have the same {}: {} is not written".format(
-        paths[2], paths[0], other,
+        differs, paths[0], other,
         str(out) + "/counts_mean_shap_scores.h5") in output
     assert "Traceback" not in output
+    assert os.listdir(str(out)) == []
+
+
+def test_difference_in_the_last_of_many_peaks_is_found(tmp_path):
+    """
+        The folds are compared a block of rows at a time: a
+        difference in the last of 4,100 peaks is found like one in
+        the first
+    """
+
+    peaks = [("chr1", 40 * i) for i in range(4100)]
+    paths, sequences, stored = score_files(tmp_path, folds=2, peaks=peaks)
+    out = tmp_path / "out"
+    out.mkdir()
+    code, output = run_script("mean_shap.py", [
+        "--counts_shaps", ",".join(paths), "--output_dir", out], tmp_path)
+    assert code == 0, output[-3000:]
+    found, _ = read_scores(str(out / "counts_mean_shap_scores.h5"))
+    assert found["hyp_scores"].shape == (4100, LENGTH, 4)
+    os.remove(str(out / "counts_mean_shap_scores.h5"))
+    with h5py.File(paths[1], "r+") as f:
+        f["input_seqs"][4099, 7] = np.roll(sequences[4099, 7], 1)
+    code, output = run_script("mean_shap.py", [
+        "--counts_shaps", ",".join(paths), "--output_dir", out], tmp_path)
+    assert code == 1, output[-3000:]
+    assert "do not have the same sequences" in output
+    assert os.listdir(str(out)) == []
+
+
+def test_no_memory_for_a_fold_stops_the_script(tmp_path):
+    """
+        A fold that cannot be read for want of memory is not a fold
+        that does not exist: the script fails instead of writing the
+        mean of the others
+    """
+
+    paths, _, _ = score_files(tmp_path, folds=3)
+    out = tmp_path / "out"
+    out.mkdir()
+    code, output = run_without_memory_for(paths[1], "mean_shap.py", [
+        "--counts_shaps", ",".join(paths), "--output_dir", out], tmp_path)
+    assert code != 0, output[-3000:]
+    assert "MemoryError: no memory for " + paths[1] in output
+    assert os.listdir(str(out)) == []
+    # (the same call with memory for all three)
+    code, output = run_without_memory_for("none", "mean_shap.py", [
+        "--counts_shaps", ",".join(paths), "--output_dir", out], tmp_path)
+    assert code == 0 and os.listdir(str(out)) == [
+        "counts_mean_shap_scores.h5"], output[-3000:]
+
+
+def test_no_score_files_asked_for_is_an_error(tmp_path):
+    out = tmp_path / "out"
+    out.mkdir()
+    code, output = run_script("mean_shap.py", ["--output_dir", out],
+                              tmp_path)
+    assert code == 2, output[-3000:]
+    assert "no score files: give --counts_shaps, --profile_shaps or both" \
+        in output
     assert os.listdir(str(out)) == []
 
 
@@ -524,7 +617,13 @@ def test_mean_prediction_file(mean_predictions):
     # (the mean, not one fold)
     for fold in mean_predictions["profiles"]:
         assert np.abs(fold[rows] - expected[rows]).max() > 0.5
-    # the types the script has always written
+    # the types the script has always written: the names as text of
+    # any length in ASCII
+    with h5py.File(str(mean_predictions["out"] / "mean_predictions.h5"),
+                   "r") as f:
+        kind_of_text = h5py.check_string_dtype(f["coords_chrom"].dtype)
+    assert kind_of_text is not None and kind_of_text.length is None
+    assert kind_of_text.encoding == "ascii"
     assert found["pred_prof"].dtype == np.float32
     assert found["pred_logcounts"].dtype == np.float32
     assert found["coords_start"].dtype == np.int64
@@ -699,8 +798,8 @@ def test_prediction_folds_that_do_not_agree_are_an_error(tmp_path, other):
         wrote bigWigs of that one.)
     """
 
-    paths, _ = prediction_files(tmp_path, folds=2, seed=7)
-    with h5py.File(paths[1], "r+") as f:
+    paths, _ = prediction_files(tmp_path, folds=3, seed=7)
+    with h5py.File(paths[2], "r+") as f:
         if other == "chromosomes":
             row = text(f["coords/coords_chrom"][:]).index("chr2")
             f["coords/coords_chrom"][row] = "chr1"
@@ -729,7 +828,7 @@ def test_prediction_folds_that_do_not_agree_are_an_error(tmp_path, other):
         "-c", tmp_path / "chrom.sizes", "-o", out], tmp_path)
     assert code == 1, output[-3000:]
     assert "{} and {} do not have the same {}: {} is not written".format(
-        paths[1], paths[0], other,
+        paths[2], paths[0], other,
         str(out) + "/mean_predictions.h5") in output
     assert "Traceback" not in output
     # no bigWigs of the earlier mean, which is as it was
@@ -772,6 +871,34 @@ def test_no_prediction_file_that_can_be_read_is_an_error(tmp_path):
     assert code == 1, output[-3000:]
     assert "None of the prediction files could be read" in output
     assert "Traceback" not in output and os.listdir(str(out)) == []
+
+
+def test_no_memory_for_a_prediction_file_stops_the_script(tmp_path):
+    paths, _ = prediction_files(tmp_path, folds=3, seed=11)
+    out = tmp_path / "out"
+    code, output = run_without_memory_for(
+        paths[2], "mean_predictions.py",
+        ["--prediction_h5s", ",".join(paths), "-o", out], tmp_path)
+    assert code != 0, output[-3000:]
+    assert "MemoryError: no memory for " + paths[2] in output
+    assert os.listdir(str(out)) == []
+
+
+def test_bigwigs_without_chromosome_sizes_are_an_error(tmp_path):
+    """
+        bigWigs asked for without the sizes of the chromosomes: said
+        before anything is written (the mean used to be written, the
+        bigWigs left out with a message, and the script ended well)
+    """
+
+    paths, _ = prediction_files(tmp_path, folds=2, seed=12)
+    out = tmp_path / "out"
+    code, output = run_script("mean_predictions.py", [
+        "--prediction_h5s", ",".join(paths), "--generate_bigwigs",
+        "-o", out], tmp_path)
+    assert code == 2, output[-3000:]
+    assert "--generate_bigwigs needs the chromosome sizes" in output
+    assert not os.path.exists(str(out))
 
 
 def test_counts_below_one_are_counts(tmp_path):

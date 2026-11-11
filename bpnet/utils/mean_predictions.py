@@ -18,9 +18,30 @@ parser.add_argument("-o", "--output_dir", type=str, help="Output bigwig file",re
 args = parser.parse_args()
 print(args)
 
+if args.generate_bigwigs and not args.chrom_sizes:
+    # (before anything is written: the mean used to be written and
+    # the bigWigs left out with a message)
+    parser.error("--generate_bigwigs needs the chromosome sizes "
+                 "(-c/--chrom_sizes)")
+
 if not os.path.isdir(args.output_dir):
     os.mkdir(args.output_dir)
     
+def same(first, other, rows=4096):
+    """
+        Are two arrays the same? Compared a block of rows at a time,
+        so that the folds of a large experiment are compared without
+        another array of their size.
+    """
+
+    if first.shape != other.shape:
+        return False
+    if first.ndim == 0:
+        return bool(np.array_equal(first, other))
+    return all(np.array_equal(first[i:i + rows], other[i:i + rows])
+               for i in range(0, len(first), rows))
+
+
 def mean_predictions(predictions_list,h5_out_path):    
     pred_logcounts_lst=[]
     pred_logcounts_both_st_lst=[]
@@ -44,6 +65,10 @@ def mean_predictions(predictions_list,h5_out_path):
             order = np.argsort([str(coord_chrom[i])+"_"+str(coord_start[i])+"_"+str(coord_end[i]) for i in range(coord_chrom.shape[0])])
             pred_logcounts = pred_logcounts[order]
             pred_prof = pred_prof[order]
+        except MemoryError:
+            # (no file that cannot be read: left out, the mean would
+            # be one of fewer folds for want of memory)
+            raise
         except Exception as error:
             print(f'{predictions_h5} has problems or does not exist '
                   f'({type(error).__name__}: {error})')
@@ -83,7 +108,7 @@ def mean_predictions(predictions_list,h5_out_path):
                           [np.array(profiles.shape) for profiles in
                            pred_profs_lst])):
         for predictions_h5, value in zip(read[1:], values[1:]):
-            if not np.array_equal(value, values[0]):
+            if not same(values[0], value):
                 sys.exit(f'{predictions_h5} and {read[0]} do not have the '
                          f'same {what}: {h5_out_path} is not written')
 

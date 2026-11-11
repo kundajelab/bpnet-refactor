@@ -19,6 +19,21 @@ DATASETS = ('hyp_scores', 'coords_chrom', 'coords_start', 'coords_end',
             'input_seqs')
 
 
+def same(first, other, rows=4096):
+    """
+        Are two arrays the same? Compared a block of rows at a time,
+        so that the folds of a large experiment are compared without
+        another array of their size.
+    """
+
+    if first.shape != other.shape:
+        return False
+    if first.ndim == 0:
+        return bool(np.array_equal(first, other))
+    return all(np.array_equal(first[i:i + rows], other[i:i + rows])
+               for i in range(0, len(first), rows))
+
+
 def mean_shap(shaps_list,output_path):
     hyp_scores_lst=[]
     chrom_lst=[]
@@ -33,6 +48,10 @@ def mean_shap(shaps_list,output_path):
             # cannot be read whole is left out whole
             with h5py.File(shap_h5, 'r') as f:
                 fold = [f[name][()] for name in DATASETS]
+        except MemoryError:
+            # (no file that cannot be read: left out, the mean would
+            # be one of fewer folds for want of memory)
+            raise
         except Exception as error:
             print(f'{shap_h5} does not exist or cannot be read '
                   f'({type(error).__name__}: {error})')
@@ -57,7 +76,7 @@ def mean_shap(shaps_list,output_path):
                           [np.array(scores.shape) for scores in
                            hyp_scores_lst])):
         for shap_h5, value in zip(read[1:], values[1:]):
-            if not np.array_equal(value, values[0]):
+            if not same(values[0], value):
                 sys.exit(f'{shap_h5} and {read[0]} do not have the same '
                          f'{what}: {output_path} is not written')
 
@@ -107,6 +126,10 @@ def mean_shap(shaps_list,output_path):
 
 
 args = parser.parse_args()
+
+if not args.counts_shaps and not args.profile_shaps:
+    parser.error("no score files: give --counts_shaps, --profile_shaps or "
+                 "both")
 
 if args.counts_shaps:
     mean_shap(args.counts_shaps,f"{args.output_dir}/counts_mean_shap_scores.h5")
