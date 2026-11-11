@@ -488,8 +488,14 @@ class Interrupts(object):
                 ...
                 raise interrupts.interrupted(failure)
         
-        Interrupts that were ignored before stay ignored. Outside the 
-        main thread, where signals are not handled, nothing is noted.
+        Interrupts that were ignored before stay ignored, and so is 
+        a handler that was not installed from Python (nothing is 
+        noted then). An interrupt with the default action of the 
+        system is raised as a KeyboardInterrupt while the block runs, 
+        so that the tool can clean up. A handler that someone else 
+        installs while the block runs is left in place at its end. 
+        Outside the main thread, where signals are not handled, 
+        nothing is noted.
     """
     
     def __init__(self):
@@ -501,18 +507,37 @@ class Interrupts(object):
     def __enter__(self):
         try:
             before = signal.getsignal(signal.SIGINT)
-            if before != signal.SIG_IGN:
-                self._before = signal.signal(signal.SIGINT, self._note)
-                self._installed = True
         except ValueError:
-            pass
+            return self
+        if before is None or before == signal.SIG_IGN:
+            return self
+        self._before = before
+        self._installed = True
+        try:
+            signal.signal(signal.SIGINT, self._note)
+        except ValueError:
+            # (not the main thread)
+            self._installed = False
+        except BaseException:
+            # an interrupt right after the handler was installed: the 
+            # block does not run, and its end is not called
+            self._restore()
+            raise
         return self
     
     def __exit__(self, *failure):
-        if self._installed:
-            self._installed = False
-            signal.signal(signal.SIGINT, self._before)
+        self._restore()
         return False
+    
+    def _restore(self):
+        if not self._installed:
+            return
+        self._installed = False
+        try:
+            if signal.getsignal(signal.SIGINT) == self._note:
+                signal.signal(signal.SIGINT, self._before)
+        except ValueError:  # pragma: no cover
+            pass
     
     def _note(self, signum, frame):
         self.noted = True
@@ -542,8 +567,10 @@ class Interrupts(object):
             Returns:
                 BaseException: the failure itself, or, when an 
                     interrupt arrived and the failure is something 
-                    else, a KeyboardInterrupt with the failure as 
-                    its cause
+                    else (any other exception, also SystemExit, or 
+                    the failure of a batch worker that followed the 
+                    interrupt), a KeyboardInterrupt with the failure 
+                    as its cause
         """
         
         if self.noted and not isinstance(failure, KeyboardInterrupt):
@@ -582,6 +609,9 @@ def interruptible(items, interrupts=None):
             try:
                 item = next(iterator)
             except StopIteration:
+                # (an interrupt that was lost while the end was 
+                # fetched)
+                interrupts.check()
                 return
             interrupts.check()
             yield item

@@ -921,6 +921,9 @@ def predict_main():
     try:
         with interrupts:
             predict(args, pred_dir, interrupts)
+            # (an interrupt that was lost after the last batch, while 
+            # the files were written)
+            interrupts.check()
     except BaseException as failure:
         # the workers of the batch generator would go on making 
         # batches that nobody takes, and keep this process from ending

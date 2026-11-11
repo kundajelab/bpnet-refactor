@@ -21,19 +21,22 @@ LIMIT = 60
 def in_a_process(scenario):
     """
         What `scenario(queue)` puts into its queue, in a process of
-        its own (the scenarios send signals to themselves)
+        its own (the scenarios send signals to themselves). The
+        process must also end by itself.
     """
 
     queue = multiprocessing.Queue()
     process = multiprocessing.Process(target=scenario, args=(queue,))
     process.start()
     try:
-        return queue.get(timeout=LIMIT)
-    finally:
+        result = queue.get(timeout=LIMIT)
         process.join(LIMIT)
-        if process.is_alive():  # pragma: no cover
+        assert not process.is_alive(), "the scenario did not end"
+        return result
+    finally:
+        if process.is_alive():
             process.kill()
-            process.join()
+        process.join()
 
 
 def interrupt_myself():
@@ -207,6 +210,150 @@ def test_interrupt_lost_before_the_loop_ends_it_before_the_first_item():
     """
 
     assert in_a_process(lost_before_the_loop) == ("interrupted", [], [])
+
+
+def lost_at_the_end(queue):
+    def ending():
+        yield 1
+        try:
+            interrupt_myself()
+        except KeyboardInterrupt:
+            pass
+
+    with generators.Interrupts() as interrupts:
+        taken = []
+        try:
+            for item in generators.interruptible(ending(), interrupts):
+                taken.append(item)
+            result = "finished"
+        except KeyboardInterrupt:
+            result = "interrupted"
+    queue.put((result, taken))
+
+
+def test_interrupt_lost_while_the_end_is_fetched_ends_the_loop():
+    assert in_a_process(lost_at_the_end) == ("interrupted", [1])
+
+
+def failures_after_an_interrupt(queue):
+    from bpnet.utils.exceptionhandler import NoTracebackException
+
+    with generators.Interrupts() as interrupts:
+        try:
+            interrupt_myself()
+        except KeyboardInterrupt:
+            pass
+        found = []
+        for failure in (SystemExit(0), SystemExit(1),
+                        NoTracebackException("Batch generation failed"),
+                        ValueError("x")):
+            reported = interrupts.interrupted(failure)
+            found.append((type(reported).__name__,
+                          reported.__cause__ is failure))
+    queue.put(found)
+
+
+def test_every_failure_after_an_interrupt_is_the_interrupt():
+    """
+        Also an exit (which may claim success) and the failure of a
+        batch worker that followed the interrupt are reported as the
+        interrupt
+    """
+
+    assert in_a_process(failures_after_an_interrupt) == \
+        [("KeyboardInterrupt", True)] * 4
+
+
+def nested(queue):
+    before = signal.getsignal(signal.SIGINT)
+    with generators.Interrupts() as outer:
+        with generators.Interrupts() as inner:
+            try:
+                interrupt_myself()
+            except KeyboardInterrupt:
+                pass
+            inside = signal.getsignal(signal.SIGINT) == inner._note
+        between = signal.getsignal(signal.SIGINT) == outer._note
+    queue.put((inner.noted, outer.noted, inside, between,
+               signal.getsignal(signal.SIGINT) is before))
+
+
+def test_nested_notes_both_take_the_interrupt():
+    assert in_a_process(nested) == (True, True, True, True, True)
+
+
+def handler_installed_meanwhile(queue):
+    calls = []
+
+    def later(number, frame):
+        calls.append(number)
+
+    with generators.Interrupts() as interrupts:
+        signal.signal(signal.SIGINT, later)
+    kept = signal.getsignal(signal.SIGINT) is later
+    interrupt_myself()
+    queue.put((kept, calls == [signal.SIGINT], interrupts.noted))
+
+
+def test_handler_installed_meanwhile_stays():
+    """
+        A handler that someone else installs while the block runs is
+        not replaced at its end by the one that was there before
+    """
+
+    assert in_a_process(handler_installed_meanwhile) == (True, True, False)
+
+
+def handler_not_from_python(queue):
+    # (signal.getsignal returns None for a handler that was not
+    # installed from Python)
+    real = signal.getsignal
+    generators.signal.getsignal = lambda number: None
+    try:
+        with generators.Interrupts() as interrupts:
+            during = real(signal.SIGINT) is signal.default_int_handler
+        result = ("ended", interrupts.noted, interrupts._installed, during)
+    except BaseException as failure:  # pragma: no cover
+        result = ("failed", repr(failure))
+    finally:
+        generators.signal.getsignal = real
+    queue.put(result)
+
+
+def test_handler_that_python_did_not_install_is_left_alone():
+    assert in_a_process(handler_not_from_python) == \
+        ("ended", False, False, True)
+
+
+def interrupted_while_entering(queue):
+    before = signal.getsignal(signal.SIGINT)
+    real = signal.signal
+
+    def installs_then_interrupt(number, handler):
+        previous = real(number, handler)
+        if getattr(handler, "__name__", None) == "_note":
+            raise KeyboardInterrupt
+        return previous
+
+    generators.signal.signal = installs_then_interrupt
+    try:
+        with generators.Interrupts():
+            result = "entered"
+    except KeyboardInterrupt:
+        result = "interrupted"
+    finally:
+        generators.signal.signal = real
+    queue.put((result, signal.getsignal(signal.SIGINT) is before))
+
+
+def test_interrupt_while_the_handler_is_installed():
+    """
+        An interrupt right after the handler was installed ends the
+        entry of the block, whose end is then not called: the entry
+        puts the handler that was there back itself
+    """
+
+    assert in_a_process(interrupted_while_entering) == ("interrupted", True)
 
 
 def ignored_before(queue):
