@@ -327,14 +327,11 @@ class Model(torch.nn.Module):
 
     def _register(self, name, module):
         """
-            The module of a layer, under the layer's name
+            The module of a layer, under the layer's name (the names
+            of the layers are unique, and the name of a built-in
+            activation is none of them: no module is replaced)
         """
 
-        if name in self.layers:
-            raise UnsupportedModelError(
-                "Layer names are not unique: {} (the activation that a "
-                "layer 'x' has built in is 'x_activation' here)".format(
-                    name))
         try:
             self.layers[name] = module
         except (KeyError, TypeError) as error:

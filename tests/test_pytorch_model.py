@@ -153,6 +153,42 @@ def test_graph_written_by_hand():
                                rtol=1e-12, atol=1e-12)
 
 
+@pytest.mark.parametrize("width,dilation", [
+    (3, 1), (4, 1), (2, 3), (4, 3), (3, 2), (6, 5), (1, 1)])
+def test_same_padding_as_tensorflow_defines_it(width, dilation):
+    """
+        A convolution that keeps the length is the convolution of the
+        input with zeros added on both sides: as many as the kernel
+        spans beyond one position, half of them on the left, and the
+        odd one on the right (the 'SAME' padding of TensorFlow)
+    """
+
+    architecture = {
+        "name": "same", "layers": [
+            entry("InputLayer", "x", batch_input_shape=[None, 20, 3]),
+            entry("Conv1D", "conv", ["x"], filters=2, kernel_size=[width],
+                  dilation_rate=[dilation], padding="same",
+                  activation="linear")],
+        "input_layers": [["x", 0, 0]], "output_layers": [["conv", 0, 0]]}
+    rng = np.random.RandomState(11)
+    weights = {"conv": {"kernel": rng.normal(size=(width, 3, 2)),
+                        "bias": rng.normal(size=2)}}
+    model = pytorch_model.from_architecture(architecture, weights)
+    assert model.shapes["conv"] == (2, 20)
+    x = rng.normal(size=(4, 20, 3))
+    span = dilation * (width - 1)
+    left = span // 2
+    padded = np.zeros((4, 20 + span, 3))
+    padded[:, left:left + 20] = x
+    expected = reference_model.conv1d_valid(
+        padded, weights["conv"]["kernel"], weights["conv"]["bias"],
+        dilation=dilation)
+    with torch.no_grad():
+        found = model(torch.tensor(pytorch_model.channels_first(x)))
+    np.testing.assert_allclose(pytorch_model.channels_last(found.numpy()),
+                               expected, rtol=1e-12, atol=1e-12)
+
+
 def test_model_with_one_output_returns_a_tensor():
     architecture, weights = hand_made()
     one = copy.deepcopy(architecture)
