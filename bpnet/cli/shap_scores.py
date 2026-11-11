@@ -4,8 +4,9 @@ import numpy as np
 import pandas as pd
 import pyBigWig
 import pysam
-import shap
-import tensorflow as tf
+
+# (TensorFlow and the shap fork are imported where the TensorFlow
+# backend needs them: the PyTorch backend runs without either)
 
 from bpnet.cli.argparsers import shap_scores_argsparser
 from bpnet.utils.datetime_custom import *
@@ -14,7 +15,6 @@ from bpnet.utils.shaputils import *
 from bpnet.utils.logger import *
 from bpnet.generators.sequtils import one_hot_encode
 from bpnet.utils.misc import gaussian1D_smoothing
-import tensorflow as tf
 from bpnet.utils.importance_hdf5_to_bigwig import importance_hdf5_to_bigwig
 
 from bpnet.model import loading
@@ -89,13 +89,51 @@ def save_scores(peaks_df, one_hot_sequences, hyp_shap_scores, output_fname):
     
 
 def shap_scores(args, shap_dir):
+    pytorch = getattr(args, "backend", "tensorflow") == "pytorch"
+
     # load the model (with the package's own loader: keras' loader 
     # only reads these models back under TensorFlow 2.4)
-    try:
-        model = loading.load_model(args.model)
-    except (OSError, ValueError, tf.errors.OpError) as error:
-        raise NoTracebackException(
-            "Cannot load the model {}: {}".format(args.model, error))
+    if pytorch:
+        if args.orig_multi_loss or args.task_id != 0:
+            raise NoTracebackException(
+                "--backend pytorch explains the first task of a model "
+                "with one multinomial over both strands; --task-id and "
+                "--orig-multi-loss are not supported with it")
+        try:
+            from bpnet.pytorch import attribution
+            from bpnet.pytorch import model as pytorch_model
+            import tangermeme  # noqa: F401
+        except ImportError as error:
+            raise NoTracebackException(
+                "--backend pytorch needs PyTorch and tangermeme to be "
+                "installed ({})".format(error))
+        try:
+            model = pytorch_model.load_model(args.model)
+        except (OSError, ValueError) as error:
+            raise NoTracebackException(
+                "Cannot load the model {}: {}".format(args.model, error))
+        with_controls = len(model.input_names) > 1
+        tracks = [model.shapes[name][0] for name in model.output_names
+                  if len(model.shapes[name]) == 2]
+        if tracks != [2]:
+            # for a model with one profile track the TensorFlow backend
+            # writes half the profile scores of the definition (it
+            # always takes the model for a stranded one); until that
+            # is settled this backend does not write the other half
+            raise NoTracebackException(
+                "--backend pytorch explains models with two profile "
+                "tracks (both strands); this model has {}".format(
+                    tracks[0] if len(tracks) == 1 else tracks))
+    else:
+        import shap
+        import tensorflow as tf
+
+        try:
+            model = loading.load_model(args.model)
+        except (OSError, ValueError, tf.errors.OpError) as error:
+            raise NoTracebackException(
+                "Cannot load the model {}: {}".format(args.model, error))
+        with_controls = isinstance(model.input, list)
     
     # read all the peaks into a pandas dataframe
     peaks_df = pd.read_csv(args.bed_file, sep='\t', header=None, 
@@ -182,7 +220,7 @@ def shap_scores(args, shap_dir):
     bias_counts_input = None
     bias_profile_input = None
     # if bias is part of the model then model inputs will be a list
-    if isinstance(model.input, list):
+    if with_controls:
         # log of sum of counts of the control track
         # if multiple control files are specified this would be
         # log(sum(position_wise_sum_from_all_files))
@@ -278,54 +316,60 @@ def shap_scores(args, shap_dir):
     X = one_hot_encode(sequences, args.input_seq_len)
     print("X shape", X.shape)
         
-    # inline function to handle dinucleotide shuffling
-    def data_func(model_inputs):
-        rng = np.random.RandomState(args.seed)
-        dinucs =  [dinuc_shuffle(model_inputs[0], args.num_shuffles, rng)] + \
-        [
-            np.tile(
-                np.zeros_like(model_inputs[i]),
-                (args.num_shuffles,) + (len(model_inputs[i].shape) * (1,))
-            ) for i in range(1, len(model_inputs))
-        ]
-        
-        return dinucs
-    
-    print('bias_counts_input:',bias_counts_input)
-    print('bias_profile_input:',bias_profile_input)
-    if bias_counts_input is None and bias_profile_input is None:
-        counts_explainer_inputs = [model.input]
-        profile_explainer_inputs =[model.input]
-        
-        counts_shap_inputs = [X]
-        profile_shap_inputs = [X]
+    if pytorch:
+        counts_shap_scores, profile_shap_scores = pytorch_shap_scores(
+            args, model, attribution, X, bias_profile_input,
+            bias_counts_input)
     else:
-        counts_explainer_inputs = [model.input[0], model.input[2]]
-        profile_explainer_inputs = [model.input[0], model.input[1]]
+        # inline function to handle dinucleotide shuffling
+        def data_func(model_inputs):
+            rng = np.random.RandomState(args.seed)
+            dinucs =  [dinuc_shuffle(model_inputs[0], args.num_shuffles, rng)] + \
+            [
+                np.tile(
+                    np.zeros_like(model_inputs[i]),
+                    (args.num_shuffles,) + (len(model_inputs[i].shape) * (1,))
+                ) for i in range(1, len(model_inputs))
+            ]
         
-        counts_shap_inputs = [X, bias_counts_input]
-        profile_shap_inputs = [X, bias_profile_input]
-
-    profile_model_counts_explainer = shap.explainers.deep.TFDeepExplainer(
-        (counts_explainer_inputs, 
-         tf.reduce_sum(model.outputs[1], axis=-1)),
-        data_func, 
-        combine_mult_and_diffref=combine_mult_and_diffref)
-
-    # explainer for the profile head
-    weightedsum_meannormed_logits = get_weightedsum_meannormed_logits(
-        model, task_id=args.task_id, stranded=True, orig_multi_loss=args.orig_multi_loss)
+            return dinucs
     
-    profile_model_profile_explainer = shap.explainers.deep.TFDeepExplainer(
-        (profile_explainer_inputs, weightedsum_meannormed_logits),
-        data_func, 
-        combine_mult_and_diffref=combine_mult_and_diffref)
+        print('bias_counts_input:',bias_counts_input)
+        print('bias_profile_input:',bias_profile_input)
+        if bias_counts_input is None and bias_profile_input is None:
+            counts_explainer_inputs = [model.input]
+            profile_explainer_inputs =[model.input]
+        
+            counts_shap_inputs = [X]
+            profile_shap_inputs = [X]
+        else:
+            counts_explainer_inputs = [model.input[0], model.input[2]]
+            profile_explainer_inputs = [model.input[0], model.input[1]]
+        
+            counts_shap_inputs = [X, bias_counts_input]
+            profile_shap_inputs = [X, bias_profile_input]
+
+        profile_model_counts_explainer = shap.explainers.deep.TFDeepExplainer(
+            (counts_explainer_inputs, 
+             tf.reduce_sum(model.outputs[1], axis=-1)),
+            data_func, 
+            combine_mult_and_diffref=combine_mult_and_diffref)
+
+        # explainer for the profile head
+        weightedsum_meannormed_logits = get_weightedsum_meannormed_logits(
+            model, task_id=args.task_id, stranded=True, orig_multi_loss=args.orig_multi_loss)
+    
+        profile_model_profile_explainer = shap.explainers.deep.TFDeepExplainer(
+            (profile_explainer_inputs, weightedsum_meannormed_logits),
+            data_func, 
+            combine_mult_and_diffref=combine_mult_and_diffref)
     
 
 
     logging.info("Generating 'counts' shap scores")
-    counts_shap_scores = profile_model_counts_explainer.shap_values(
-        counts_shap_inputs, progress_message=100)
+    if not pytorch:
+        counts_shap_scores = profile_model_counts_explainer.shap_values(
+            counts_shap_inputs, progress_message=100)
     
     # save the dictionary in HDF5 formnat
     logging.info("Saving 'counts' scores")
@@ -340,8 +384,9 @@ def shap_scores(args, shap_dir):
         
     
     logging.info("Generating 'profile' shap scores")
-    profile_shap_scores = profile_model_profile_explainer.shap_values(
-        profile_shap_inputs, progress_message=100)
+    if not pytorch:
+        profile_shap_scores = profile_model_profile_explainer.shap_values(
+            profile_shap_inputs, progress_message=100)
     
     # save the dictionary in HDF5 formnat
     logging.info("Saving 'profile' scores")
@@ -383,13 +428,43 @@ def shap_scores(args, shap_dir):
             warnings.warn('Warning Message: generate_shap_bigWigs option is selected but chrom_sizes is not provided. chrom_sizes is required to generate the bigWigs.')
                 
         
+def pytorch_shap_scores(args, model, attribution, X, bias_profile_input,
+                        bias_counts_input):
+    """
+        The scores by the PyTorch backend: tangermeme's DeepSHAP on
+        the PyTorch model, with the references and the outputs of the
+        TensorFlow backend (bpnet.pytorch.attribution)
+
+        Returns:
+            tuple: (counts scores, profile scores), each
+                N x sequence_length x 4
+    """
+
+    controls = None
+    if bias_profile_input is not None:
+        controls = {}
+        for name in model.input_names[1:]:
+            controls[name] = bias_profile_input \
+                if len(model.shapes[name]) == 2 else bias_counts_input
+    logging.info("Generating 'counts' and 'profile' shap scores (PyTorch)")
+    return attribution.hypothetical_scores(
+        model, ("counts", "profile"), X, controls,
+        num_shuffles=args.num_shuffles, seed=args.seed,
+        batch_size=args.batch_size, device=args.device,
+        progress=lambda done: logging.info(
+            "{} of {} sequences".format(done, len(X))))
+
+
 def shap_scores_main():
-    # disable eager execution so shap deep explainer wont break
-    tf.compat.v1.disable_eager_execution()
-    
     # parse the command line arguments
     parser = shap_scores_argsparser()
     args = parser.parse_args()
+
+    if args.backend == "tensorflow":
+        import tensorflow as tf
+
+        # disable eager execution so shap deep explainer wont break
+        tf.compat.v1.disable_eager_execution()
     
     # check if the output directory exists
     if not os.path.exists(args.output_directory):
