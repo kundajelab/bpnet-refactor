@@ -629,3 +629,34 @@ def test_bigwig_holds_the_scores_of_the_bases_that_are_there(with_control,
             assert np.array_equal(values, projected[i].astype(np.float32))
     finally:
         bw.close()
+
+
+def test_chromosome_with_a_long_name(with_control, tmp_path):
+    """
+        A chromosome whose name has more than 8 characters: the score
+        files, the peak file and the bigWigs of a run all name it
+        whole (the score files used to hold its first 8 characters)
+    """
+
+    name = "chrUn_KI270302v1_alt_of_a_long_name"
+    d = synth.make_dataset(str(tmp_path / "data"),
+                           chroms=("chr1", "chr2", name))
+    out = tmp_path / "shap"
+    out.mkdir()
+    run = run_shap(d, with_control["model"], out, extra=[
+        "--generate-shap-bigWigs", "--chrom-sizes", d["chrom_sizes"]])
+    peaks = test_peaks(d)
+    assert len(peaks) > 20 and {chrom for chrom, _ in peaks} == {name}
+    for which in ("counts", "profile"):
+        scores = run["scores"][which]
+        assert [c.decode() if isinstance(c, bytes) else c
+                for c in scores["coords_chrom"]] == [name] * len(peaks)
+        bw = pyBigWig.open(os.path.join(run["dir"], which + "_scores.bw"))
+        try:
+            values = np.array(bw.values(name, int(scores["coords_start"][0]),
+                                        int(scores["coords_end"][0])))
+        finally:
+            bw.close()
+        assert np.isfinite(values).all() and np.abs(values).max() > 0
+    with open(os.path.join(run["dir"], "peaks_valid_scores.bed")) as fh:
+        assert [line.split("\t")[0] for line in fh] == [name] * len(peaks)
