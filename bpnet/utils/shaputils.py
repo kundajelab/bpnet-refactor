@@ -1,5 +1,7 @@
 ## Av's code with a bit of reformatting
 
+import threading
+
 import numpy as np
 
 # (TensorFlow is imported where it is needed: the shuffles are also
@@ -116,52 +118,90 @@ def _walk(tokens, successors):
 #: the walk compiled by numba, once it has been asked for: [None] if
 #: numba is not installed or could not compile it
 _COMPILED_WALK = []
+#: held by the thread that compiles the walk
+_COMPILING = threading.Lock()
+
+
+def _numba_is_compiling():
+    """
+        Whether numba's compiler is at work in another thread: its
+        lock cannot be had. (In a process that was forked while a
+        thread of its parent compiled, the lock is held for good by a
+        thread that does not exist here; compiling would wait forever.)
+    """
+
+    try:
+        from numba.core.compiler_lock import global_compiler_lock
+
+        lock = global_compiler_lock._lock
+    except (ImportError, AttributeError):
+        return False
+    if not lock.acquire(False):
+        return True
+    lock.release()
+    return False
 
 
 def _compiled_walk():
     """
         The walk as a function compiled by numba (same arguments and
         result as _walk), None where numba is not available
+
+        It is compiled once per process, by the first thread that asks
+        for it. Nothing waits for a compilation: a thread that asks
+        while another compiles (this function or anything else that
+        numba compiles) gets None for the time being and walks in
+        Python, and so does, for good, a process that was forked
+        while a thread of its parent was compiling.
     """
 
     if _COMPILED_WALK:
         return _COMPILED_WALK[0]
+    if not _COMPILING.acquire(False):
+        return None
     try:
-        import numba
+        if _COMPILED_WALK:
+            return _COMPILED_WALK[0]
+        if _numba_is_compiling():
+            return None
+        try:
+            import numba
 
-        @numba.njit
-        def visit(tokens, flat, counters, order):
-            ind = 0
-            for j in range(1, tokens.shape[0]):
-                t = tokens[ind]
-                ind = flat[counters[t]]
-                counters[t] += 1
-                order[j] = ind
+            @numba.njit
+            def visit(tokens, flat, counters, order):
+                ind = 0
+                for j in range(1, tokens.shape[0]):
+                    t = tokens[ind]
+                    ind = flat[counters[t]]
+                    counters[t] += 1
+                    order[j] = ind
 
-        def walk(tokens, successors):
-            # the lists of successors one after the other, and where
-            # the list of each token starts
-            flat = np.concatenate(successors).astype(np.int64)
-            counters = np.zeros(len(successors), dtype=np.int64)
-            counters[1:] = np.cumsum(
-                [len(inds) for inds in successors])[:-1]
-            order = np.zeros(len(tokens), dtype=np.int64)
-            visit(np.ascontiguousarray(tokens, dtype=np.int64), flat,
-                  counters, order)
-            return tokens[order]
+            def walk(tokens, successors):
+                # the lists of successors one after the other, and
+                # where the list of each token starts
+                flat = np.concatenate(successors).astype(np.int64)
+                counters = np.zeros(len(successors), dtype=np.int64)
+                counters[1:] = np.cumsum(
+                    [len(inds) for inds in successors])[:-1]
+                order = np.zeros(len(tokens), dtype=np.int64)
+                visit(np.ascontiguousarray(tokens, dtype=np.int64), flat,
+                      counters, order)
+                return tokens[order]
 
-        # compile now: a failure is found here, not in a shuffle
-        walk(np.array([0, 1, 0]), [np.array([1]), np.array([2])])
-    except Exception:
-        walk = None
-    _COMPILED_WALK.append(walk)
-    return walk
+            # compile now: a failure is found here, not in a shuffle
+            walk(np.array([0, 1, 0]), [np.array([1]), np.array([2])])
+        except Exception:
+            walk = None
+        _COMPILED_WALK.append(walk)
+        return walk
+    finally:
+        _COMPILING.release()
 
 
 #: from this many positions to walk in one call on, the walk is done
 #: by the compiled function where numba is installed (compiling takes
-#: about half a second once per process; below, the walk in Python is
-#: used, which gives the same result)
+#: between a third of a second and a second, once per process; below,
+#: the walk in Python is used, which gives the same result)
 COMPILED_FROM = 20000
 
 

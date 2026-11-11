@@ -29,6 +29,29 @@ WAYS = [False, pytest.param(True, marks=pytest.mark.skipif(
     not has_numba(), reason="numba is not installed"))]
 
 
+def random_state(seed):
+    """
+        A random state that has drawn before, with a normal variate
+        in its cache (part of its state, like the generator's array)
+    """
+
+    state = np.random.RandomState(seed)
+    state.normal()
+    assert state.get_state()[3] == 1
+    return state
+
+
+def assert_same_state(a, b):
+    """
+        Two random states are in the same state: the generator's
+        array, the position in it, and the cached normal variate
+    """
+
+    a, b = a.get_state(), b.get_state()
+    assert a[0] == b[0] and np.array_equal(a[1], b[1])
+    assert a[2:] == b[2:]
+
+
 def one_hot(text, dtype=np.int8):
     out = np.zeros((len(text), 4), dtype=dtype)
     for i, base in enumerate(text):
@@ -66,23 +89,28 @@ def test_same_shuffles_as_before(name, compiled):
     for seed, count in ((20210304, 20), (1, 1), (7, 3), (3, 0)):
         for dtype in (np.int8, np.float64, np.float32):
             x = one_hot(text, dtype)
-            old_state = np.random.RandomState(seed)
-            new_state = np.random.RandomState(seed)
+            old_state, new_state = random_state(seed), random_state(seed)
             old = dinuc_shuffle_v0(x, count, old_state)
             new = dinuc_shuffle(x, count, new_state, compiled=compiled)
             assert new.dtype == old.dtype == dtype
             assert new.shape == old.shape == (count, len(text), 4)
             assert np.array_equal(new, old)
-            # the same random numbers were drawn
-            assert old_state.randint(2 ** 31) == new_state.randint(2 ** 31)
+            # the random state is where the previous implementation
+            # leaves it
+            assert_same_state(old_state, new_state)
 
-        old_state = np.random.RandomState(seed)
-        new_state = np.random.RandomState(seed)
+        old_state, new_state = random_state(seed), random_state(seed)
         old = dinuc_shuffle_v0(text, count, old_state)
         new = dinuc_shuffle(text, count, new_state, compiled=compiled)
         assert isinstance(new, list) and new == old
         assert all(isinstance(s, str) and len(s) == len(text) for s in new)
-        assert old_state.randint(2 ** 31) == new_state.randint(2 ** 31)
+        assert_same_state(old_state, new_state)
+        # a state that has not drawn before
+        old_state = np.random.RandomState(seed)
+        new_state = np.random.RandomState(seed)
+        assert dinuc_shuffle(text, count, new_state, compiled=compiled) == \
+            dinuc_shuffle_v0(text, count, old_state)
+        assert_same_state(old_state, new_state)
 
 
 def pairs(text):
@@ -222,6 +250,127 @@ def test_numba_that_is_missing_or_fails(monkeypatch):
         assert np.array_equal(
             dinuc_shuffle(x, 20, np.random.RandomState(8), compiled=compiled),
             expected)
+
+
+def test_nothing_waits_for_a_compilation(monkeypatch):
+    """
+        One thread compiles the walk; a thread that asks meanwhile
+        walks in Python instead of waiting, and so does one that asks
+        while numba compiles something else. Afterwards the compiled
+        walk is there, made once.
+    """
+
+    if not has_numba():
+        pytest.skip("numba is not installed")
+    import threading
+
+    from numba.core.compiler_lock import global_compiler_lock
+
+    rng = np.random.RandomState(9)
+    x = one_hot("".join(rng.choice(list("ACGT"), size=2114)))
+    expected = dinuc_shuffle_v0(x, 20, np.random.RandomState(8))
+    monkeypatch.setattr(shaputils, "_COMPILED_WALK", [])
+
+    def from_another_thread(function):
+        result = []
+        thread = threading.Thread(
+            target=lambda: result.append(function()), daemon=True)
+        thread.start()
+        thread.join(60)
+        assert not thread.is_alive()
+        return result[0]
+
+    # this thread is "compiling"
+    with shaputils._COMPILING:
+        assert from_another_thread(shaputils._compiled_walk) is None
+        assert np.array_equal(from_another_thread(lambda: dinuc_shuffle(
+            x, 20, np.random.RandomState(8))), expected)
+    assert shaputils._COMPILED_WALK == []
+    # numba is compiling something
+    with global_compiler_lock:
+        assert from_another_thread(shaputils._numba_is_compiling)
+        assert from_another_thread(shaputils._compiled_walk) is None
+        assert np.array_equal(from_another_thread(lambda: dinuc_shuffle(
+            x, 20, np.random.RandomState(8), compiled=True)), expected)
+    assert shaputils._COMPILED_WALK == []
+    assert not shaputils._numba_is_compiling()
+
+    # several threads at once: one function, the same shuffles
+    results, threads = [], []
+    start = threading.Event()
+
+    def shuffle():
+        start.wait()
+        results.append(dinuc_shuffle(x, 20, np.random.RandomState(8)))
+
+    for _ in range(6):
+        threads.append(threading.Thread(target=shuffle, daemon=True))
+        threads[-1].start()
+    start.set()
+    for thread in threads:
+        thread.join(120)
+        assert not thread.is_alive()
+    assert len(results) == 6
+    assert all(np.array_equal(result, expected) for result in results)
+    assert len(shaputils._COMPILED_WALK) == 1
+    assert shaputils._COMPILED_WALK[0] is not None
+    assert shaputils._compiled_walk() is shaputils._COMPILED_WALK[0]
+
+
+FORKED_WHILE_COMPILING = """
+import os, signal, sys, threading
+import numpy as np
+from numba.core.compiler_lock import global_compiler_lock
+from bpnet.utils.shaputils import dinuc_shuffle
+from tests.legacy_reference import dinuc_shuffle_v0
+
+held, release = threading.Event(), threading.Event()
+
+def hold_compiler():
+    with global_compiler_lock:
+        held.set()
+        release.wait()
+
+thread = threading.Thread(target=hold_compiler)
+thread.start()
+held.wait()
+pid = os.fork()
+if pid == 0:
+    # the lock of the compiler is held here by a thread that does not
+    # exist in this process
+    signal.alarm(20)
+    text = "ACGT" * 600
+    same = dinuc_shuffle(text, 20, np.random.RandomState(1)) == \
+        dinuc_shuffle_v0(text, 20, np.random.RandomState(1))
+    os._exit(0 if same else 3)
+release.set()
+thread.join()
+print("child:", os.waitpid(pid, 0)[1])
+"""
+
+
+def test_process_forked_while_numba_compiles():
+    """
+        A process that is forked while a thread of its parent compiles
+        with numba inherits the compiler's lock, held: a shuffle in it
+        must not try to compile (it would wait forever), and gives the
+        same shuffles
+    """
+
+    if not has_numba():
+        pytest.skip("numba is not installed")
+    import os
+    import subprocess
+    import sys
+
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    done = subprocess.run(
+        [sys.executable, "-c", FORKED_WHILE_COMPILING], cwd=repo,
+        env=dict(os.environ, PYTHONPATH=repo, PYTHONDONTWRITEBYTECODE="1"),
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        universal_newlines=True, timeout=120)
+    assert done.returncode == 0, done.stdout[-2000:]
+    assert "child: 0" in done.stdout, done.stdout[-2000:]
 
 
 def test_without_a_random_state():
