@@ -391,8 +391,11 @@ def interrupted_at_the_end_of_the_entry(queue):
     before = signal.getsignal(signal.SIGINT)
     lines, first = inspect.getsourcelines(generators.Interrupts.__enter__)
     # the line of the entry that returns once the handler is installed
-    last = first + max(i for i, line in enumerate(lines)
-                       if line.strip() == "return self")
+    installs = [i for i, line in enumerate(lines)
+                if line.strip() == "signal.signal(signal.SIGINT, self._handler)"]
+    assert len(installs) == 1 and lines[installs[0] + 1].strip() == \
+        "return self"
+    last = first + installs[0] + 1
     sent = []
 
     def trace(frame, event, arg):
@@ -465,6 +468,57 @@ def test_failure_of_the_handler_that_was_there_while_entering():
 
     assert in_a_process(handler_that_raises_value_error) == \
         ("the handler that was there", True, True, False)
+
+
+#: a fresh interpreter in which the module threading is imported first
+#: by a thread that is not the main one: threading then takes that
+#: thread for the main thread
+THREADING_IMPORTED_ELSEWHERE = """
+import _thread, os, signal, time
+done = []
+
+
+def imports():
+    import threading
+    done.append(threading.main_thread().ident)
+
+
+_thread.start_new_thread(imports, ())
+while not done:
+    time.sleep(0.01)
+import threading
+from bpnet.generators import generators
+
+with generators.Interrupts() as notes:
+    try:
+        os.kill(os.getpid(), signal.SIGINT)
+        time.sleep(0.2)
+    except KeyboardInterrupt:
+        pass
+print("main thread taken for another:",
+      threading.main_thread().ident != _thread.get_ident())
+print("noted:", notes.noted)
+"""
+
+
+def test_notes_where_threading_was_imported_by_another_thread():
+    """
+        Whether the handling of interrupts can be changed is not
+        asked of the module threading, which can take another thread
+        for the main one
+    """
+
+    import subprocess
+    import sys
+
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    output = subprocess.run(
+        [sys.executable, "-c", THREADING_IMPORTED_ELSEWHERE],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        universal_newlines=True, timeout=LIMIT,
+        env=dict(os.environ, PYTHONPATH=repo, CUDA_VISIBLE_DEVICES="")).stdout
+    assert "main thread taken for another: True" in output, output[-2000:]
+    assert "noted: True" in output, output[-2000:]
 
 
 def ignored_before(queue):

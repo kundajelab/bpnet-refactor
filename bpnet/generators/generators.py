@@ -74,7 +74,6 @@ from bpnet.utils.misc import gaussian1D_smoothing
 from contextlib import contextmanager
 from queue import Empty, Full, Queue
 from threading import RLock, Thread
-import threading
 import time
 import traceback
 
@@ -491,7 +490,11 @@ class Interrupts(object):
         
         Interrupts that were ignored before stay ignored, and so is 
         a handler that was not installed from Python (nothing is 
-        noted then). An interrupt with the default action of the 
+        noted then). An interrupt in the last instructions of the 
+        entry, after its protection and before the block runs, can 
+        leave the handler of the block installed; it then goes on 
+        passing interrupts to the handler that was there, so that 
+        they act as before. An interrupt with the default action of the 
         system is raised as a KeyboardInterrupt while the block runs, 
         so that the tool can clean up. A handler that someone else 
         installs while the block runs is left in place at its end. 
@@ -509,10 +512,6 @@ class Interrupts(object):
         self._handler = self._note
     
     def __enter__(self):
-        if threading.current_thread() is not threading.main_thread():
-            # (signals are handled in the main thread only, and their 
-            # handling cannot be changed from another)
-            return self
         before = signal.getsignal(signal.SIGINT)
         if before is None or before == signal.SIG_IGN:
             return self
@@ -521,6 +520,16 @@ class Interrupts(object):
         try:
             signal.signal(signal.SIGINT, self._handler)
             return self
+        except ValueError:
+            if signal.getsignal(signal.SIGINT) is not self._handler:
+                # the handling of signals cannot be changed here (not 
+                # the main thread of the main interpreter): nothing is 
+                # noted
+                self._installed = False
+                return self
+            # (raised after ours was installed: below)
+            self._restore()
+            raise
         except BaseException:
             # an interrupt right after the handler was installed (or 
             # anything else on the way): the block does not run, and 
