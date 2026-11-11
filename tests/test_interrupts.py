@@ -295,6 +295,34 @@ def handler_installed_meanwhile(queue):
     queue.put((kept, calls == [signal.SIGINT], interrupts.noted))
 
 
+def handler_that_equals_everything(queue):
+    class Later(object):
+        calls = 0
+
+        def __call__(self, number, frame):
+            Later.calls += 1
+
+        def __eq__(self, other):
+            return True
+
+        __hash__ = object.__hash__
+
+    later = Later()
+    with generators.Interrupts():
+        signal.signal(signal.SIGINT, later)
+    queue.put(signal.getsignal(signal.SIGINT) is later)
+
+
+def test_handler_installed_meanwhile_is_told_apart_by_identity():
+    """
+        Whether the handler of the block is still installed is asked
+        by identity: a handler installed meanwhile that claims to be
+        equal to anything stays as well
+    """
+
+    assert in_a_process(handler_that_equals_everything) is True
+
+
 def test_handler_installed_meanwhile_stays():
     """
         A handler that someone else installs while the block runs is
@@ -354,6 +382,89 @@ def test_interrupt_while_the_handler_is_installed():
     """
 
     assert in_a_process(interrupted_while_entering) == ("interrupted", True)
+
+
+def interrupted_at_the_end_of_the_entry(queue):
+    import inspect
+    import sys
+
+    before = signal.getsignal(signal.SIGINT)
+    lines, first = inspect.getsourcelines(generators.Interrupts.__enter__)
+    # the line of the entry that returns once the handler is installed
+    last = first + max(i for i, line in enumerate(lines)
+                       if line.strip() == "return self")
+    sent = []
+
+    def trace(frame, event, arg):
+        if frame.f_code is generators.Interrupts.__enter__.__code__:
+            if event == "line" and frame.f_lineno == last and not sent:
+                sent.append(1)
+                os.kill(os.getpid(), signal.SIGINT)
+            return trace
+        return None
+
+    notes = generators.Interrupts()
+    sys.settrace(trace)
+    try:
+        with notes:
+            result = "entered"
+    except KeyboardInterrupt:
+        result = "interrupted"
+    finally:
+        sys.settrace(None)
+    queue.put((result, sent == [1], notes.noted,
+               signal.getsignal(signal.SIGINT) is before, notes._installed))
+
+
+def test_interrupt_when_the_entry_returns():
+    """
+        An interrupt that arrives when the handler is installed and
+        the entry is about to return ends the entry: the handler that
+        was there is put back
+    """
+
+    assert in_a_process(interrupted_at_the_end_of_the_entry) == \
+        ("interrupted", True, True, True, False)
+
+
+def handler_that_raises_value_error(queue):
+    def odd(number, frame):
+        raise ValueError("the handler that was there")
+
+    signal.signal(signal.SIGINT, odd)
+    real = signal.signal
+
+    def installs_then_interrupt(number, handler):
+        previous = real(number, handler)
+        if getattr(handler, "__name__", None) == "_note":
+            # a real interrupt, right after the handler was installed
+            os.kill(os.getpid(), signal.SIGINT)
+            time.sleep(0.2)
+        return previous
+
+    generators.signal.signal = installs_then_interrupt
+    notes = generators.Interrupts()
+    try:
+        with notes:
+            result = "entered"
+    except ValueError as failure:
+        result = str(failure)
+    finally:
+        generators.signal.signal = real
+    queue.put((result, notes.noted, signal.getsignal(signal.SIGINT) is odd,
+               notes._installed))
+
+
+def test_failure_of_the_handler_that_was_there_while_entering():
+    """
+        A ValueError on the way into the block (here from the handler
+        that was there, called for an interrupt right after ours was
+        installed) is not taken for the refusal of another thread:
+        the entry fails and is undone
+    """
+
+    assert in_a_process(handler_that_raises_value_error) == \
+        ("the handler that was there", True, True, False)
 
 
 def ignored_before(queue):

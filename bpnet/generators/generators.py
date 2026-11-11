@@ -74,6 +74,7 @@ from bpnet.utils.misc import gaussian1D_smoothing
 from contextlib import contextmanager
 from queue import Empty, Full, Queue
 from threading import RLock, Thread
+import threading
 import time
 import traceback
 
@@ -503,27 +504,29 @@ class Interrupts(object):
         self.noted = False
         self._before = None
         self._installed = False
+        # (the handler, as one object: whether it is still installed 
+        # is asked by identity)
+        self._handler = self._note
     
     def __enter__(self):
-        try:
-            before = signal.getsignal(signal.SIGINT)
-        except ValueError:
+        if threading.current_thread() is not threading.main_thread():
+            # (signals are handled in the main thread only, and their 
+            # handling cannot be changed from another)
             return self
+        before = signal.getsignal(signal.SIGINT)
         if before is None or before == signal.SIG_IGN:
             return self
         self._before = before
         self._installed = True
         try:
-            signal.signal(signal.SIGINT, self._note)
-        except ValueError:
-            # (not the main thread)
-            self._installed = False
+            signal.signal(signal.SIGINT, self._handler)
+            return self
         except BaseException:
-            # an interrupt right after the handler was installed: the 
-            # block does not run, and its end is not called
+            # an interrupt right after the handler was installed (or 
+            # anything else on the way): the block does not run, and 
+            # its end is not called
             self._restore()
             raise
-        return self
     
     def __exit__(self, *failure):
         self._restore()
@@ -534,7 +537,7 @@ class Interrupts(object):
             return
         self._installed = False
         try:
-            if signal.getsignal(signal.SIGINT) == self._note:
+            if signal.getsignal(signal.SIGINT) is self._handler:
                 signal.signal(signal.SIGINT, self._before)
         except ValueError:  # pragma: no cover
             pass

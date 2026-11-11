@@ -183,8 +183,9 @@ class Fails(tf.keras.callbacks.Callback):
     def fail(self, batch, what):
         if os.environ['FAIL_IN'] == 'loses an interrupt in ' + what and \
                 batch == 1:
-            # as a callback of TensorFlow can: the KeyboardInterrupt
-            # is discarded, and the training goes on
+            # simulates what happens where TensorFlow discards the
+            # KeyboardInterrupt (Keras' own batch hooks pass it on):
+            # the training goes on
             try:
                 open('waiting', 'w').close()
                 time.sleep(120)

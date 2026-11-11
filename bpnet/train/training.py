@@ -693,7 +693,10 @@ class InterruptCheck(tf.keras.callbacks.Callback):
     def __init__(self, interrupts):
         super(InterruptCheck, self).__init__()
         self.interrupts = interrupts
-        # (the logs are not looked at: Keras need not convert them)
+        # (the logs are not looked at, so that Keras need not convert 
+        # them for this callback. It does for its progress bar, which 
+        # bpnet-train shows; without it Keras 2.4 still converts them 
+        # after every batch once a callback has batch hooks.)
         self._supports_tf_logs = True
     
     def on_train_batch_end(self, batch, logs=None):
