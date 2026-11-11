@@ -70,11 +70,17 @@ _ACTIVATIONS = {
 }
 
 
+#: other names TensorFlow accepts for a type (these are its own: for
+#: numpy 'float' is float64)
+_TYPE_NAMES = {"half": "float16", "float": "float32", "double": "float64"}
+
+
 def _variable_type(config):
     """
         The type the variables of a layer were saved with, by the
-        layer's settings: its type, or float32 under a mixed precision
-        policy. None when the file does not say.
+        layer's settings: its type under the name numpy has for it,
+        or float32 under a mixed precision policy. None when the file
+        does not say.
     """
 
     stored = config.get("dtype")
@@ -88,7 +94,9 @@ def _variable_type(config):
         raise UnsupportedModelError(
             "Layer {}: dtype {} is not supported".format(
                 config.get("name"), stored))
-    return "float32" if stored.startswith("mixed_") else stored
+    if stored.startswith("mixed_"):
+        return "float32"
+    return _TYPE_NAMES.get(stored, stored)
 
 
 def channels_first(array):

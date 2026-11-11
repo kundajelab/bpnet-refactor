@@ -460,6 +460,22 @@ def test_weights_must_have_the_type_the_layers_were_saved_with():
         assert "Layer out: its saved weights are ['float64']" in \
             str(failure.value)
 
+    # the other names TensorFlow has for the types (for numpy 'float'
+    # is float64: these are TensorFlow's)
+    for name, kind, right, wrong in (("double", "float64", weights, single),
+                                     ("float", "float32", single, weights)):
+        other = changed(architecture, "first", dtype=name)
+        model = pytorch_model.from_architecture(other, right)
+        assert model.saved_types["first"] == kind
+        assert str(model.layers["first"].weight.dtype) == "torch." + kind
+        with pytest.raises(UnsupportedModelError) as failure:
+            pytorch_model.from_architecture(other, wrong)
+        assert "was saved with the type {}".format(kind) in \
+            str(failure.value)
+    assert pytorch_model.Model(changed(
+        architecture, "first", dtype="half")).saved_types["first"] == \
+        "float16"
+
     # on purpose
     model = pytorch_model.from_architecture(double)
     pytorch_model.set_weights(model, single)
@@ -981,6 +997,42 @@ def test_graph_that_keras_builds(tf, tmp_path):
     assert isinstance(found, torch.Tensor)
     np.testing.assert_allclose(found.numpy(), expected, rtol=2e-5,
                                atol=2e-5 * np.abs(expected).max())
+
+
+@pytest.mark.parametrize("name", ["double", "float64"])
+def test_layers_that_keras_saved_as_double(tf, tmp_path, name):
+    """
+        A model whose layers were given their type by one of the names
+        TensorFlow has for float64: its weights are float64, and so is
+        the model here, with the outputs of the Keras model
+    """
+
+    layers = tf.keras.layers
+    # (a policy keeps the name it was given; a type that is given as
+    # a string is stored as 'float64' whatever its spelling)
+    x = layers.Input((6,), name="x", dtype="float64")
+    y = layers.Dense(4, activation="tanh", name="d",
+                     dtype=tf.keras.mixed_precision.Policy(name))(x)
+    y = layers.Dense(2, name="e",
+                     dtype=tf.keras.mixed_precision.Policy(name))(y)
+    keras = tf.keras.Model(x, y, name="double")
+    rng = np.random.RandomState(12)
+    keras.set_weights([rng.normal(size=w.shape) for w in keras.get_weights()])
+    batch = rng.normal(size=(5, 6))
+    expected = keras(tf.constant(batch), training=False).numpy()
+    assert expected.dtype == np.float64
+    path = str(tmp_path / "model")
+    keras.save(path)
+
+    stored = {layer["name"]: layer["config"].get("dtype")
+              for layer in loading.read_architecture(path)["layers"]}
+    assert stored["d"] == stored["e"] == name
+    model = pytorch_model.load_model(path)
+    assert model.saved_types == {"d": "float64", "e": "float64"}
+    assert all(p.dtype == torch.float64 for p in model.parameters())
+    with torch.no_grad():
+        found = model(torch.tensor(batch)).numpy()
+    np.testing.assert_allclose(found, expected, rtol=1e-12, atol=1e-12)
 
 
 def test_model_saved_as_hdf5(tf, tmp_path):
