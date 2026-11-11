@@ -763,10 +763,9 @@ def saved_by(request, tmp_path_factory):
 def test_models_saved_by_every_tensorflow_version(saved_by, directory,
                                                   file_name):
     """
-        A model that TensorFlow 2.4.1, 2.11.0 or 2.15.1 saved gives in
-        PyTorch the outputs it gave where it was saved. An HDF5 file
-        is read without TensorFlow; the weights of a SavedModel
-        directory are read with it.
+        A model that TensorFlow 2.4.1, 2.11.0 or 2.15.1 saved, as a
+        SavedModel directory or as an HDF5 file, gives in PyTorch the
+        outputs it gave where it was saved. TensorFlow is not needed.
     """
 
     case_dir = os.path.join(saved_by["dir"], directory)
@@ -781,8 +780,6 @@ def test_models_saved_by_every_tensorflow_version(saved_by, directory,
                                match="without a layer graph"):
                 pytorch_model.load_model(path)
             return
-    else:
-        pytest.importorskip("tensorflow")
     expected = np.load(os.path.join(case_dir, "expected.npz"))
     inputs = {key[len("input/"):]: expected[key] for key in expected.files
               if key.startswith("input/")}

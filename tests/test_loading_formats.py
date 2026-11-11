@@ -36,17 +36,73 @@ def field(number, value):
     return varint((number << 3) | 2) + varint(len(value)) + value
 
 
+def fixed32(number, data):
+    """
+        A field of four bytes
+    """
+
+    assert len(data) == 4
+    return varint((number << 3) | 5) + data
+
+
+def fixed64(number, data):
+    """
+        A field of eight bytes
+    """
+
+    assert len(data) == 8
+    return varint((number << 3) | 1) + data
+
+
 def test_fields_of_a_message():
     message = field(1, 5) + field(2, b"abc") + field(300, 2 ** 40 + 3) + \
         field(7, b"") + varint((4 << 3) | 5) + b"\x01\x02\x03\x04" + \
         varint((5 << 3) | 1) + bytes(range(8)) + field(2, b"x" * 300)
-    fields = [(n, v if isinstance(v, int) else bytes(v))
-              for n, v in loading._fields(memoryview(message))]
+    fields = [(n, k, v if isinstance(v, int) else bytes(v))
+              for n, k, v in loading._fields(memoryview(message))]
+    # with their kinds: 0 a number, 2 length delimited, 5 and 1 of
+    # fixed width (four and eight bytes)
     assert fields == [
-        (1, 5), (2, b"abc"), (300, 2 ** 40 + 3), (7, b""),
-        (4, b"\x01\x02\x03\x04"), (5, bytes(range(8))), (2, b"x" * 300)]
+        (1, 0, 5), (2, 2, b"abc"), (300, 0, 2 ** 40 + 3), (7, 2, b""),
+        (4, 5, b"\x01\x02\x03\x04"), (5, 1, bytes(range(8))),
+        (2, 2, b"x" * 300)]
+    assert (loading._VARINT, loading._FIXED64, loading._BYTES,
+            loading._FIXED32) == (0, 1, 2, 5)
     assert bytes(loading._first(memoryview(message), 2)) == b"abc"
     assert loading._first(memoryview(message), 9) is None
+    # a field of another kind is not the message that is looked for:
+    # eight bytes of fixed width that read as a message, a number
+    other = varint((2 << 3) | 1) + b"\x12\x02\x08\x01\x18\x00\x18\x00" + \
+        field(2, 7) + field(2, b"abc")
+    assert bytes(loading._first(memoryview(other), 2)) == b"abc"
+    assert loading._first(memoryview(other[:-5]), 2) is None
+    # the largest field number
+    largest = varint((2 ** 29 - 1) << 3) + b"\x01"
+    assert list(loading._fields(memoryview(largest))) == [(2 ** 29 - 1, 0, 1)]
+
+
+def test_numbers_of_a_message():
+    """
+        A number of a message takes at most ten bytes, of which 64
+        bits count (what the tenth byte has beyond them is dropped, as
+        protocol buffers do); a field of 32 bits keeps the low 32, and
+        the fields of both widths are signed
+    """
+
+    assert loading._varint(b"x\xac\x02", 1) == (300, 3)
+    assert loading._varint(b"\xff" * 9 + b"\x01", 0) == (2 ** 64 - 1, 10)
+    assert loading._varint(b"\xff" * 9 + b"\x7f", 0) == (2 ** 64 - 1, 10)
+    assert loading._varint(b"\x81" + b"\x80" * 8 + b"\x7e", 0) == (1, 10)
+    with pytest.raises(ValueError, match="more than ten bytes"):
+        loading._varint(b"\xff" * 10 + b"\x01", 0)
+    for value, as_32, as_64 in (
+            (0, 0, 0), (5, 5, 5), (2 ** 31 - 1, 2 ** 31 - 1, 2 ** 31 - 1),
+            (2 ** 31, -2 ** 31, 2 ** 31), (2 ** 32 - 1, -1, 2 ** 32 - 1),
+            (2 ** 32 + 1, 1, 2 ** 32 + 1), (2 ** 63 - 1, -1, 2 ** 63 - 1),
+            (2 ** 63, 0, -2 ** 63), (2 ** 64 - 1, -1, -1),
+            (2 ** 64 - 2 ** 31, -2 ** 31, -2 ** 31)):
+        assert loading._int32(value) == as_32
+        assert loading._int64(value) == as_64
 
 
 def test_truncated_or_foreign_data_is_not_read_as_a_message():
@@ -56,9 +112,38 @@ def test_truncated_or_foreign_data_is_not_read_as_a_message():
     for data in (b"\x80", b"\x08\xff\xff", field(2, b"abc")[:1] + b"\x80"):
         with pytest.raises(ValueError, match="Truncated"):
             list(loading._fields(memoryview(data)))
-    # wire type 3 (start group) is not used by these files
-    with pytest.raises(ValueError, match="wire type"):
-        list(loading._fields(memoryview(varint((1 << 3) | 3))))
+    # fields of fixed width that are cut short
+    for wire_type, length in ((5, 4), (1, 8)):
+        with pytest.raises(ValueError, match="Truncated"):
+            list(loading._fields(memoryview(
+                varint((1 << 3) | wire_type) + bytes(length - 1))))
+    # wire types 3 and 4 (groups) are not used by these files; 6 and 7
+    # do not exist
+    for wire_type in (3, 4, 6, 7):
+        with pytest.raises(ValueError, match="wire type"):
+            list(loading._fields(memoryview(varint((1 << 3) | wire_type))))
+    # there is no field number 0, and none of more than 29 bits (a
+    # field number with its kind has 32)
+    for data in (b"\x00\x01", field(0, b"abc"),
+                 varint((2 ** 29) << 3) + b"\x01",
+                 varint(2 ** 32 + (15 << 3)) + b"\x03"):
+        with pytest.raises(ValueError, match="field number"):
+            list(loading._fields(memoryview(data)))
+    # a field number with its kind, and a length, are written in as
+    # few bytes as they need (the readers of protocol buffers do not
+    # agree on other ways of writing them)
+    for data in (b"\x88\x00\x01", b"\x88\x80\x80\x80\x80\x00\x01",
+                 b"\x88" + b"\x80" * 8 + b"\x02\x01",
+                 b"\x12\x83\x00abc", b"\x12\x83\x80\x80\x80\x80\x00abc"):
+        with pytest.raises(ValueError, match="in more bytes than it needs"):
+            list(loading._fields(memoryview(data)))
+    assert [(n, k, bytes(v)) for n, k, v in loading._fields(memoryview(
+        b"\x12\x80\x01" + bytes(128)))] == [(2, 2, bytes(128))]
+    # a field has less than 2 GB
+    for length, message in ((2 ** 31 - 16, "a field of 2147483632 bytes"),
+                            (2 ** 31 - 17, "Truncated")):
+        with pytest.raises(ValueError, match=message):
+            list(loading._fields(memoryview(b"\x12" + varint(length))))
 
 
 def keras_json(layers=()):
@@ -163,3 +248,41 @@ def test_paths_that_are_not_saved_models(tmp_path):
     with pytest.raises(loading.UnsupportedModelError,
                        match="MyModel model without a layer graph"):
         loading.read_architecture(str(tmp_path / "subclassed"))
+
+
+def test_hdf5_files_that_do_not_hold_weights(tmp_path):
+    h5py = pytest.importorskip("h5py")
+    path = str(tmp_path / "other.h5")
+    with h5py.File(path, "w") as f:
+        f.create_dataset("x", data=[1, 2])
+    with pytest.raises(loading.UnsupportedModelError,
+                       match="it has no 'model_weights'"):
+        loading.read_weights(path)
+    # a layer that lists weights it does not have
+    with h5py.File(path, "w") as f:
+        layer = f.create_group("model_weights").create_group("conv")
+        layer.attrs["weight_names"] = [b"conv/kernel:0", b"conv/bias:0"]
+        layer.create_group("conv").create_dataset("kernel:0", data=[1.0])
+    with pytest.raises(ValueError) as failure:
+        loading.read_weights(path)
+    assert "layer conv lists the weights conv/bias:0 and does not have " \
+        "them" in str(failure.value)
+    with h5py.File(path, "a") as f:
+        f["model_weights/conv/conv"].create_dataset("bias:0", data=[2.0])
+    weights = loading.read_weights(path)
+    assert sorted(weights) == ["conv"]
+    assert {name: value.tolist() for name, value in
+            weights["conv"].items()} == {"kernel": [1.0], "bias": [2.0]}
+    # the weights of a layer that are no group
+    with h5py.File(path, "w") as f:
+        weights = f.create_group("model_weights").create_dataset(
+            "conv", data=[1.0])
+        weights.attrs["weight_names"] = [b"conv/kernel:0"]
+    with pytest.raises(ValueError,
+                       match="the weights of layer conv are not a group"):
+        loading.read_weights(path)
+    # not an HDF5 file
+    with open(path, "wb") as fh:
+        fh.write(b"something else")
+    with pytest.raises(OSError):
+        loading.read_weights(path)

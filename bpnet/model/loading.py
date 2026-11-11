@@ -20,7 +20,9 @@
     prediction (model.predict, model(x)); it holds none of the training
     settings of CustomModel.
 
-    Reading the layer graph needs neither TensorFlow nor keras.
+    Reading the layer graph and the weights needs neither TensorFlow
+    nor keras (the variables of a SavedModel are read by
+    bpnet.model.checkpoint); building the keras model does.
 """
 
 import json
@@ -51,35 +53,96 @@ def _varint(buffer, position):
 
     result = 0
     shift = 0
-    while True:
+    # (a number of 64 bits takes at most ten bytes)
+    for _ in range(10):
         if position >= len(buffer):
             raise ValueError("Truncated protocol buffer message")
         byte = buffer[position]
         position += 1
         result |= (byte & 0x7F) << shift
         if not byte & 0x80:
-            return result, position
+            # (64 bits: what the tenth byte has beyond them is dropped,
+            # as protocol buffers do)
+            return result & 0xFFFFFFFFFFFFFFFF, position
         shift += 7
+    raise ValueError(
+        "Not a protocol buffer message (a number of more than ten bytes)")
+
+
+#: the kinds of field of the protocol buffer wire format ("wire types")
+_VARINT, _FIXED64, _BYTES, _FIXED32 = 0, 1, 2, 5
+#: the longest field that protocol buffer readers take
+_LONGEST = 0x7FFFFFFF - 16
+
+
+def _prefix(buffer, position):
+    """
+        What a field starts with: its number with its kind, or its
+        length. A varint that fits 32 bits, written in as few bytes as
+        it needs: the readers of protocol buffers do not agree on
+        longer ones (one reads a field number of ten bytes, another
+        refuses one of six), and no writer makes them.
+
+        Returns:
+            tuple: (value, position after it)
+    """
+
+    value, after = _varint(buffer, position)
+    if after - position > 5 or value >> 32 or \
+            (after - position > 1 and buffer[after - 1] == 0):
+        raise ValueError(
+            "Not a protocol buffer message (a field number or a length "
+            "of more than 32 bits, or in more bytes than it needs)")
+    return value, after
+
+
+def _int32(value):
+    """
+        A varint as the int32 field it is (the low 32 bits, signed)
+    """
+
+    value &= 0xFFFFFFFF
+    return value - (1 << 32) if value >> 31 else value
+
+
+def _int64(value):
+    """
+        A varint as the int64 field it is (signed)
+    """
+
+    return value - (1 << 64) if value >> 63 else value
 
 
 def _fields(buffer):
     """
-        The fields of a serialized protocol buffer message, in order
+        The fields of a serialized protocol buffer message, in order,
+        with their kind. A reader that knows the message takes a
+        field only when it has the kind the message gives it, and
+        passes over it otherwise, as protocol buffers do (a fixed
+        width field of eight bytes is not a message of eight bytes).
 
         Yields:
-            tuple: (field number, value); the value is an int for a
-                varint field and a memoryview for a length delimited
-                or fixed width field
+            tuple: (field number, kind, value); the value is an int
+                for a varint field (_VARINT) and a memoryview for a
+                length delimited (_BYTES) or fixed width field
+                (_FIXED64, _FIXED32)
     """
 
     position, end = 0, len(buffer)
     while position < end:
-        key, position = _varint(buffer, position)
+        key, position = _prefix(buffer, position)
         number, wire_type = key >> 3, key & 7
+        if number == 0:
+            raise ValueError(
+                "Not a protocol buffer message (field number 0)")
         if wire_type == 0:
             value, position = _varint(buffer, position)
         elif wire_type == 2:
-            length, position = _varint(buffer, position)
+            length, position = _prefix(buffer, position)
+            if length > _LONGEST:
+                raise ValueError(
+                    "Not a protocol buffer message (a field of {} "
+                    "bytes)".format(length))
             value = buffer[position:position + length]
             position += length
         elif wire_type in (1, 5):
@@ -92,16 +155,17 @@ def _fields(buffer):
                     wire_type))
         if position > end:
             raise ValueError("Truncated protocol buffer message")
-        yield number, value
+        yield number, wire_type, value
 
 
 def _first(buffer, number):
     """
-        The first field with the given number, None if there is none
+        The first length delimited field (a message, a string) with
+        the given number, None if there is none
     """
 
-    for field_number, value in _fields(buffer):
-        if field_number == number:
+    for field_number, kind, value in _fields(buffer):
+        if field_number == number and kind == _BYTES:
             return value
     return None
 
@@ -139,11 +203,13 @@ def _metadata_in_keras_metadata_pb(data):
         'root'
     """
 
-    for number, node in _fields(data):
-        if number != 1:
+    for number, kind, node in _fields(data):
+        if number != 1 or kind != _BYTES:
             continue
         node_path, metadata = None, None
-        for field_number, value in _fields(node):
+        for field_number, field_kind, value in _fields(node):
+            if field_kind != _BYTES:
+                continue
             if field_number == 3:
                 node_path = bytes(value).decode("utf-8")
             elif field_number == 5:
@@ -237,7 +303,9 @@ def _weights_in_saved_model(path):
     """
         The variables of every layer in a SavedModel's checkpoint
 
-        The checkpoint records the objects of the model as a graph:
+        The checkpoint (read without TensorFlow, see
+        bpnet.model.checkpoint) records the objects of the model as a
+        graph:
         the model refers to its layers with weights
         ('layer_with_weights-<i>'), each of which refers to its
         variables ('kernel', 'bias'). The graph is followed from the
@@ -246,54 +314,209 @@ def _weights_in_saved_model(path):
         it had in the model ('<layer>/kernel').
     """
 
-    import tensorflow as tf
+    from bpnet.model.checkpoint import Checkpoint, CorruptCheckpointError
 
-    reader = tf.train.load_checkpoint(
-        os.path.join(path, "variables", "variables"))
-    object_graph = memoryview(
-        reader.get_tensor("_CHECKPOINTABLE_OBJECT_GRAPH"))
+    reader = Checkpoint(os.path.join(path, "variables", "variables"))
+    if "_CHECKPOINTABLE_OBJECT_GRAPH" not in reader:
+        raise CorruptCheckpointError(
+            "{} does not say which variables belong to which layer (it "
+            "has no object graph)".format(reader.index_path))
+    object_graph = reader.get_tensor("_CHECKPOINTABLE_OBJECT_GRAPH")
+    if not isinstance(object_graph, bytes):
+        raise CorruptCheckpointError(
+            "{}: its object graph is not a message".format(
+                reader.index_path))
+    try:
+        variables = _variables_in_object_graph(memoryview(object_graph))
+    except UnsupportedModelError as error:
+        raise UnsupportedModelError("{}: {}".format(reader.index_path, error))
+    except ValueError as error:
+        raise CorruptCheckpointError(
+            "{}: its object graph cannot be read ({})".format(
+                reader.index_path, error))
 
+    found, tensors = {}, {}
+    for variable_name, full_name, checkpoint_key in variables:
+        layer = full_name.rsplit("/", 1)[0]
+        if variable_name in found.get(layer, {}):
+            # the weights are filed by the names of the variables, so
+            # a name can be there once. Keras writes it twice for two
+            # layers that share a variable, which the models of this
+            # package do not do
+            if tensors[layer, variable_name] == checkpoint_key:
+                raise UnsupportedModelError(
+                    "{}: two layers share the variable {} (tied "
+                    "weights)".format(reader.index_path, full_name))
+            raise UnsupportedModelError(
+                "{}: two variables have the name {}".format(
+                    reader.index_path, full_name))
+        tensors[layer, variable_name] = checkpoint_key
+        if not full_name:
+            # (TensorFlow writes none for a variable that was made
+            # with an empty name; the layers of this package name
+            # their variables)
+            raise UnsupportedModelError(
+                "{}: a variable of a layer has no name (its tensor is "
+                "{}), so the layer it belongs to cannot be told".format(
+                    reader.index_path, checkpoint_key))
+        if checkpoint_key not in reader:
+            raise CorruptCheckpointError(
+                "{} has no tensor {}, which its object graph names "
+                "for {}".format(reader.index_path, checkpoint_key,
+                                full_name))
+        value = reader.get_tensor(checkpoint_key)
+        if isinstance(value, bytes) or value.dtype == object:
+            raise UnsupportedModelError(
+                "{}: variable {} holds text, not numbers".format(
+                    reader.index_path, full_name))
+        found.setdefault(layer, {})[variable_name] = value
+    return found
+
+
+def _text(value):
+    return bytes(value).decode("utf-8")
+
+
+def _objects_in_object_graph(object_graph):
+    """
+        The objects of the object graph of a checkpoint
+        (TrackableObjectGraph), each with its children and its
+        attributes. The whole graph is read and checked, not only the
+        part that leads to the weights: every message in it is one,
+        every text is text, every reference is to an object of the
+        graph, and the children of an object have names of their own.
+
+        Returns:
+            list: for every object (children, attributes, saver): the
+                children as (name, number of the object), the
+                attributes as (name, full name of the variable, name
+                of its tensor in the checkpoint), and the name of the
+                saver that is registered for the object ('' for none)
+
+        Raises:
+            ValueError: the graph is not what the format says
+    """
+
+    objects, references = [], []
     # TrackableObjectGraph.nodes
-    nodes = [node for number, node in _fields(object_graph) if number == 1]
-
-    def children(node):
-        # TrackableObject.children[i]: node_id, local_name
-        found = []
-        for number, reference in _fields(node):
-            if number != 1:
+    for number, kind, node in _fields(object_graph):
+        if number != 1 or kind != _BYTES:
+            continue
+        children, attributes, saver = [], [], ""
+        for field, field_kind, value in _fields(node):
+            if field_kind != _BYTES:
                 continue
-            node_id, local_name = 0, ""
-            for field_number, value in _fields(reference):
-                if field_number == 1:
-                    node_id = value
-                elif field_number == 2:
-                    local_name = bytes(value).decode("utf-8")
-            found.append((local_name, node_id))
-        return found
+            if field == 1:
+                # children: node_id, local_name
+                node_id, local_name = 0, ""
+                for part, part_kind, part_value in _fields(value):
+                    if part == 1 and part_kind == _VARINT:
+                        node_id = _int32(part_value)
+                    elif part == 2 and part_kind == _BYTES:
+                        local_name = _text(part_value)
+                if any(local_name == name for name, _ in children):
+                    # (TensorFlow restores the first of them, or
+                    # both: no writer makes them)
+                    raise ValueError(
+                        "an object has two children named {!r}".format(
+                            local_name))
+                children.append((local_name, node_id))
+                references.append(node_id)
+            elif field == 2:
+                # attributes: name, full_name, checkpoint_key
+                texts = {1: "", 2: "", 3: ""}
+                for part, part_kind, part_value in _fields(value):
+                    if part in texts and part_kind == _BYTES:
+                        texts[part] = _text(part_value)
+                attributes.append((texts[1], texts[2], texts[3]))
+            elif field == 3:
+                # slot_variables: original_variable_node_id, slot_name,
+                # slot_variable_node_id
+                ids = {1: 0, 3: 0}
+                for part, part_kind, part_value in _fields(value):
+                    if part in ids and part_kind == _VARINT:
+                        ids[part] = _int32(part_value)
+                    elif part == 2 and part_kind == _BYTES:
+                        _text(part_value)
+                references.extend(ids.values())
+            elif field == 4:
+                # registered_saver: name, object_name (TensorFlow 2.8
+                # and later)
+                for part, part_kind, part_value in _fields(value):
+                    if part in (1, 2) and part_kind == _BYTES:
+                        name = _text(part_value)
+                        if part == 1:
+                            saver = name
+            elif field == 5:
+                # has_checkpoint_values: a message of one number
+                # (TensorFlow 2.9 and later)
+                for _ in _fields(value):
+                    pass
+        objects.append((children, attributes, saver))
+    if not objects:
+        raise ValueError("it has no objects")
+    for node_id in references:
+        if not 0 <= node_id < len(objects):
+            raise ValueError("an object refers to object {} of {}".format(
+                node_id, len(objects)))
+    return objects
 
-    def variable(node):
-        # TrackableObject.attributes[i]: name, full_name, checkpoint_key
-        for number, attribute in _fields(node):
-            if number != 2:
-                continue
-            values = {n: bytes(v).decode("utf-8")
-                      for n, v in _fields(attribute) if n in (1, 2, 3)}
-            if values.get(1) == "VARIABLE_VALUE":
-                return values.get(2, ""), values[3]
-        return None
 
-    found = {}
-    for local_name, node_id in children(nodes[0]):
+def _variables_in_object_graph(object_graph):
+    """
+        The variables of the layers with weights in the object graph
+        of a checkpoint: its first object is the model, which refers
+        to its layers with weights ('layer_with_weights-<i>'), each of
+        which refers to its variables. (The models of this package:
+        a layer whose weights are those of layers inside it, such as
+        a model used as a layer, is reported as not supported.)
+
+        Returns:
+            list: for each variable (its name in the layer, its full
+                name, the name of its tensor in the checkpoint)
+
+        Raises:
+            ValueError: the graph is not what the format says
+            UnsupportedModelError: an object of the graph is saved by
+                a registered saver, or a layer with weights has no
+                variables of its own
+    """
+
+    objects = _objects_in_object_graph(object_graph)
+    for _, _, saver in objects:
+        if saver:
+            # (TensorFlow 2.8 and later restore such an object with
+            # the function registered under that name and fail without
+            # it; earlier versions do not know the field)
+            raise UnsupportedModelError(
+                "an object of its object graph is saved by a registered "
+                "saver ({})".format(saver))
+    found = []
+    for local_name, node_id in objects[0][0]:
         if not local_name.startswith("layer_with_weights-"):
             continue
-        for variable_name, variable_id in children(nodes[node_id]):
-            entry = variable(nodes[variable_id])
-            if entry is None:
+        before = len(found)
+        for variable_name, variable_id in objects[node_id][0]:
+            values = [(full_name, checkpoint_key)
+                      for name, full_name, checkpoint_key
+                      in objects[variable_id][1] if name == "VARIABLE_VALUE"]
+            if not values:
                 continue
-            full_name, checkpoint_key = entry
-            layer = full_name.rsplit("/", 1)[0]
-            found.setdefault(layer, {})[variable_name] = \
-                reader.get_tensor(checkpoint_key)
+            if len(values) > 1:
+                raise ValueError(
+                    "a variable ({}) with {} values".format(
+                        values[0][0] or variable_name, len(values)))
+            full_name, checkpoint_key = values[0]
+            if not checkpoint_key:
+                raise ValueError(
+                    "a variable ({}) without the name of its "
+                    "tensor".format(full_name or variable_name))
+            found.append((variable_name, full_name, checkpoint_key))
+        if len(found) == before:
+            raise UnsupportedModelError(
+                "a layer with weights ({}) has no variables of its own: "
+                "its weights are those of layers inside it".format(
+                    local_name))
     return found
 
 
@@ -302,12 +525,24 @@ def _weights_in_hdf5(path):
 
     found = {}
     with h5py.File(path, "r") as f:
+        if "model_weights" not in f:
+            raise UnsupportedModelError(
+                "{} does not hold the weights of a keras model (it has "
+                "no 'model_weights')".format(path))
         group = f["model_weights"]
         for layer in group:
+            if not isinstance(group[layer], h5py.Group):
+                raise ValueError(
+                    "{}: the weights of layer {} are not a group".format(
+                        path, layer))
             names = group[layer].attrs.get("weight_names", [])
             for name in names:
                 if isinstance(name, bytes):
                     name = name.decode("utf-8")
+                if name not in group[layer]:
+                    raise ValueError(
+                        "{}: layer {} lists the weights {} and does not "
+                        "have them".format(path, layer, name))
                 # '<layer>/kernel:0'
                 variable = name.split("/")[-1].split(":")[0]
                 found.setdefault(layer, {})[variable] = \
