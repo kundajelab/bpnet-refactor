@@ -460,6 +460,13 @@ def interrupts_ignored():
         signal.signal(signal.SIGINT, before)
 
 
+#: the message with which Python refuses to change the handling of a 
+#: signal outside the main thread of the main interpreter ("signal 
+#: only works in main thread", followed by "of the main interpreter" 
+#: from Python 3.9 on)
+_REFUSED = re.compile(r"signal only works in main thread")
+
+
 class Interrupts(object):
     """
         Notes the interrupts (SIGINT) that arrive while a loop runs, 
@@ -520,14 +527,17 @@ class Interrupts(object):
         try:
             signal.signal(signal.SIGINT, self._handler)
             return self
-        except ValueError:
-            if signal.getsignal(signal.SIGINT) is not self._handler:
+        except ValueError as error:
+            if _REFUSED.match(str(error)):
                 # the handling of signals cannot be changed here (not 
-                # the main thread of the main interpreter): nothing is 
-                # noted
+                # the main thread of the main interpreter): nothing was 
+                # installed, and nothing is noted. (Not the handler 
+                # that was there: handlers run in the main thread, 
+                # where this is not refused.)
                 self._installed = False
                 return self
-            # (raised after ours was installed: below)
+            # (another ValueError: from the handler that was there, 
+            # called for an interrupt, say)
             self._restore()
             raise
         except BaseException:

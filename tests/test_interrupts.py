@@ -521,6 +521,100 @@ def test_notes_where_threading_was_imported_by_another_thread():
     assert "noted: True" in output, output[-2000:]
 
 
+def value_error_before_ours_is_installed(queue):
+    import inspect
+    import sys
+
+    def odd(number, frame):
+        raise ValueError("the handler that was there")
+
+    signal.signal(signal.SIGINT, odd)
+    lines, first = inspect.getsourcelines(generators.Interrupts.__enter__)
+    installs = [i for i, line in enumerate(lines)
+                if line.strip() == "signal.signal(signal.SIGINT, self._handler)"]
+    assert len(installs) == 1
+    line = first + installs[0]
+    sent = []
+
+    def trace(frame, event, arg):
+        if frame.f_code is generators.Interrupts.__enter__.__code__:
+            if event == "line" and frame.f_lineno == line and not sent:
+                sent.append(1)
+                os.kill(os.getpid(), signal.SIGINT)
+                time.sleep(0.2)
+            return trace
+        return None
+
+    notes = generators.Interrupts()
+    ran = []
+    sys.settrace(trace)
+    try:
+        with notes:
+            ran.append(1)
+        result = "entered"
+    except ValueError as failure:
+        result = str(failure)
+    finally:
+        sys.settrace(None)
+    queue.put((result, ran, sent == [1], notes._installed,
+               signal.getsignal(signal.SIGINT) is odd))
+
+
+def test_value_error_before_the_handler_is_installed():
+    """
+        The handler that was there raises ValueError for an interrupt
+        that arrives before ours is installed: that is not the refusal
+        of another thread; the entry fails, and the block does not run
+    """
+
+    assert in_a_process(value_error_before_ours_is_installed) == \
+        ("the handler that was there", [], True, False, True)
+
+
+def handler_that_replaces_itself(queue):
+    def third(number, frame):
+        pass
+
+    def odd(number, frame):
+        signal.signal(signal.SIGINT, third)
+        raise ValueError("the handler that was there")
+
+    signal.signal(signal.SIGINT, odd)
+    real = signal.signal
+
+    def installs_then_interrupt(number, handler):
+        previous = real(number, handler)
+        if getattr(handler, "__name__", None) == "_note":
+            os.kill(os.getpid(), signal.SIGINT)
+            time.sleep(0.2)
+        return previous
+
+    generators.signal.signal = installs_then_interrupt
+    notes = generators.Interrupts()
+    ran = []
+    try:
+        with notes:
+            ran.append(1)
+        result = "entered"
+    except ValueError as failure:
+        result = str(failure)
+    finally:
+        generators.signal.signal = real
+    queue.put((result, ran, notes.noted, notes._installed,
+               signal.getsignal(signal.SIGINT) is third))
+
+
+def test_value_error_from_a_handler_that_installed_another():
+    """
+        The handler that was there, called for an interrupt right
+        after ours was installed, installs another handler and raises
+        ValueError: the entry fails, and the other handler stays
+    """
+
+    assert in_a_process(handler_that_replaces_itself) == \
+        ("the handler that was there", [], True, False, True)
+
+
 def ignored_before(queue):
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     with generators.Interrupts() as interrupts:
