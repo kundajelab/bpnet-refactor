@@ -251,7 +251,7 @@ calls = []
 def loses_an_interrupt(self, *args, **kwargs):
     calls.append(1)
     open('predicted', 'w').close()
-    if len(calls) == 2 and os.environ.get('LOSE_IN') != 'loading':
+    if len(calls) == 2 and os.environ.get('LOSE_IN', 'a batch') == 'a batch':
         try:
             open('waiting', 'w').close()
             time.sleep(120)
