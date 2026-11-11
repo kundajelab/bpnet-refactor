@@ -4,6 +4,7 @@
 """
 
 import copy
+import os
 
 import numpy as np
 
@@ -150,3 +151,60 @@ def random_batch(params, batch_size=6, n_signal=2, n_bias=2, seed=0,
             [1.0, 1.0, 0.0, 1.0, 0.0, 1.0] * (batch_size // 6 + 1),
             dtype=np.float64)[:batch_size]
     return inputs, outputs, np.asarray(weights, dtype=np.float64)
+
+
+# -------------------- models saved by other versions --------------------
+
+#: the archives of tests/data/saved_models: one per TensorFlow version
+#: that saved the models (see make_fixtures.py there)
+FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data",
+                        "saved_models")
+FIXTURE_VERSIONS = ["2.4.1", "2.11.0", "2.15.1"]
+
+#: the models of an archive: directory name in the archive ->
+#: (architecture variant, saved after training steps with the
+#: optimizer's state, also saved as HDF5)
+FIXTURE_MODELS = {
+    "released_structure": ("two strands with control", True, True),
+    "hidden_counts_layers": ("counts head with hidden layers", False, False),
+}
+
+
+def fixture_files():
+    """
+        (directory, file name) of every saved model of an archive
+    """
+
+    files = []
+    for directory, (_, _, hdf5) in sorted(FIXTURE_MODELS.items()):
+        files.append((directory, "model"))
+        if hdf5:
+            files.append((directory, "model.h5"))
+    return files
+
+
+def unpack_fixture_models(version, target):
+    """
+        Unpack the models that a TensorFlow version saved
+
+        Args:
+            version (str): one of FIXTURE_VERSIONS
+            target (str): directory to unpack into
+
+        Returns:
+            str: the directory that holds one folder per model
+    """
+
+    import tarfile
+
+    name = "tf{}".format(version)
+    with tarfile.open(os.path.join(FIXTURES, name + ".tar.gz")) as tar:
+        members = tar.getmembers()
+        # only plain files and directories below the archive's folder
+        for member in members:
+            parts = member.name.split("/")
+            assert member.isfile() or member.isdir(), member.name
+            assert parts[0] == name and ".." not in parts, member.name
+            assert not os.path.isabs(member.name), member.name
+        tar.extractall(target, members=members)
+    return os.path.join(target, name)

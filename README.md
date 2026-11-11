@@ -293,6 +293,21 @@ profile_logits, log_counts = model.predict(
      "counts_bias_input_0": control_log_counts})
 ```
 
+The same model as a PyTorch module (`bpnet.pytorch.model`; PyTorch is not installed with the package: `pip install torch`):
+
+```
+import torch
+from bpnet.pytorch import model as pytorch_model
+model = pytorch_model.load_model("models/model_split000")
+with torch.no_grad():
+    profile_logits, log_counts = model(
+        sequence=torch.tensor(pytorch_model.channels_first(one_hot_sequences), dtype=torch.float32),
+        profile_bias_input_0=torch.tensor(pytorch_model.channels_first(control_profiles), dtype=torch.float32),
+        counts_bias_input_0=torch.tensor(control_log_counts, dtype=torch.float32))
+```
+
+The PyTorch model has a module for every layer with weights, every activation and every dropout layer of the saved model, under the layer's name (`model.layers`), and gives the outputs of the Keras model to the rounding of float32. It takes and returns the layout PyTorch tools expect: sequences are (batch, 4, length) and profiles (batch, tracks, length), where the Keras model has (batch, length, 4) and (batch, length, tracks); `channels_first` and `channels_last` convert arrays between the two. Reading the weights of a SavedModel directory needs TensorFlow to be installed; an HDF5 file does not.
+
 It is usefull to also make predictions on all the peaks as the model predictions provide denoised version of the observed signal.
 ```
 bpnet-predict \

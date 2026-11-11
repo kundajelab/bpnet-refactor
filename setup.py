@@ -18,7 +18,7 @@ setup(
                       "scipy", "scikit-image", "scikit-learn", "deepdish", "pandas", "matplotlib", "plotly", 
                       "deeptools", "pyfaidx", "deeplift", "hdf5plugin","shap @ git+https://github.com/kundajelab/shap.git"
                       ],
-    extras_require={"dev": ["pytest", "pytest-cov"]},
+    extras_require={"dev": ["pytest", "pytest-cov"], "pytorch": ["torch"]},
     license="MIT license",
     zip_safe=False,
     keywords=["deep learning",
