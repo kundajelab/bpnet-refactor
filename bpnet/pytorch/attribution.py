@@ -333,6 +333,10 @@ class _FullPrecision(object):
         self._written.append((write, was))
 
     def _switch(self):
+        # the functions behind the 'fp32_precision' attributes of
+        # torch.backends, and not the attributes: the one of
+        # torch.backends.mkldnn writes the 'generic' setting (PyTorch
+        # 2.9 to 2.15)
         read = getattr(torch._C, "_get_fp32_precision_getter", None)
         write = getattr(torch._C, "_set_fp32_precision_setter", None)
         if read is None or write is None:

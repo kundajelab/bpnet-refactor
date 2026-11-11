@@ -355,7 +355,7 @@ This script will output shap bigwig tracks which are usefull for visualizing in 
 
 UCSC, WashU browsers currently support visualizing the importance scores - use the [Dynseq](https://kundajelab.github.io/dynseq-pages/) option.
 
-`bpnet-shap` computes the scores with the lab's fork of `shap` on the Keras model (TensorFlow 1 graph mode). With `--backend pytorch` it computes them with [tangermeme](https://github.com/jmschrei/tangermeme)'s `deep_lift_shap` on the PyTorch model of the same saved model instead: the same outputs are explained with the same references (the dinucleotide shuffles of each sequence for the same `--seed`, no control for the references), and the same files are written. It needs PyTorch and tangermeme (`pip install torch tangermeme`; tested with tangermeme 1.6.0), not TensorFlow or the fork.
+`bpnet-shap` computes the scores with the lab's fork of `shap` on the Keras model (TensorFlow 1 graph mode). With `--backend pytorch` it computes them with [tangermeme](https://github.com/jmschrei/tangermeme)'s `deep_lift_shap` on the PyTorch model of the same saved model instead: the same outputs are explained with the same references (the dinucleotide shuffles of each sequence for the same `--seed`, no control for the references), and the same files are written. It needs PyTorch and tangermeme (`pip install torch tangermeme`; tested with tangermeme 1.6.0 and PyTorch 2.8, 2.12, 2.14 and 2.15), not TensorFlow or the fork.
 
 ```
 bpnet-shap --backend pytorch --device cuda:0 --batch-size 128 \
