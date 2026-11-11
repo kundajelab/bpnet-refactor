@@ -141,17 +141,19 @@ def with_trailer(contents, kind=0):
         "<I", masked(crc_bit_by_bit(contents + bytes([kind]))))
 
 
-def table(pairs, per_block=1000, kind=0, restart_interval=16):
+def table_of_blocks(blocks, kind=0):
     """
-        A table file: blocks of sorted (key, value) pairs, a block of
-        meta data (empty), a block that lists the blocks, the footer
+        A table file from the contents of its blocks: the blocks, a
+        block of meta data (empty), a block that lists the blocks with
+        a key for each (no key of the block comes after it), the footer
+
+        Args:
+            blocks (list): (key for the list of blocks, contents)
     """
 
     data, handles = bytearray(), []
-    for start in range(0, len(pairs), per_block):
-        chunk = pairs[start:start + per_block]
-        contents = block(chunk, restart_interval)
-        handles.append((chunk[-1][0],
+    for separator, contents in blocks:
+        handles.append((separator,
                         varint(len(data)) + varint(len(contents))))
         data += with_trailer(contents, kind)
     meta = block([])
@@ -162,6 +164,19 @@ def table(pairs, per_block=1000, kind=0, restart_interval=16):
     data += with_trailer(index)
     footer += bytes(40 - len(footer)) + struct.pack("<Q", MAGIC)
     return bytes(data + footer)
+
+
+def table(pairs, per_block=1000, kind=0, restart_interval=16):
+    """
+        A table file of sorted (key, value) pairs, `per_block` to a
+        block
+    """
+
+    blocks = []
+    for start in range(0, len(pairs), per_block):
+        chunk = pairs[start:start + per_block]
+        blocks.append((chunk[-1][0], block(chunk, restart_interval)))
+    return table_of_blocks(blocks, kind)
 
 
 #: numpy type -> tensorflow.DataType
@@ -367,6 +382,134 @@ def test_compressed_table_is_not_supported(tmp_path):
         checkpoint.read_table(path)
 
 
+def read(tmp_path, content):
+    path = str(tmp_path / "table")
+    with open(path, "wb") as fh:
+        fh.write(content)
+    return checkpoint.read_table(path)
+
+
+def test_keys_are_in_order_and_there_once(tmp_path):
+    """
+        The keys of a table ascend, none is there twice, and every
+        block holds the keys between the key the list of blocks gives
+        for the block before and its own. A table that breaks this is
+        not read: TensorFlow looks a key up through the list of blocks
+        and would find one of two entries (the first), or none.
+    """
+
+    a, b, c, d = (b"a", b"1"), (b"b", b"2"), (b"c", b"3"), (b"d", b"4")
+    good = [(b"b", block([a, b])), (b"d", block([c, d]))]
+    assert read(tmp_path, table_of_blocks(good)) == dict([a, b, c, d])
+    # the key for a block may come after its last key
+    assert read(tmp_path, table_of_blocks(
+        [(b"bz", block([a, b])), (b"z", block([c, d]))])) == \
+        dict([a, b, c, d])
+
+    twice = (b"b", b"other")
+    cases = {
+        "a key twice in a block": [(b"d", block([a, b, twice, c, d]))],
+        "a key twice, in two blocks": [(b"b", block([a, b])),
+                                       (b"d", block([twice, c, d]))],
+        "keys of a block not in order": [(b"d", block([a, c, b, d]))],
+        "a block whose keys come before those of the block before": [
+            (b"d", block([c, d])), (b"e", block([a, b]))],
+        "a key after the key of its block": [(b"a", block([a, b])),
+                                             (b"d", block([c, d]))],
+        "a key that belongs to the block before": [
+            (b"c", block([a, b])), (b"d", block([c, d]))],
+        "the list of blocks not in order": [(b"d", block([a, b])),
+                                            (b"b", block([c, d]))],
+        "the same key for two blocks": [(b"b", block([a, b])),
+                                        (b"b", block([]))],
+    }
+    for name, blocks in cases.items():
+        with pytest.raises(CorruptCheckpointError) as failure:
+            read(tmp_path, table_of_blocks(blocks))
+        assert "not in order" in str(failure.value), name
+
+
+def test_restart_points_of_a_block(tmp_path):
+    """
+        TensorFlow finds a key in a block by its restart points (the
+        entries whose keys are stored whole): a block whose restart
+        points are not what they should be is not read
+    """
+
+    pairs = [(b"key%02d" % i, b"v%d" % i) for i in range(10)]
+    good = block(pairs, restart_interval=4)
+    count, = struct.unpack("<I", good[-4:])
+    assert count == 3
+    entries, points = good[:-16], list(struct.unpack("<3I", good[-16:-4]))
+    assert points[0] == 0 and points == sorted(points)
+
+    def with_points(new):
+        return entries + struct.pack("<{}I".format(len(new)), *new) + \
+            struct.pack("<I", len(new))
+
+    assert with_points(points) == good
+    assert read(tmp_path, table_of_blocks([(b"z", good)])) == dict(pairs)
+    # (fewer restart points than there could be is fine: the first)
+    assert read(tmp_path, table_of_blocks(
+        [(b"z", with_points(points[:1]))])) == dict(pairs)
+    for name, new in (
+            ("does not start at 0", points[1:]),
+            ("not in order", [0, points[2], points[1]]),
+            ("the same twice", [0, points[1], points[1]]),
+            ("none", []),
+            ("beyond the entries", points + [len(entries) + 4]),
+            ("in the middle of an entry", [0, points[1] + 1]),
+            # the entry there shares bytes with the key before it
+            ("at an entry that is not whole", [0, points[1] - 10])):
+        with pytest.raises(CorruptCheckpointError) as failure:
+            read(tmp_path, table_of_blocks([(b"z", with_points(new))]))
+        assert "is not in the table format" in str(failure.value), name
+
+
+def test_numbers_have_the_width_of_their_fields():
+    """
+        The numbers of the formats take at most ten bytes (64 bits) or
+        five (32 bits). Longer ones are refused at once: an unbounded
+        number would take long to read before the file is refused.
+    """
+
+    assert checkpoint._number(b"\x00", 0) == (0, 1)
+    assert checkpoint._number(b"\xac\x02rest", 0) == (300, 2)
+    assert checkpoint._number(b"xx\x7f", 2) == (127, 3)
+    largest = b"\xff" * 9 + b"\x01"
+    assert checkpoint._number(largest, 0) == (2 ** 64 - 1, 10)
+    assert checkpoint._number(b"\xff" * 4 + b"\x0f", 0, 32) == \
+        (2 ** 32 - 1, 5)
+    for data, bits, message in (
+            (b"\xff" * 9 + b"\x02", 64, "does not fit 64 bits"),
+            (b"\xff" * 10 + b"\x01", 64, "takes more bytes"),
+            (b"\xff" * 4 + b"\x1f", 32, "does not fit 32 bits"),
+            (b"\xff" * 5 + b"\x01", 32, "takes more bytes"),
+            (b"\xff" * 100000 + b"\x7f", 64, "takes more bytes"),
+            (b"\x80", 64, "is cut short"), (b"", 64, "is cut short")):
+        with pytest.raises(ValueError, match=message):
+            checkpoint._number(data, 0, bits)
+    # the messages inside a checkpoint are read with the same bound
+    with pytest.raises(ValueError, match="more than ten bytes"):
+        loading._varint(b"\xff" * 100000 + b"\x7f", 0)
+    assert loading._varint(largest, 0) == (2 ** 64 - 1, 10)
+
+
+def test_long_numbers_in_a_table(tmp_path):
+    # an entry whose length is a number of a hundred thousand bytes
+    contents = b"\x00\x01" + b"\xff" * 100000 + b"\x7f" + b"k" + \
+        struct.pack("<II", 0, 1)
+    with pytest.raises(CorruptCheckpointError,
+                       match="is not in the table format"):
+        read(tmp_path, table_of_blocks([(b"z", contents)]))
+    # the place of a block as such a number
+    good = table([(b"a", b"1")])
+    footer = b"\xff" * 40
+    with pytest.raises(CorruptCheckpointError,
+                       match="the end of the table is not in the table"):
+        read(tmp_path, good[:-48] + footer + good[-8:])
+
+
 # --------------------------------------------------------------------
 # checkpoints written here
 # --------------------------------------------------------------------
@@ -464,7 +607,7 @@ def change_of(name, **settings):
     ("conv/bias", {"shape": (8, 4)}, "its shape (8, 4) needs 128"),
     ("conv/bias", {"dtype": 2}, "its shape (64,) needs 512"),
     ("large", {"offset": 10 ** 7}, "is cut short: tensor large ends at"),
-    ("strings", {"size": 3}, "is cut short"),
+    ("strings", {"size": 3}, "does not have the size its strings need"),
     ("strings", {"shape": (2, 1)}, "does not have the size its strings "
      "need"),
     ("one string", {"size": 22}, "does not have the size its strings need"),
@@ -589,6 +732,143 @@ def test_checkpoints_that_are_not_supported(tmp_path):
     os.remove(index)
     with pytest.raises(FileNotFoundError):
         Checkpoint(prefix)
+
+
+def test_what_the_index_says_is_checked_before_the_data_is_read(
+        tmp_path, monkeypatch):
+    """
+        An entry whose size does not fit its shape is refused without
+        reading that many bytes (an index can claim any size)
+    """
+
+    prefix = str(tmp_path / "ckpt")
+    value = np.arange(4, dtype=np.float32)
+    huge = 1 << 27
+    write_checkpoint(prefix, {"x": value, "s": np.array(b"text",
+                                                         dtype=object)},
+                     change=lambda name, settings: settings.update(
+                         size=huge))
+    # a data file of that size (a hole: it takes no space)
+    with open(prefix + ".data-00000-of-00001", "r+b") as fh:
+        fh.truncate(2 * huge)
+    reads = []
+    real_open = open
+
+    def watching(path, *args, **kwargs):
+        if ".data-" in str(path):
+            reads.append(path)
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(checkpoint, "open", watching, raising=False)
+    reader = Checkpoint(prefix)
+    with pytest.raises(CorruptCheckpointError,
+                       match=r"has {} bytes; its shape \(4,\) needs 16".format(
+                           huge)):
+        reader.get_tensor("x")
+    assert reads == []
+    # (a string may have any length: its size cannot be checked
+    # against its shape. The file is cut back first.)
+    with real_open(prefix + ".data-00000-of-00001", "r+b") as fh:
+        fh.truncate(100)
+    with pytest.raises(CorruptCheckpointError, match="is cut short"):
+        reader.get_tensor("s")
+    assert reads == []
+
+    # a shape whose product does not fit 64 bits
+    write_checkpoint(prefix, {"x": value}, change=lambda name, settings:
+                     settings.update(shape=(2 ** 40, 2 ** 40, 4)))
+    with pytest.raises(CorruptCheckpointError,
+                       match="has 16 bytes; its shape"):
+        Checkpoint(prefix).get_tensor("x")
+
+
+def test_entries_that_are_not_what_the_format_says(tmp_path):
+    """
+        An entry of the index with a field of another kind than the
+        format has for it (a number for a message, a message for a
+        number) is reported as damage, like any other
+    """
+
+    prefix = str(tmp_path / "ckpt")
+    index = prefix + ".index"
+    with open(prefix + ".data-00000-of-00001", "wb") as fh:
+        fh.write(bytes(64))
+    good = field(1, 1) + field(2, field(2, field(1, 4))) + field(5, 16) + \
+        varint((6 << 3) | 5) + struct.pack("<I", masked(crc_bit_by_bit(
+            bytes(16))))
+    with open(index, "wb") as fh:
+        fh.write(table([(b"", field(1, 1)), (b"x", good)]))
+    assert Checkpoint(prefix).get_tensor("x").shape == (4,)
+
+    wrong = {
+        "the shape as a number": field(1, 1) + field(2, 0) + field(5, 16),
+        "a dimension as a number": field(1, 1) + field(2, field(2, 5)) +
+        field(5, 16),
+        "the size of a dimension as a message": field(1, 1) + field(
+            2, field(2, field(1, b"ab"))) + field(5, 16),
+        "the type as a message": field(1, b"ab") + field(5, 16),
+        "the size as a message": field(1, 1) + field(5, b"abc"),
+        "the offset as a message": field(1, 1) + field(4, b"abc"),
+        "the checksum as a number": field(1, 1) + field(6, 5),
+        "the checksum of eight bytes": field(1, 1) + varint((6 << 3) | 1) +
+        bytes(8),
+        "a dimension of negative size": field(1, 1) + field(2, field(
+            2, field(1, 2 ** 64 - 1))) + field(5, 16),
+        "a number that does not end": field(1, 1) + b"\x28" + b"\xff" * 20,
+    }
+    for name, message in wrong.items():
+        with open(index, "wb") as fh:
+            fh.write(table([(b"", field(1, 1)), (b"x", message)]))
+        with pytest.raises(CorruptCheckpointError) as failure:
+            Checkpoint(prefix).get_tensor("x")
+        assert "the entry of tensor x cannot be read" in \
+            str(failure.value), name
+
+    # the header
+    for name, header in (("the shards as a message", field(1, b"ab")),
+                         ("the version as a number", field(1, 1) +
+                          field(3, 7)),
+                         ("the producer as a message", field(1, 1) + field(
+                             3, field(1, b"ab")))):
+        with open(index, "wb") as fh:
+            fh.write(table([(b"", header), (b"x", good)]))
+        with pytest.raises(CorruptCheckpointError,
+                           match="its header cannot be read"):
+            Checkpoint(prefix)
+
+
+def test_version_of_the_format(tmp_path):
+    """
+        A checkpoint says which readers may read it, as TensorFlow
+        checks: it is refused when it asks for a later reader than
+        this one (version 1), or names this version as one that must
+        not read it
+    """
+
+    prefix = str(tmp_path / "ckpt")
+    value = np.arange(3, dtype=np.float32)
+
+    def header(producer=1, consumer=0, bad=b""):
+        version = field(1, producer) if producer else b""
+        if consumer:
+            version += field(2, consumer)
+        return field(1, 1) + field(3, version + bad)
+
+    # what TensorFlow writes, and what it would still read
+    for good in (header(), header(producer=0), header(producer=7),
+                 header(consumer=1), field(1, 1),
+                 header(bad=field(3, 2) + field(3, 5)),
+                 header(bad=field(3, varint(2) + varint(300)))):
+        write_checkpoint(prefix, {"x": value}, header=good)
+        assert_same_tensor(Checkpoint(prefix).get_tensor("x"), value)
+    for refused in (header(consumer=2), header(consumer=999),
+                    header(bad=field(3, 1)),
+                    header(bad=field(3, varint(7) + varint(1))),
+                    header(bad=field(3, 3) + field(3, 1))):
+        write_checkpoint(prefix, {"x": value}, header=refused)
+        with pytest.raises(UnsupportedModelError,
+                           match="asks for another version of the format"):
+            Checkpoint(prefix)
 
 
 def test_fields_that_are_zero_may_be_written(tmp_path):
@@ -717,6 +997,32 @@ def test_saved_model_with_a_damaged_checkpoint(saved_by, tmp_path):
     os.remove(data_path)
     with pytest.raises(FileNotFoundError, match="is missing"):
         loading.read_weights(model)
+    write(data_path, data)
+
+    # an index without the object graph, or without a tensor that the
+    # object graph names: damage (an error of the kind the tools
+    # report), not a missing key
+    entries = checkpoint.read_table(index_path)
+    header = entries.pop(b"")
+
+    def rewrite(without):
+        pairs = [(b"", header)] + [(name, value)
+                                   for name, value in entries.items()
+                                   if name != without]
+        write(index_path, table(pairs))
+
+    rewrite(b"_CHECKPOINTABLE_OBJECT_GRAPH")
+    with pytest.raises(CorruptCheckpointError, match="has no object graph"):
+        loading.read_weights(model)
+    rewrite(key.encode())
+    with pytest.raises(CorruptCheckpointError) as failure:
+        loading.read_weights(model)
+    assert "has no tensor {}, which its object graph names".format(key) in \
+        str(failure.value)
+    assert isinstance(failure.value, ValueError)
+    rewrite(None)
+    assert sorted(loading.read_weights(model)) == sorted(
+        loading.read_weights(source))
 
 
 # --------------------------------------------------------------------
@@ -793,12 +1099,11 @@ def test_checkpoint_that_tensorflow_writes_here(tf, tmp_path):
     # the index has several blocks
     with open(prefix + ".index", "rb") as fh:
         index = memoryview(fh.read())
-    footer = index[len(index) - 48:]
+    footer = index[len(index) - 48:len(index) - 8]
     position = 0
     for _ in range(2):
-        _, position = loading._varint(footer, position)
-    offset, position = loading._varint(footer, position)
-    size, position = loading._varint(footer, position)
-    blocks = list(checkpoint._entries(
-        checkpoint._block(index, offset, size, "index"), "index"))
+        _, position = checkpoint._number(footer, position)
+    offset, position = checkpoint._number(footer, position)
+    size, position = checkpoint._number(footer, position)
+    blocks = checkpoint._entries(index[offset:offset + size], "index")
     assert len(blocks) > 1

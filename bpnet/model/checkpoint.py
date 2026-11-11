@@ -23,7 +23,7 @@ import struct
 
 import numpy as np
 
-from bpnet.model.loading import UnsupportedModelError, _fields, _varint
+from bpnet.model.loading import UnsupportedModelError, _fields
 
 
 class CorruptCheckpointError(ValueError):
@@ -156,69 +156,114 @@ def _unmask(masked):
 
 _MAGIC = 0xDB4775248B80FB57
 _FOOTER = 48
+#: the version of the checkpoint format that this module reads
+#: (TensorFlow's kTensorBundleVersion, the same from 2.4 to 2.21)
+_VERSION = 1
 
 
-def _block(data, offset, size, path):
+def _number(buffer, position, bits=64):
     """
-        The contents of a block of the table, after its checksum
+        A number in the base 128 encoding of the formats, of the
+        given width (64 bits: at most ten bytes; 32 bits: five)
+
+        Returns:
+            tuple: (value, position after it)
     """
 
-    end = offset + size + 5
-    if end > len(data):
-        raise CorruptCheckpointError(
-            "{} is cut short: a block of its table ends at byte {} of "
-            "{}".format(path, end, len(data)))
-    contents = data[offset:offset + size]
-    kind = data[offset + size]
-    stored, = struct.unpack("<I", data[offset + size + 1:end])
-    if crc32c(data[offset:offset + size + 1]) != _unmask(stored):
-        raise CorruptCheckpointError(
-            "{}: a block of its table does not have the checksum that "
-            "is stored with it".format(path))
-    if kind != 0:
-        raise UnsupportedModelError(
-            "{}: a block of its table is compressed (type {})".format(
-                path, kind))
-    return contents
+    result = shift = 0
+    for _ in range(10 if bits == 64 else 5):
+        if position >= len(buffer):
+            raise ValueError("a number is cut short")
+        byte = buffer[position]
+        position += 1
+        result |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            if result >> bits:
+                raise ValueError("a number does not fit {} bits".format(bits))
+            return result, position
+        shift += 7
+    raise ValueError("a number takes more bytes than {} bits need".format(
+        bits))
 
 
 def _entries(block, path):
     """
-        The (key, value) pairs of a block, in order. A key is stored as
-        the number of bytes it shares with the key before it and the
-        rest.
+        The (key, value) pairs of a block, in order
+
+        A key is stored as the number of bytes it shares with the key
+        before it and the rest. At the "restart points", whose
+        positions are listed at the end of the block, a key is stored
+        whole; TensorFlow finds a key by them, so they are checked.
     """
 
-    if len(block) < 4:
-        raise CorruptCheckpointError("{}: an empty block".format(path))
-    restarts, = struct.unpack("<I", block[len(block) - 4:])
-    end = len(block) - 4 - 4 * restarts
-    if end < 0:
-        raise CorruptCheckpointError(
-            "{}: a block of its table is not in the table format".format(
-                path))
+    def corrupt(what):
+        return CorruptCheckpointError(
+            "{}: a block of its table is not in the table format "
+            "({})".format(path, what))
+
+    if len(block) < 8:
+        raise corrupt("it has {} bytes".format(len(block)))
+    count, = struct.unpack("<I", block[len(block) - 4:])
+    end = len(block) - 4 - 4 * count
+    if count < 1 or end < 0:
+        raise corrupt("{} restart points in {} bytes".format(
+            count, len(block)))
+    restarts = struct.unpack("<{}I".format(count),
+                             block[end:len(block) - 4])
+    if restarts[0] != 0 or \
+            any(b <= a for a, b in zip(restarts, restarts[1:])):
+        raise corrupt("its restart points are not in order from 0")
+    restarts = set(restarts)
+    pairs, starts = [], set()
     position, key = 0, b""
     try:
         while position < end:
-            shared, position = _varint(block, position)
-            unshared, position = _varint(block, position)
-            length, position = _varint(block, position)
+            starts.add(position)
+            whole = position in restarts
+            shared, position = _number(block, position, 32)
+            unshared, position = _number(block, position, 32)
+            length, position = _number(block, position, 32)
             if shared > len(key) or position + unshared + length > end:
-                raise ValueError("entry beyond its block")
+                raise ValueError("an entry goes beyond its block")
+            if whole and shared:
+                raise ValueError("a key at a restart point is not whole")
             key = key[:shared] + bytes(block[position:position + unshared])
             position += unshared
-            yield key, block[position:position + length]
+            pairs.append((key, block[position:position + length]))
             position += length
     except ValueError as error:
+        raise corrupt(error)
+    if not restarts <= starts | {0}:
+        raise corrupt("a restart point is not at an entry")
+    return pairs
+
+
+def _handle(value, path):
+    """
+        Where a block is: (offset, size)
+    """
+
+    try:
+        offset, position = _number(value, 0)
+        size, position = _number(value, position)
+    except ValueError as error:
         raise CorruptCheckpointError(
-            "{}: a block of its table is not in the table format "
+            "{}: the place of a block is not in the table format "
             "({})".format(path, error))
+    return offset, size
 
 
 def read_table(path):
     """
         The keys and values of a table file (the '.index' file of a
         checkpoint)
+
+        The table is read as TensorFlow reads it or not at all: every
+        block against its checksum, the keys in ascending order and
+        none twice, every block within the range of keys that the
+        list of blocks gives it. (A table that breaks these rules
+        could hold a key twice, and TensorFlow would find one of the
+        two.)
 
         Args:
             path (str): the file
@@ -228,41 +273,74 @@ def read_table(path):
                 file (sorted by key)
     """
 
-    with open(path, "rb") as fh:
-        data = memoryview(fh.read())
-    if len(data) < _FOOTER:
+    size = os.path.getsize(path)
+    if size < _FOOTER:
         raise CorruptCheckpointError(
             "{} is too short for a checkpoint index ({} bytes)".format(
-                path, len(data)))
-    footer = data[len(data) - _FOOTER:]
-    if struct.unpack("<Q", footer[40:])[0] != _MAGIC:
-        raise CorruptCheckpointError(
-            "{} is not a checkpoint index (or it is cut short): it does "
-            "not end with the mark of a table".format(path))
-    try:
-        # the handle of the block of meta data, which is not needed,
-        # then that of the block that lists the blocks
-        handles = footer[:_FOOTER - 8]
-        _, position = _varint(handles, 0)
-        _, position = _varint(handles, position)
-        offset, position = _varint(handles, position)
-        size, position = _varint(handles, position)
-    except ValueError:
-        raise CorruptCheckpointError(
-            "{}: the end of the table is not in the table format".format(
-                path))
-    found = {}
-    for _, handle in _entries(_block(data, offset, size, path), path):
-        try:
-            block_offset, position = _varint(handle, 0)
-            block_size, position = _varint(handle, position)
-        except ValueError:
+                path, size))
+    with open(path, "rb") as fh:
+        fh.seek(size - _FOOTER)
+        footer = memoryview(fh.read(_FOOTER))
+        if len(footer) != _FOOTER or \
+                struct.unpack("<Q", footer[40:])[0] != _MAGIC:
             raise CorruptCheckpointError(
-                "{}: the list of blocks is not in the table format".format(
-                    path))
-        for key, value in _entries(
-                _block(data, block_offset, block_size, path), path):
-            found[key] = bytes(value)
+                "{} is not a checkpoint index (or it is cut short): it "
+                "does not end with the mark of a table".format(path))
+
+        def block(offset, length):
+            # the contents of a block, after its checksum
+            end = offset + length + 5
+            if end > size - _FOOTER:
+                raise CorruptCheckpointError(
+                    "{} is cut short: a block of its table ends at byte "
+                    "{} of {}".format(path, end, size))
+            fh.seek(offset)
+            raw = memoryview(fh.read(length + 5))
+            if len(raw) != length + 5:
+                raise CorruptCheckpointError(
+                    "{} is cut short".format(path))
+            stored, = struct.unpack("<I", raw[length + 1:])
+            if crc32c(raw[:length + 1]) != _unmask(stored):
+                raise CorruptCheckpointError(
+                    "{}: a block of its table does not have the checksum "
+                    "that is stored with it".format(path))
+            if raw[length] != 0:
+                raise UnsupportedModelError(
+                    "{}: a block of its table is compressed (type "
+                    "{})".format(path, raw[length]))
+            return raw[:length]
+
+        try:
+            # the place of the block of meta data, which is not needed,
+            # then that of the block that lists the blocks
+            handles = footer[:_FOOTER - 8]
+            _, position = _number(handles, 0)
+            _, position = _number(handles, position)
+            offset, position = _number(handles, position)
+            length, position = _number(handles, position)
+        except ValueError as error:
+            raise CorruptCheckpointError(
+                "{}: the end of the table is not in the table format "
+                "({})".format(path, error))
+
+        found = {}
+        last = before = None
+        for separator, handle in _entries(block(offset, length), path):
+            # the keys of a block lie after those of the block before
+            # and not after the key the list gives for the block
+            if before is not None and separator <= before:
+                raise CorruptCheckpointError(
+                    "{}: the list of the blocks of its table is not in "
+                    "order".format(path))
+            for key, value in _entries(block(*_handle(handle, path)), path):
+                if (last is not None and key <= last) or key > separator \
+                        or (before is not None and key <= before):
+                    raise CorruptCheckpointError(
+                        "{}: the keys of its table are not in order, or "
+                        "one is there twice ({!r})".format(path, key))
+                found[key] = bytes(value)
+                last = key
+            before = separator
     return found
 
 
@@ -271,12 +349,29 @@ def read_table(path):
 # --------------------------------------------------------------------
 
 #: tensorflow.DataType -> numpy type, for the types whose bytes in the
-#: file are those of the array
+#: file are those of the array (floats, integers, bool; not complex
+#: numbers, bfloat16 or the quantized types)
 _TYPES = {
     1: "<f4", 2: "<f8", 3: "<i4", 4: "u1", 5: "<i2", 6: "i1", 9: "<i8",
     10: "?", 17: "<u2", 19: "<f2", 22: "<u4", 23: "<u8",
 }
 _STRING = 7
+
+
+def _message(value):
+    """
+        The fields of a message that is a field of another message
+    """
+
+    if isinstance(value, int):
+        raise ValueError("a number where a message is expected")
+    return _fields(value)
+
+
+def _integer(value):
+    if not isinstance(value, int):
+        raise ValueError("a message where a number is expected")
+    return value
 
 
 class Checkpoint(object):
@@ -297,13 +392,44 @@ class Checkpoint(object):
             raise CorruptCheckpointError(
                 "{} has no header: it is not the index of a "
                 "checkpoint".format(self.index_path))
-        header = {number: value for number, value in
-                  _fields(memoryview(table.pop(b"")))}
-        self.shards = header.get(1, 0)
-        if header.get(2, 0) != 0:
+        # BundleHeaderProto: num_shards, endianness, version
+        shards, endianness, producer, consumer, bad = 0, 0, 0, 0, []
+        try:
+            for number, value in _fields(memoryview(table.pop(b""))):
+                if number == 1:
+                    shards = _integer(value)
+                elif number == 2:
+                    endianness = _integer(value)
+                elif number == 3:
+                    # VersionDef: producer, min_consumer, bad_consumers
+                    for field, part in _message(value):
+                        if field == 1:
+                            producer = _integer(part)
+                        elif field == 2:
+                            consumer = _integer(part)
+                        elif field == 3 and isinstance(part, int):
+                            bad.append(part)
+                        elif field == 3:
+                            position = 0
+                            while position < len(part):
+                                one, position = _number(part, position)
+                                bad.append(one)
+        except ValueError as error:
+            raise CorruptCheckpointError(
+                "{}: its header cannot be read ({})".format(
+                    self.index_path, error))
+        if endianness != 0:
             raise UnsupportedModelError(
                 "{}: the checkpoint was written on a big endian "
                 "machine".format(self.index_path))
+        # as TensorFlow checks the versions of a checkpoint it reads
+        if consumer > _VERSION or _VERSION in bad or producer >> 31:
+            raise UnsupportedModelError(
+                "{}: the checkpoint asks for another version of the "
+                "format than this reader has (version {}; written by {}, "
+                "for readers from {}, not for {})".format(
+                    self.index_path, _VERSION, producer, consumer, bad))
+        self.shards = shards
         self._entries = table
         self._files = {}
 
@@ -318,6 +444,11 @@ class Checkpoint(object):
         return key.encode("utf-8") in self._entries
 
     def _entry(self, key):
+        """
+            What the index says about a tensor (BundleEntryProto), and
+            the number of its elements
+        """
+
         try:
             message = self._entries[key.encode("utf-8")]
         except KeyError:
@@ -329,35 +460,44 @@ class Checkpoint(object):
         try:
             for number, value in _fields(memoryview(message)):
                 if number == 1:
-                    entry["dtype"] = value
+                    entry["dtype"] = _integer(value)
                 elif number == 2:
-                    # TensorShapeProto.dim[i].size
-                    for dim_number, dim in _fields(value):
+                    # TensorShapeProto: dim[i].size, unknown_rank
+                    for dim_number, dim in _message(value):
                         if dim_number == 2:
                             size = 0
-                            for size_number, size_value in _fields(dim):
+                            for size_number, size_value in _message(dim):
                                 if size_number == 1:
-                                    size = size_value
+                                    size = _integer(size_value)
                             entry["shape"].append(size)
                         elif dim_number == 3 and dim:
                             raise UnsupportedModelError(
                                 "{}: tensor {} has no known shape".format(
                                     self.index_path, key))
                 elif number == 3:
-                    entry["shard"] = value
+                    entry["shard"] = _integer(value)
                 elif number == 4:
-                    entry["offset"] = value
+                    entry["offset"] = _integer(value)
                 elif number == 5:
-                    entry["size"] = value
+                    entry["size"] = _integer(value)
                 elif number == 6:
+                    if isinstance(value, int) or len(value) != 4:
+                        raise ValueError("a checksum that is not 4 bytes")
                     entry["crc"], = struct.unpack("<I", value)
                 elif number == 7:
                     raise UnsupportedModelError(
                         "{}: tensor {} was saved in slices (a partitioned "
                         "variable)".format(self.index_path, key))
-        except (ValueError, struct.error) as error:
-            if isinstance(error, UnsupportedModelError):
-                raise
+            count = 1
+            for size in entry["shape"]:
+                if size >> 63:
+                    raise ValueError("a dimension of unknown or negative "
+                                     "size")
+                count *= size
+            entry["count"] = count
+        except UnsupportedModelError:
+            raise
+        except (ValueError, TypeError, struct.error) as error:
             raise CorruptCheckpointError(
                 "{}: the entry of tensor {} cannot be read ({})".format(
                     self.index_path, key, error))
@@ -385,6 +525,10 @@ class Checkpoint(object):
         """
             One tensor of the checkpoint
 
+            What the index says about the tensor is checked before
+            its bytes are read (their number against the shape), and
+            the bytes against their checksum.
+
             Args:
                 key (str): its name in the checkpoint
 
@@ -395,27 +539,29 @@ class Checkpoint(object):
         """
 
         entry = self._entry(key)
-        data, path = self._bytes(key, entry)
-        shape = tuple(entry["shape"])
-        count = int(np.prod(shape, dtype=np.int64))
+        shape, count = tuple(entry["shape"]), entry["count"]
 
         def corrupt(what):
             return CorruptCheckpointError(
-                "{}: tensor {} {}".format(path, key, what))
+                "{}.data-{:05d}-of-{:05d}: tensor {} {}".format(
+                    self.prefix, entry["shard"], self.shards, key, what))
 
         if entry["dtype"] == _STRING:
-            # the lengths of the strings, a checksum of the lengths,
-            # the strings
+            # the lengths of the strings (at least a byte each), a
+            # checksum of the lengths, the strings
+            if entry["size"] < count + 4:
+                raise corrupt("does not have the size its strings need")
+            data, _ = self._bytes(key, entry)
             view = memoryview(data)
             lengths, position, crc = [], 0, 0
             try:
                 for _ in range(count):
-                    length, position = _varint(view, position)
+                    length, position = _number(view, position)
                     lengths.append(length)
                     crc = crc32c(struct.pack(
                         "<I" if length <= 0xFFFFFFFF else "<Q", length), crc)
             except ValueError:
-                raise corrupt("is cut short")
+                raise corrupt("does not have the size its strings need")
             if position + 4 + sum(lengths) != len(data):
                 raise corrupt("does not have the size its strings need")
             stored, = struct.unpack("<I", view[position:position + 4])
@@ -444,9 +590,10 @@ class Checkpoint(object):
                 "(tensorflow.DataType {})".format(
                     self.index_path, key, entry["dtype"]))
         dtype = np.dtype(_TYPES[entry["dtype"]])
-        if count * dtype.itemsize != len(data):
+        if count * dtype.itemsize != entry["size"]:
             raise corrupt("has {} bytes; its shape {} needs {}".format(
-                len(data), shape, count * dtype.itemsize))
+                entry["size"], shape, count * dtype.itemsize))
+        data, _ = self._bytes(key, entry)
         if _unmask(entry["crc"]) != crc32c(data):
             raise corrupt("does not have the checksum that is stored "
                           "with it")

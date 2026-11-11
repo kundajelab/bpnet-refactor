@@ -53,7 +53,8 @@ def _varint(buffer, position):
 
     result = 0
     shift = 0
-    while True:
+    # (a number of 64 bits takes at most ten bytes)
+    for _ in range(10):
         if position >= len(buffer):
             raise ValueError("Truncated protocol buffer message")
         byte = buffer[position]
@@ -62,6 +63,8 @@ def _varint(buffer, position):
         if not byte & 0x80:
             return result, position
         shift += 7
+    raise ValueError(
+        "Not a protocol buffer message (a number of more than ten bytes)")
 
 
 def _fields(buffer):
@@ -250,11 +253,19 @@ def _weights_in_saved_model(path):
         it had in the model ('<layer>/kernel').
     """
 
-    from bpnet.model.checkpoint import Checkpoint
+    from bpnet.model.checkpoint import Checkpoint, CorruptCheckpointError
 
     reader = Checkpoint(os.path.join(path, "variables", "variables"))
-    object_graph = memoryview(
-        reader.get_tensor("_CHECKPOINTABLE_OBJECT_GRAPH"))
+    if "_CHECKPOINTABLE_OBJECT_GRAPH" not in reader:
+        raise CorruptCheckpointError(
+            "{} does not say which variables belong to which layer (it "
+            "has no object graph)".format(reader.index_path))
+    object_graph = reader.get_tensor("_CHECKPOINTABLE_OBJECT_GRAPH")
+    if not isinstance(object_graph, bytes):
+        raise CorruptCheckpointError(
+            "{}: its object graph is not a message".format(
+                reader.index_path))
+    object_graph = memoryview(object_graph)
 
     # TrackableObjectGraph.nodes
     nodes = [node for number, node in _fields(object_graph) if number == 1]
@@ -295,6 +306,11 @@ def _weights_in_saved_model(path):
                 continue
             full_name, checkpoint_key = entry
             layer = full_name.rsplit("/", 1)[0]
+            if checkpoint_key not in reader:
+                raise CorruptCheckpointError(
+                    "{} has no tensor {}, which its object graph names "
+                    "for {}".format(reader.index_path, checkpoint_key,
+                                    full_name))
             found.setdefault(layer, {})[variable_name] = \
                 reader.get_tensor(checkpoint_key)
     return found
