@@ -355,15 +355,18 @@ This script will output shap bigwig tracks which are usefull for visualizing in 
 
 UCSC, WashU browsers currently support visualizing the importance scores - use the [Dynseq](https://kundajelab.github.io/dynseq-pages/) option.
 
-`bpnet-shap` computes the scores with the lab's fork of `shap` on the Keras model (TensorFlow 1 graph mode). With `--backend pytorch` it computes them with [tangermeme](https://github.com/jmschrei/tangermeme)'s `deep_lift_shap` on the PyTorch model of the same saved model instead: the same outputs are explained with the same references (the dinucleotide shuffles of each sequence for the same `--seed`, no control for the references), and the same files are written. It needs PyTorch and tangermeme (`pip install torch tangermeme`), not TensorFlow or the fork, and is several times faster on a GPU: on a trained ENCODE model, 68 peaks per second for each of the two outputs against 11 to 12.
+`bpnet-shap` computes the scores with the lab's fork of `shap` on the Keras model (TensorFlow 1 graph mode). With `--backend pytorch` it computes them with [tangermeme](https://github.com/jmschrei/tangermeme)'s `deep_lift_shap` on the PyTorch model of the same saved model instead: the same outputs are explained with the same references (the dinucleotide shuffles of each sequence for the same `--seed`, no control for the references), and the same files are written. It needs PyTorch and tangermeme (`pip install torch tangermeme`; tested with tangermeme 1.6.0), not TensorFlow or the fork.
 
 ```
 bpnet-shap --backend pytorch --device cuda:0 --batch-size 128 \
         ... (the other options as above)
 ```
 
-`--batch-size` is the number of pairs of a sequence and a reference in one forward pass. The scores of the two backends agree to the rounding of the score files (float16) for the counts output, and for the profile output except in about one peak in a hundred, where the fork is the one that is off: it computes one multiplier as a quotient of differences in float32, which is imprecise where a logit of the sequence and of a reference nearly coincide (up to 3e-4 of the largest score of such a peak). `--backend pytorch` supports the first task of a model trained with one multinomial over both strands (not `--task-id` other than 0, not `--orig-multi-loss`).
+`--batch-size` is the number of pairs of a sequence and a reference in one forward pass; `--device` defaults to a GPU when PyTorch sees one.
 
+What it supports: the first task of a model with two profile tracks (both strands) trained with one multinomial over them, with or without control inputs, whose activations are ReLU, as in the default architecture. It refuses `--task-id` other than 0, `--orig-multi-loss`, a model with one profile track, and a model with another activation (for example a counts head with hidden layers that are not ReLU): its scores are compared with an independent DeepLIFT for ReLU only, and the two backends treat several other activations differently. It also checks once per run that the installed tangermeme hands a model its batches the way this backend relies on, and stops if it does not.
+
+What has been measured, on one trained ENCODE model with control inputs (ENCSR000EFG, 512 peaks, 20 shuffles, one L40S, with an earlier state of this code that computes the same): 68 peaks per second for each of the two outputs against 11 to 12 with the TensorFlow backend. On those peaks the scores of the two backends agree to the rounding of the score files (float16) for the counts output, and for the profile output in all but 4 of the 512 peaks; there the TensorFlow backend is the one that is off (up to 3e-4 of the largest score of the peak), because the fork computes one multiplier as a quotient of differences in float32, which is imprecise where a logit of the sequence and of a reference nearly coincide. Other models and other GPUs have not been measured. Like the TensorFlow backend, the command holds the sequences and both score arrays of all peaks in memory (about 13 GB for 100,000 peaks of 2,114 bases).
 
 
 #### Please cite:

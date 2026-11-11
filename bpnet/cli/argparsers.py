@@ -369,10 +369,10 @@ def shap_scores_argsparser():
                         help="what computes the scores: 'tensorflow' (the "
                         "shap fork on the keras model) or 'pytorch' "
                         "(tangermeme's DeepSHAP on the PyTorch model of "
-                        "the same saved model: the same scores to the "
-                        "rounding of the score files, several times "
-                        "faster on a GPU; needs PyTorch and tangermeme, "
-                        "not TensorFlow)")
+                        "the same saved model, for the same outputs and "
+                        "references; for models with two profile tracks "
+                        "whose activations are ReLU; needs PyTorch and "
+                        "tangermeme, not TensorFlow)")
 
     parser.add_argument('--device', type=str, default=None,
                         help="--backend pytorch: the device to compute "

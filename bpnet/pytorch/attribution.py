@@ -28,19 +28,28 @@
       (l_j(x) - l_j(r)), about half of the change of the output.)
 
     Both rely on the layout of a batch inside deep_lift_shap
-    (sequences, then references, row for row); the tests compare the
-    scores with an independent DeepLIFT, which a change of that
-    layout in a later tangermeme would fail.
+    (sequences, then references, row for row). The layout is looked
+    at once per process with a small model that notes what it is
+    given (_check_layout), so that a later tangermeme with another
+    layout is refused instead of giving other scores; and the tests
+    compare the scores with an independent DeepLIFT.
 
-    On a GPU the scores are computed with TF32 switched off. PyTorch
-    lets cuDNN compute convolutions in TF32 (10 bits of mantissa) by
-    default on the GPUs that have it; with it, 4% of the profile
-    scores of a trained ENCODE model were more than 1e-5 of the
-    largest score of their peak off, by up to 9e-4; without it, all
-    were within 5e-8 of an independent float64 computation, at the
-    same speed.
+    The scores are verified for models whose only nonlinear layers
+    are ReLU, which is every model bpnet-train makes with its default
+    architecture; a model with another activation is refused.
+
+    The scores are computed in the type of the model's parameters and
+    nothing less: on a GPU with TF32 switched off, without the
+    reduced precision that torch.set_float32_matmul_precision allows,
+    and outside any autocast of the caller. PyTorch lets cuDNN
+    compute convolutions in TF32 (10 bits of mantissa) by default on
+    the GPUs that have it; with it, 4% of the profile scores of a
+    trained ENCODE model were more than 1e-5 of the largest score of
+    their peak off, by up to 9e-4; without it, all were within 5e-8
+    of an independent float64 computation, at the same speed.
 """
 
+import contextlib
 import warnings
 
 import numpy as np
@@ -50,21 +59,186 @@ from bpnet.pytorch.model import channels_first, channels_last
 from bpnet.utils.shaputils import dinuc_shuffle
 
 
+#: the kinds of layer for which the scores are verified against an
+#: independent DeepLIFT: linear ones, dropout (which does nothing
+#: when a model is evaluated) and ReLU
+_VERIFIED_LAYERS = (torch.nn.Conv1d, torch.nn.Linear, torch.nn.Dropout,
+                    torch.nn.ReLU, torch.nn.ModuleDict)
+
+
+def check_model(model):
+    """
+        Refuse a model with a layer for which the scores of this
+        module are not verified (an activation other than ReLU:
+        deep_lift_shap has rules for many of them, and none of them
+        has been compared with bpnet-shap)
+
+        Raises:
+            ValueError: the model has such a layer
+    """
+
+    others = sorted({type(module).__name__ for module in model.modules()
+                     if module is not model and
+                     not isinstance(module, _VERIFIED_LAYERS)})
+    if others:
+        raise ValueError(
+            "The scores of the PyTorch backend are verified for models "
+            "whose only nonlinear layers are ReLU; this model has layers "
+            "of the kind {}".format(", ".join(others)))
+
+
+class _Layout(torch.nn.Module):
+    """
+        A model that notes the batches it is given
+    """
+
+    def __init__(self):
+        super(_Layout, self).__init__()
+        self.weight = torch.nn.Parameter(torch.ones(1))
+        self.seen = []
+
+    def forward(self, sequence, mark):
+        self.seen.append((sequence.detach().clone(), mark.detach().clone()))
+        return (self.weight * sequence).sum(dim=(1, 2)).unsqueeze(-1)
+
+
+_LAYOUT_CHECKED = []
+
+
+def _check_layout(deep_lift_shap):
+    """
+        Is a batch inside deep_lift_shap what the targets of this
+        module take it to be: the sequences of the pairs of the batch,
+        then the reference of each pair in the same order, and the
+        extra inputs of the sequences for both halves? Looked at once
+        per process, with three sequences, two references each and
+        batches of four pairs.
+
+        Raises:
+            RuntimeError: the layout is another one (a tangermeme
+                this module was not written for)
+    """
+
+    if _LAYOUT_CHECKED:
+        return
+    # sequence i is all base i; its reference j has base 3 at
+    # position j and base i elsewhere: all rows are different
+    length, shuffles = 4, 2
+    x = torch.zeros(3, 4, length)
+    references = torch.zeros(3, shuffles, 4, length)
+    for i in range(3):
+        x[i, i] = 1
+        for j in range(shuffles):
+            references[i, j, i] = 1
+            references[i, j, :, j] = 0
+            references[i, j, 3, j] = 1
+    marks = torch.tensor([[1.0], [2.0], [3.0]])
+    layout = _Layout()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        deep_lift_shap(layout, x, args=(marks,), references=references,
+                       batch_size=4, device="cpu", dtype=torch.float32,
+                       only_warn=True)
+    pair, as_expected = 0, bool(layout.seen)
+    for sequence, mark in layout.seen:
+        half = sequence.shape[0] // 2
+        as_expected = as_expected and sequence.shape[0] == 2 * half and \
+            mark.shape[0] == 2 * half
+        for row in range(half if as_expected else 0):
+            i, j = divmod(pair, shuffles)
+            as_expected = as_expected and i < 3 and \
+                torch.equal(sequence[row], x[i]) and \
+                torch.equal(sequence[half + row], references[i, j]) and \
+                torch.equal(mark[row], marks[i]) and \
+                torch.equal(mark[half + row], marks[i])
+            pair += 1
+    if not as_expected or pair != 3 * shuffles:
+        import tangermeme
+        raise RuntimeError(
+            "deep_lift_shap of tangermeme {} hands a model other batches "
+            "than bpnet.pytorch.attribution was written for (sequences, "
+            "then their references, row for row): its scores would not be "
+            "those of bpnet-shap".format(
+                getattr(tangermeme, "__version__", "(unknown version)")))
+    _LAYOUT_CHECKED.append(True)
+
+
 class _FullPrecision(object):
     """
-        While inside: no TF32 on the GPU (convolutions and matrix
-        products in float32 proper); afterwards as it was
+        While inside: float32 is float32. No TF32 on the GPU
+        (convolutions and matrix products), no reduced precision of
+        matrix products (torch.set_float32_matmul_precision), no
+        autocast of the caller; afterwards every setting as it was.
+
+        PyTorch has three sets of switches for this, which it keeps
+        side by side: torch.set_float32_matmul_precision, the older
+        'allow_tf32' flags, and (PyTorch 2.9 and later) a setting per
+        backend and kind of operation, 'fp32_precision'. Each is read
+        before any is changed and put back in the order in which the
+        later ones overwrite the earlier ones; a switch that cannot be
+        read (PyTorch refuses to report one that disagrees with the
+        others) is left alone.
     """
 
     def __enter__(self):
-        self.previous = (torch.backends.cudnn.allow_tf32,
-                         torch.backends.cuda.matmul.allow_tf32)
-        torch.backends.cudnn.allow_tf32 = False
-        torch.backends.cuda.matmul.allow_tf32 = False
+        backends = torch.backends
+
+        def readable(read):
+            # (older PyTorch does not have every switch, and says so
+            # in several ways)
+            try:
+                return read()
+            except (RuntimeError, AttributeError, AssertionError):
+                return None
+
+        matmul = readable(lambda: torch.get_float32_matmul_precision())
+        flags = [(backends.cudnn, "allow_tf32")]
+        if matmul is None:
+            # (no such setting in this PyTorch, or the backends were
+            # set one by one in a way it cannot say)
+            flags.append((backends.cuda.matmul, "allow_tf32"))
+        holders = [("cuda", "matmul"), ("mkldnn", "matmul")] + [
+            (backend, kind) for backend in ("cudnn", "mkldnn")
+            for kind in ("conv", "rnn")]
+        settings = [getattr(getattr(backends, backend, None), kind, None)
+                    for backend, kind in holders]
+        # what is there now ...
+        flags = [(holder, name, readable(lambda: getattr(holder, name)))
+                 for holder, name in flags]
+        before = [(setting, readable(lambda: setting.fp32_precision))
+                  for setting in settings]
+        before = [(setting, value) for setting, value in before
+                  if value is not None]
+        settings = [setting for setting, _ in before]
+        # ... full precision ...
+        if matmul is not None:
+            torch.set_float32_matmul_precision("highest")
+        for holder, name, value in flags:
+            if value is not None:
+                setattr(holder, name, False)
+        for setting in settings:
+            setting.fp32_precision = "ieee"
+
+        # ... and how to put it back
+        def undo():
+            if matmul is not None:
+                torch.set_float32_matmul_precision(matmul)
+            for holder, name, value in flags:
+                if value is not None:
+                    setattr(holder, name, value)
+            for setting, value in before:
+                setting.fp32_precision = value
+
+        self._undo = undo
+        self._contexts = contextlib.ExitStack()
+        for device_type in ("cpu", "cuda"):
+            if device_type == "cpu" or torch.cuda.is_available():
+                self._contexts.enter_context(torch.autocast(
+                    device_type=device_type, enabled=False))
 
     def __exit__(self, *failure):
-        torch.backends.cudnn.allow_tf32, \
-            torch.backends.cuda.matmul.allow_tf32 = self.previous
+        self._contexts.close()
+        self._undo()
 
 
 def _no_control_for_the_references(control):
@@ -205,10 +379,27 @@ def hypothetical_scores(model, which, sequences, controls=None,
                 parameters: the score each of the four bases would
                 have at each position. A list of such arrays, in the
                 order of `which`, when `which` names several outputs.
+
+        Raises:
+            ValueError: the model has a layer for which the scores
+                are not verified (check_model), the inputs are not
+                what the model takes, or a number of shuffles, a
+                batch size or a chunk below 1
+            RuntimeError: the installed tangermeme lays out its
+                batches in another way than this module relies on
     """
 
     from tangermeme.deep_lift_shap import deep_lift_shap
 
+    for name, value in (("num_shuffles", num_shuffles),
+                        ("batch_size", batch_size), ("chunk", chunk)):
+        # (deep_lift_shap takes a batch size of 0 or less for "all
+        # pairs at once")
+        if isinstance(value, bool) or \
+                not isinstance(value, (int, np.integer)) or value < 1:
+            raise ValueError(
+                "{}: a whole number of at least 1 is expected, not "
+                "{!r}".format(name, value))
     several = not isinstance(which, str)
     names_of_targets = list(which) if several else [which]
     kinds = {"counts": CountsTarget, "profile": ProfileTarget}
@@ -216,6 +407,8 @@ def hypothetical_scores(model, which, sequences, controls=None,
             any(name not in kinds for name in names_of_targets):
         raise ValueError("which: 'counts' or 'profile', not {!r}".format(
             which))
+    check_model(model)
+    _check_layout(deep_lift_shap)
     targets = [kinds[name](model) for name in names_of_targets]
     names = model.input_names[1:]
     controls = dict(controls or {})

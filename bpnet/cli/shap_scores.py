@@ -100,6 +100,7 @@ def shap_scores(args, shap_dir):
                 "with one multinomial over both strands; --task-id and "
                 "--orig-multi-loss are not supported with it")
         try:
+            import torch
             from bpnet.pytorch import attribution
             from bpnet.pytorch import model as pytorch_model
             import tangermeme  # noqa: F401
@@ -107,6 +108,26 @@ def shap_scores(args, shap_dir):
             raise NoTracebackException(
                 "--backend pytorch needs PyTorch and tangermeme to be "
                 "installed ({})".format(error))
+        for name, value in (("--batch-size", args.batch_size),
+                            ("--num-shuffles", args.num_shuffles)):
+            if value < 1:
+                raise NoTracebackException(
+                    "--backend pytorch: {} must be at least 1, not "
+                    "{}".format(name, value))
+        if args.device is not None:
+            try:
+                device = torch.device(args.device)
+            except (RuntimeError, ValueError) as error:
+                raise NoTracebackException(
+                    "--device {}: not a device of PyTorch ({})".format(
+                        args.device, str(error).split("\n")[0]))
+            if device.type == "cuda" and (
+                    not torch.cuda.is_available() or
+                    (device.index or 0) >= torch.cuda.device_count()):
+                raise NoTracebackException(
+                    "--device {}: PyTorch sees {} GPU(s) here".format(
+                        args.device, torch.cuda.device_count()
+                        if torch.cuda.is_available() else 0))
         try:
             model = pytorch_model.load_model(args.model)
         except (OSError, ValueError) as error:
@@ -124,6 +145,10 @@ def shap_scores(args, shap_dir):
                 "--backend pytorch explains models with two profile "
                 "tracks (both strands); this model has {}".format(
                     tracks[0] if len(tracks) == 1 else tracks))
+        try:
+            attribution.check_model(model)
+        except ValueError as error:
+            raise NoTracebackException("--backend pytorch: {}".format(error))
     else:
         import shap
         import tensorflow as tf
