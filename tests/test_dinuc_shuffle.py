@@ -117,8 +117,12 @@ def test_arrays_as_they_come():
     other_values = x.astype(np.float64) * 0.5
     wide = np.zeros((300, 6), dtype=np.int16)
     wide[np.arange(300), rng.randint(0, 6, size=300)] = 1
-    for array in (reverse, locked, two_ones, other_values, wide,
-                  x.astype(np.uint8), x.astype(bool), np.asfortranarray(x)):
+    # more kinds of position than a small integer counts
+    many = np.zeros((600, 300), dtype=np.int8)
+    many[np.arange(600), rng.randint(0, 300, size=600)] = 1
+    for array in (reverse, locked, two_ones, other_values, wide, many,
+                  np.eye(130, dtype=np.int8), x.astype(np.uint8),
+                  x.astype(bool), np.asfortranarray(x)):
         old_state, new_state = random_state(9), random_state(9)
         old = dinuc_shuffle_v0(array, 4, old_state)
         new = dinuc_shuffle(array, 4, new_state)
@@ -212,7 +216,13 @@ def test_what_is_not_a_sequence():
             with pytest.raises(IndexError):
                 function(empty, 1, np.random.RandomState(0))
             assert len(function(empty, 0, np.random.RandomState(0))) == 0
-    # letters outside ASCII cannot be shuffled as text, as before
+    # letters outside ASCII cannot be shuffled as text, as before: the
+    # failure comes after the random numbers of the first shuffle
+    states = []
     for function in (dinuc_shuffle, dinuc_shuffle_v0):
+        state = random_state(7)
         with pytest.raises(UnicodeDecodeError):
-            function("ACéGT", 1, np.random.RandomState(0))
+            function("AC\u00e9GT" * 5, 3, state)
+        states.append(state)
+    assert_same_state(*states)
+    assert states[0].get_state()[2] != random_state(7).get_state()[2]
