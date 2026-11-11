@@ -124,7 +124,10 @@ if args.generate_bigwigs:
         predictions = h5py.File(f"{args.output_dir}/mean_predictions.h5", 'r')
 
         pred_prof = predictions['pred_prof'][()]
-        coords_chrom = predictions['coords_chrom'][()].astype("U8")
+        # the names whole (they were cut to 8 characters here)
+        coords_chrom = np.array([
+            name.decode() if isinstance(name, bytes) else str(name)
+            for name in predictions['coords_chrom'][()]])
         coords_start = predictions['coords_start'][()]
         coords_end = predictions['coords_end'][()]
 
