@@ -98,12 +98,12 @@ all(all(element == end_lst[0]) for element in end_lst)])==3):
         coords_end_dset[:] = end_lst[0]
 
         pred_logcounts_dset = f.create_dataset(
-            "pred_logcounts", (num_examples, pred_logcounts_mean.shape[1])
+            "pred_logcounts", (num_examples, pred_logcounts_mean.shape[1]), dtype="f4"
         )
         pred_logcounts_dset[:, :] = pred_logcounts_mean
 
         pred_prof_dset = f.create_dataset(
-            "pred_prof", (num_examples, pred_prof_mean.shape[1], pred_prof_mean.shape[2])
+            "pred_prof", (num_examples, pred_prof_mean.shape[1], pred_prof_mean.shape[2]), dtype="f4"
         )
         pred_prof_dset[:, :, :] = pred_prof_mean
 

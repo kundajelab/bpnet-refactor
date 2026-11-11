@@ -57,10 +57,12 @@ PEAKS = [("chr1", 100), ("chr1", 5000), ("chr2", 40), (LONG, 700),
 LENGTH = 30
 
 
-def score_files(directory, folds=3, seed=0, peaks=PEAKS):
+def score_files(directory, folds=3, seed=0, peaks=PEAKS, eighths=False):
     """
         The score files of `folds` folds for the same peaks, as
-        bpnet-shap writes them, and what went into them
+        bpnet-shap writes them, and what went into them (`eighths`:
+        the scores are multiples of 1/8 up to 4, whose sums and means
+        over a few folds float16 holds exactly)
 
         Returns:
             tuple: (paths, one hot sequences, the scores of every
@@ -79,6 +81,8 @@ def score_files(directory, folds=3, seed=0, peaks=PEAKS):
     paths, stored = [], []
     for fold in range(folds):
         scores = rng.normal(0, 0.05, size=(n, LENGTH, 4))
+        if eighths:
+            scores = rng.randint(-32, 33, size=(n, LENGTH, 4)) / 8.0
         path = os.path.join(str(directory), "fold{}.h5".format(fold))
         shap_scores.save_scores(table, sequences, scores, path)
         paths.append(path)
@@ -90,6 +94,24 @@ def read_scores(path):
     with h5py.File(path, "r") as f:
         return {key: f[key][:] for key in f}, {
             key: f[key].dtype for key in f}
+
+
+#: the number HDF5 has for the Blosc filter
+BLOSC = 32001
+
+
+def filters(path):
+    """
+        The filters of every dataset of a file, by their numbers
+    """
+
+    found = {}
+    with h5py.File(path, "r") as f:
+        for key in f:
+            made_with = f[key].id.get_create_plist()
+            found[key] = [made_with.get_filter(i)[0]
+                          for i in range(made_with.get_nfilters())]
+    return found
 
 
 def float16_mean_bound(stored):
@@ -164,6 +186,34 @@ def test_mean_score_file(mean_shap, kind):
     assert types["hyp_scores"] == np.float32
     assert types["input_seqs"] == np.float32
     assert types["coords_start"] == types["coords_end"] == np.int64
+    # compressed as the released files are, except the names (text of
+    # variable length cannot go through that filter)
+    assert filters(str(mean_shap["out"] / (
+        kind + "_mean_shap_scores.h5"))) == {
+            "coords_chrom": [], "coords_start": [BLOSC],
+            "coords_end": [BLOSC], "hyp_scores": [BLOSC],
+            "input_seqs": [BLOSC]}
+
+
+def test_mean_is_exact_where_the_arithmetic_is(tmp_path):
+    """
+        Scores that are multiples of 1/8: their sum over four folds
+        and its quarter are exact in the float16 the folds are stored
+        in, so the mean in the file is the mean, to the last bit
+    """
+
+    paths, _, stored = score_files(tmp_path, folds=4, seed=3, eighths=True)
+    out = tmp_path / "out"
+    out.mkdir()
+    code, output = run_script("mean_shap.py", [
+        "--counts_shaps", ",".join(paths), "--output_dir", out], tmp_path)
+    assert code == 0, output[-3000:]
+    found, _ = read_scores(str(out / "counts_mean_shap_scores.h5"))
+    stored = np.asarray(stored, dtype=np.float64)
+    assert np.array_equal(stored * 8, np.round(stored * 8))
+    expected = stored.mean(axis=0)
+    assert np.array_equal(found["hyp_scores"], expected)
+    assert len(np.unique(expected)) > 100
 
 
 def test_mean_of_one_kind_of_score(tmp_path):
@@ -389,30 +439,44 @@ def test_mean_prediction_file(mean_predictions):
     # (the mean, not one fold)
     for fold in mean_predictions["profiles"]:
         assert np.abs(fold[rows] - expected[rows]).max() > 0.5
+    # the types the script has always written
+    assert found["pred_prof"].dtype == np.float32
+    assert found["pred_logcounts"].dtype == np.float32
+    assert found["coords_start"].dtype == np.int64
+    assert found["coords_end"].dtype == np.int64
 
 
-def expected_tracks(regions, profile, sizes):
+def expected_tracks(regions, profile, sizes, width=WIDTH):
     """
-        What the bigWigs of the mean hold, by chromosome: the profile
-        of every region on its chromosome; where two regions overlap,
-        the earlier one up to the middle between the two centres and
-        the later one from there
+        What the bigWigs of the mean hold, by chromosome. Every base
+        of a region has the value of that region's profile; a base
+        that several regions cover has the value of one of them: of
+        the regions of a chromosome in the order of their starts, the
+        last one whose border with the region before it is at or
+        before the base. That border is the middle between the two
+        centres, rounded down, a centre being (start + end) // 2.
     """
 
     tracks = {name: np.full(size, np.nan) for name, size in sizes}
     by_chromosome = {}
     for row, (name, start) in enumerate(regions):
         by_chromosome.setdefault(name, []).append((start, row))
+
+    def centre(start):
+        return (start + start + width) // 2
+
     for name, starts in by_chromosome.items():
         starts.sort()
-        for k, (start, row) in enumerate(starts):
-            first, last = start, start + WIDTH
-            if k > 0 and starts[k - 1][0] + WIDTH > start:
-                first = (starts[k - 1][0] + start + WIDTH) // 2
-            if k + 1 < len(starts) and starts[k + 1][0] < last:
-                last = (start + starts[k + 1][0] + WIDTH) // 2
-            tracks[name][first:last] = profile[row, first - start:
-                                               last - start]
+        for position in range(len(tracks[name])):
+            owner = None
+            for k, (start, row) in enumerate(starts):
+                border = start if k == 0 else max(start, (
+                    centre(starts[k - 1][0]) + centre(start)) // 2)
+                if border <= position < start + width:
+                    owner = (start, row)
+            if owner is not None:
+                tracks[name][position] = profile[owner[1],
+                                                 position - owner[0]]
     return tracks
 
 
@@ -486,6 +550,72 @@ def test_region_is_written_to_its_own_chromosome(tmp_path):
                 rtol=1e-6, err_msg=name)
     finally:
         bw.close()
+
+
+@pytest.mark.parametrize("width", [10, 9])
+def test_regions_that_overlap_each_other(tmp_path, monkeypatch, width):
+    """
+        Three regions of one chromosome that all overlap, of an even
+        and of an odd width: each base of the bigWig has the value of
+        one region, the regions taking turns at the middle between
+        their centres (rounded down)
+    """
+
+    regions = [("chr1", 106), ("chr1", 100), ("chr1", 103), ("chr2", 7)]
+    sizes = [("chr1", 200), ("chr2", 100)]
+    monkeypatch.setattr(sys.modules[__name__], "WIDTH", width)
+    paths, _ = prediction_files(tmp_path, seed=4, regions=regions)
+    with open(str(tmp_path / "chrom.sizes"), "w") as fh:
+        for name, size in sizes:
+            fh.write("{}\t{}\n".format(name, size))
+    out = tmp_path / "out"
+    code, output = run_script("mean_predictions.py", [
+        "--prediction_h5s", ",".join(paths), "--generate_bigwigs",
+        "-c", tmp_path / "chrom.sizes", "-o", out], tmp_path)
+    assert code == 0, output[-3000:]
+    found, stored = regions_of_the_mean_file(out)
+    assert found["pred_prof"].shape == (4, width, 2)
+    expected = expected_tracks(stored, found["pred_prof"][:, :, 1], sizes,
+                               width=width)
+    # the borders, said outright: 100 + (centre of 100 and of 103) ...
+    first = ((200 + width) // 2 + (206 + width) // 2) // 2
+    second = ((206 + width) // 2 + (212 + width) // 2) // 2
+    assert (first, second) == ((106, 109) if width == 10 else (105, 108))
+    rows = {start: stored.index(("chr1", start)) for start in (100, 103, 106)}
+    profile = found["pred_prof"][:, :, 1]
+    by_hand = np.concatenate([
+        profile[rows[100], :first - 100],
+        profile[rows[103], first - 103:second - 103],
+        profile[rows[106], second - 106:]])
+    assert np.array_equal(expected["chr1"][100:106 + width], by_hand)
+    bw = pyBigWig.open(str(out / "mean_predictions_minus.bw"))
+    try:
+        for name, size in sizes:
+            values = np.array(bw.values(name, 0, size), dtype=np.float64)
+            there = ~np.isnan(expected[name])
+            assert np.array_equal(~np.isnan(values), there), name
+            np.testing.assert_allclose(values[there], expected[name][there],
+                                       rtol=1e-6, err_msg=name)
+    finally:
+        bw.close()
+    assert (~np.isnan(expected["chr1"])).sum() == 6 + width
+
+
+def test_prediction_folds_with_other_regions_give_no_file_today(tmp_path):
+    """
+        What the script does today (open to question): when the folds
+        do not have the same regions, it writes no mean and ends
+        without an error
+    """
+
+    paths, _ = prediction_files(tmp_path, folds=2, seed=7)
+    with h5py.File(paths[1], "r+") as f:
+        f["coords/coords_start"][2] += 1
+    out = tmp_path / "out"
+    code, output = run_script("mean_predictions.py", [
+        "--prediction_h5s", ",".join(paths), "-o", out], tmp_path)
+    assert code == 0, output[-3000:]
+    assert os.listdir(str(out)) == []
 
 
 def test_mean_predictions_without_bigwigs(tmp_path):

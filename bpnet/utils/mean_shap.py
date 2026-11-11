@@ -62,12 +62,12 @@ def mean_shap(shaps_list,output_path):
         coords_end_dset[:] = end_lst[0]
 
         hyp_scores_dset = f.create_dataset(
-            "hyp_scores", (num_examples, hyp_scores_mean.shape[1], hyp_scores_mean.shape[2]), **hdf5plugin.Blosc()
+            "hyp_scores", (num_examples, hyp_scores_mean.shape[1], hyp_scores_mean.shape[2]), dtype="f4", **hdf5plugin.Blosc()
         )
         hyp_scores_dset[:, :, :] = hyp_scores_mean
 
         input_seqs_dset = f.create_dataset(
-            "input_seqs", (num_examples, hyp_scores_mean.shape[1], hyp_scores_mean.shape[2]), **hdf5plugin.Blosc()
+            "input_seqs", (num_examples, hyp_scores_mean.shape[1], hyp_scores_mean.shape[2]), dtype="f4", **hdf5plugin.Blosc()
         )
         input_seqs_dset[:, :, :] = input_seqs_lst[0]
 
