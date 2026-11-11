@@ -41,9 +41,13 @@ def mean_shap(shaps_list,output_path):
 
         f = h5py.File(output_path, "w")
 
+        # (the names are not compressed like the other datasets:
+        # writing text of variable length through the Blosc filter
+        # ends the process with a floating point exception, with
+        # hdf5plugin 4.4 and 7.1 at least)
         coords_chrom_dset = f.create_dataset(
             "coords_chrom", (num_examples,),
-            dtype=h5py.string_dtype(encoding="ascii"), **hdf5plugin.Blosc()
+            dtype=h5py.string_dtype(encoding="ascii")
         )
         coords_chrom_dset[:] = chrom_lst[0]
 
@@ -58,12 +62,12 @@ def mean_shap(shaps_list,output_path):
         coords_end_dset[:] = end_lst[0]
 
         hyp_scores_dset = f.create_dataset(
-            "hyp_scores", (num_examples, hyp_scores_mean.shape[1], hyp_scores_mean.shape[2]), **hdf5plugin.Blosc()
+            "hyp_scores", (num_examples, hyp_scores_mean.shape[1], hyp_scores_mean.shape[2]), dtype="f4", **hdf5plugin.Blosc()
         )
         hyp_scores_dset[:, :, :] = hyp_scores_mean
 
         input_seqs_dset = f.create_dataset(
-            "input_seqs", (num_examples, hyp_scores_mean.shape[1], hyp_scores_mean.shape[2]), **hdf5plugin.Blosc()
+            "input_seqs", (num_examples, hyp_scores_mean.shape[1], hyp_scores_mean.shape[2]), dtype="f4", **hdf5plugin.Blosc()
         )
         input_seqs_dset[:, :, :] = input_seqs_lst[0]
 
