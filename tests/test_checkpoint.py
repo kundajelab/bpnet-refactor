@@ -615,7 +615,7 @@ def change_of(name, **settings):
      "252"),
     ("conv/bias", {"shape": (8, 4)}, "its shape (8, 4) needs 128"),
     ("conv/bias", {"dtype": 2}, "its shape (64,) needs 512"),
-    ("large", {"offset": 10 ** 7}, "is cut short: tensor large ends at"),
+    ("large", {"offset": 10 ** 7}, "is cut short: tensor large is read to"),
     ("strings", {"size": 3}, "does not have the size its strings need"),
     ("strings", {"shape": (2, 1)}, "does not have the size its strings "
      "need"),
@@ -791,12 +791,19 @@ def test_what_the_index_says_is_checked_before_the_data_is_read(
         reader.get_tensor("x")
     assert reads == []
     # (a string may have any length: its size cannot be checked
-    # against its shape. The file is cut back first.)
+    # against its shape. Its lengths are read, which say that it does
+    # not have that size; with a data file that ends before them,
+    # nothing is read)
+    with pytest.raises(CorruptCheckpointError,
+                       match="does not have the size its strings need"):
+        reader.get_tensor("s")
+    assert len(reads) == 1
     with real_open(prefix + ".data-00000-of-00001", "r+b") as fh:
-        fh.truncate(100)
+        fh.truncate(10)
+    reader = Checkpoint(prefix)
     with pytest.raises(CorruptCheckpointError, match="is cut short"):
         reader.get_tensor("s")
-    assert reads == []
+    assert len(reads) == 1
 
     # a shape of more elements than fit 63 bits
     write_checkpoint(prefix, {"x": value}, change=lambda name, settings:
@@ -860,8 +867,8 @@ def test_strings_are_read_when_their_lengths_fit(tmp_path, monkeypatch):
     write_checkpoint(prefix, tensors)
     reads = watch_reads(monkeypatch)
     reader = Checkpoint(prefix)
-    # (lengths and their checksum, then the strings)
-    for name, expected in (("none", [4, 0]), ("one", [9, 4]),
+    # (lengths and their checksum, then the strings, if there are any)
+    for name, expected in (("none", [4]), ("one", [9, 4]),
                            ("three", [10, 3])):
         del reads[:]
         assert_same_tensor(reader.get_tensor(name), tensors[name])
@@ -1172,12 +1179,27 @@ def test_weights_by_the_object_graph(tmp_path):
                       fixed32(3, b"abcd"))
     assert_weights(object_graph(nodes) + field(1, 3) + fixed32(1, b"abcd"))
 
-    # a child without the number of its object is the first object,
-    # the model, which is no variable
+    # a model without layers with weights has no weights
     nodes = graph_nodes()
-    nodes[0] = field(1, field(1, b"\x01") + field(2, b"layer_with_weights-0"))
+    nodes[0] = reference("layer-0", 1) + reference("optimizer", 4)
     assert loading.read_weights(saved_model_with(
         tmp_path, object_graph(nodes))) == {}
+
+    # a layer with weights that has no variables of its own (a model
+    # used as a layer; a layer made of layers): its weights are deeper
+    # in the graph than this reader looks, and it says so. Also a
+    # child without the number of its object, which is then the first
+    # object, the model
+    inner = graph_nodes()
+    inner[0] = reference("layer_with_weights-0", 6)
+    inner.append(reference("layer_with_weights-0", 1))
+    for nodes in (inner, [field(1, field(1, b"\x01") + field(
+            2, b"layer_with_weights-0"))] + graph_nodes()[1:]):
+        model = saved_model_with(tmp_path, object_graph(nodes))
+        with pytest.raises(UnsupportedModelError) as failure:
+            loading.read_weights(model)
+        assert "a layer with weights (layer_with_weights-0) has no " \
+            "variables of its own" in str(failure.value)
 
 
 def test_object_graph_that_is_not_one(tmp_path):
@@ -1346,15 +1368,24 @@ def test_object_graph_that_is_not_one(tmp_path):
     assert sorted(loading.read_weights(saved_model_with(
         tmp_path, changed(5, attribute("", STEP))))) == ["conv"]
 
-    # two layers whose variables have the same names: the weights are
-    # filed by name, so they cannot be told apart
+    # the weights are filed by the names of the variables. Two layers
+    # that share a variable (tied weights, which keras saves as two
+    # references to one variable) and two variables of one name are
+    # genuine checkpoints that cannot be filed that way: not
+    # supported, and said so
     nodes = list(good)
     nodes[0] = good[0] + reference("layer_with_weights-1", 6)
-    nodes.append(reference("kernel", 7))
+    nodes.append(reference("kernel", 2))
+    model = saved_model_with(tmp_path, object_graph(nodes))
+    with pytest.raises(UnsupportedModelError) as failure:
+        loading.read_weights(model)
+    assert "two layers share the variable conv/kernel (tied weights)" in \
+        str(failure.value)
+    nodes[6] = reference("kernel", 7)
     nodes.append(attribute("conv/kernel", BIAS))
     model = saved_model_with(tmp_path, object_graph(nodes))
-    with pytest.raises(CorruptCheckpointError,
-                       match="has two variables kernel of a layer conv"):
+    with pytest.raises(UnsupportedModelError,
+                       match="two variables have the name conv/kernel"):
         loading.read_weights(model)
     # (with a name of its own the second layer is read)
     nodes[7] = attribute("dense/kernel", BIAS)
@@ -1362,6 +1393,23 @@ def test_object_graph_that_is_not_one(tmp_path):
         tmp_path, object_graph(nodes)))
     assert sorted(weights) == ["conv", "dense"]
     assert_same_tensor(weights["dense"]["kernel"], graph_tensors()[BIAS])
+
+    # an object that is saved by a registered saver: TensorFlow 2.8
+    # and later restore it with the function of that name (and fail
+    # without it), earlier versions do not know of it. Whichever
+    # object has one
+    for number in (2, 4, 0):
+        saver = field(4, field(1, b"some.saver") + field(2, b"object"))
+        model = saved_model_with(
+            tmp_path, changed(number, good[number] + saver))
+        with pytest.raises(UnsupportedModelError) as failure:
+            loading.read_weights(model)
+        assert "is saved by a registered saver (some.saver)" in \
+            str(failure.value)
+        assert model in str(failure.value)
+    # (a saver without a name is none)
+    assert sorted(loading.read_weights(saved_model_with(tmp_path, changed(
+        2, good[2] + field(4, field(2, b"object")))))) == ["conv"]
 
 
 def test_objects_of_the_graph():
@@ -1377,12 +1425,13 @@ def test_objects_of_the_graph():
     objects = loading._objects_in_object_graph(memoryview(
         object_graph(good[:4] + [more] + good[5:])))
     assert objects == [
-        ([("layer_with_weights-0", 1), ("layer-1", 1), ("optimizer", 4)], []),
-        ([("kernel", 2), ("bias", 3)], []),
-        ([], [("VARIABLE_VALUE", "conv/kernel", KERNEL)]),
-        ([], [("VARIABLE_VALUE", "conv/bias", BIAS)]),
-        ([("iter", 5)], []),
-        ([], [("VARIABLE_VALUE", "Adam/iter", STEP)]),
+        ([("layer_with_weights-0", 1), ("layer-1", 1), ("optimizer", 4)], [],
+         ""),
+        ([("kernel", 2), ("bias", 3)], [], ""),
+        ([], [("VARIABLE_VALUE", "conv/kernel", KERNEL)], ""),
+        ([], [("VARIABLE_VALUE", "conv/bias", BIAS)], ""),
+        ([("iter", 5)], [], "saver"),
+        ([], [("VARIABLE_VALUE", "Adam/iter", STEP)], ""),
     ]
     assert loading._variables_in_object_graph(memoryview(
         object_graph(good))) == [("kernel", "conv/kernel", KERNEL),

@@ -273,6 +273,14 @@ def test_hdf5_files_that_do_not_hold_weights(tmp_path):
     assert sorted(weights) == ["conv"]
     assert {name: value.tolist() for name, value in
             weights["conv"].items()} == {"kernel": [1.0], "bias": [2.0]}
+    # the weights of a layer that are no group
+    with h5py.File(path, "w") as f:
+        weights = f.create_group("model_weights").create_dataset(
+            "conv", data=[1.0])
+        weights.attrs["weight_names"] = [b"conv/kernel:0"]
+    with pytest.raises(ValueError,
+                       match="the weights of layer conv are not a group"):
+        loading.read_weights(path)
     # not an HDF5 file
     with open(path, "wb") as fh:
         fh.write(b"something else")

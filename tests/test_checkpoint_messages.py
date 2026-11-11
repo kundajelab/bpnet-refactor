@@ -129,6 +129,7 @@ def case(name, entry=None, ours=None, header=None, stricter=False,
 BAD_HEADER = damage("its header cannot be read")
 OTHER_VERSION = not_supported("asks for another version of the format")
 BAD_STRINGS = damage("does not have the size its strings need")
+NEGATIVE = "a dimension of unknown or negative size"
 
 MESSAGES = [
     case("as it is written"),
@@ -148,7 +149,10 @@ MESSAGES = [
          fixed32(6, b"abcd"),
          damage("does not have the checksum that is stored with it")),
     case("beyond the end of the data file", FOUR + field(4, 1000),
-         damage("is cut short: tensor x ends at byte 1016 of")),
+         damage("is cut short: tensor x is read to byte 1016 of")),
+    case("no numbers, beyond the end of the data file",
+         field(1, 1) + field(2, field(2, b"") + DIMENSION) + field(4, 1000) +
+         checksum(0), np.zeros((0, 4), dtype=np.float32)),
 
     # a field of another kind (number, length delimited, fixed width)
     # than its message gives it is passed over, whatever its bytes
@@ -252,7 +256,15 @@ MESSAGES = [
     case("a negative offset", FOUR + field(4, 2 ** 63), damage()),
     case("a dimension of negative size",
          field(1, 1) + field(2, field(2, field(1, 2 ** 64 - 1))) +
-         field(5, 16) + CHECKSUM, damage()),
+         field(5, 16) + CHECKSUM, damage(NEGATIVE)),
+    case("two dimensions of negative size",
+         field(1, 1) + field(2, field(2, field(1, 2 ** 64 - 1)) * 2) +
+         field(5, 4) + checksum(crc_bit_by_bit(NUMBERS[:4])),
+         damage(NEGATIVE)),
+    case("no elements, and a dimension of negative size",
+         field(1, 1) + field(2, field(2, b"") +
+                             field(2, field(1, 2 ** 64 - 1))) + checksum(0),
+         damage(NEGATIVE)),
 
     # the versions: this reader is one of version 1, as TensorFlow's
     case("version: as TensorFlow writes it", header=version()),
@@ -425,6 +437,15 @@ MESSAGES = [
          field(1, 1) + field(2, DIMENSION + field(2, field(1, 1)) * 32) +
          field(5, 16) + CHECKSUM, not_supported("has 33 dimensions"),
          stricter=True),
+    case("no numbers, in a shape that numpy arrays do not have",
+         field(1, 1) + field(2, field(2, b"") + field(2, field(1, 2 ** 62))) +
+         checksum(0), not_supported("a shape that numpy arrays do not have"),
+         stricter=True),
+    case("no strings, in a shape that numpy arrays do not have",
+         field(1, 7) + field(2, field(2, field(1, 2 ** 62)) + field(2, b"")) +
+         field(4, AT_NO_STRINGS) + field(5, 4) + checksum(NO_STRINGS_CRC),
+         not_supported("a shape that numpy arrays do not have"),
+         stricter=True, dtype="string"),
     case("254 dimensions",
          field(1, 1) + field(2, DIMENSION + field(2, field(1, 1)) * 253) +
          field(5, 16) + CHECKSUM, not_supported("has 254 dimensions"),
@@ -827,6 +848,8 @@ def random_graph(rng):
         return object_graph(nodes)
     data = bytearray(object_graph(nodes))
     for _ in range(rng.randint(1, 3)):
+        if not data:
+            break
         how, position = rng.random(), rng.randrange(len(data))
         if how < 0.5:
             data[position] = rng.getrandbits(8)
@@ -877,6 +900,7 @@ def tf():
 #: anything else ends the program with an error.
 TENSORFLOW_READS = r'''
 import json
+import re
 import resource
 import sys
 
@@ -899,14 +923,37 @@ def written(tensor):
             "values": values}
 
 
+def restore(prefix, dtype):
+    # (the operation that restores the variables of a model)
+    return tf.raw_ops.RestoreV2(
+        prefix=prefix, tensor_names=["x"], shape_and_slices=[""],
+        dtypes=[getattr(tf, dtype)])[0]
+
+
+# the names TensorFlow has for the types in its messages, where they
+# are not the names of the types (types whose values this program
+# cannot write down, resource and variant, are left out)
+TYPES = {"float": "float32", "double": "float64", "half": "float16"}
+TYPES.update({name: name for name in (
+    "int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64",
+    "bool", "string", "complex64", "complex128")})
+
 results = []
 for prefix, dtype, how in json.load(open(sys.argv[1])):
     if how == "restore":
-        # what restores the variables of a model
         try:
-            tensor = tf.raw_ops.RestoreV2(
-                prefix=prefix, tensor_names=["x"], shape_and_slices=[""],
-                dtypes=[getattr(tf, dtype)])[0]
+            try:
+                tensor = restore(prefix, dtype)
+            except tf.errors.InvalidArgumentError as error:
+                # asked for another type than the entry has, which
+                # says nothing about the file: TensorFlow names the
+                # type of the entry, and is asked again for that
+                found = re.search(
+                    r"does not equal original dtype (\w+)", str(error))
+                other = TYPES.get(found.group(1)) if found else None
+                if other is None or other == dtype:
+                    raise
+                tensor = restore(prefix, other)
         except tf.errors.OpError as error:
             results.append({"refused": type(error).__name__,
                             "message": str(error)[:300]})
@@ -920,12 +967,15 @@ with open(sys.argv[2], "w") as out:
 '''
 
 #: the errors with which TensorFlow refuses the checkpoints of the
-#: table above
+#: table above, and one more that the random ones meet (slices of
+#: another rank than the tensor). Not among them: its error for a
+#: tensor it has no room for, which would say nothing about a file
 REFUSALS = ("DataLossError", "InvalidArgumentError", "NotFoundError",
             "OutOfRangeError")
+REFUSALS_OF_RANDOM_FILES = REFUSALS + ("InternalError",)
 
 
-def tensorflow_reads(tasks, work_dir, refusals=None):
+def tensorflow_reads(tasks, work_dir, refusals):
     """
         What TensorFlow reads from each checkpoint of a list, in a
         process of its own (TensorFlow ends the process on some
@@ -937,11 +987,13 @@ def tensorflow_reads(tasks, work_dir, refusals=None):
                 'x', "restore" for the operation that restores the
                 variables of a model or "reader" for the reader of
                 tf.train.load_checkpoint, which is only asked for
-                files it must read)
+                files it must read). When the restore operation says
+                that the entry has another type than the one asked
+                for, it is asked again for that type: a refusal is
+                then one of the file, not of the question
             work_dir (str): a directory for the files of the exchange
-            refusals (tuple): the errors with which TensorFlow may
-                refuse a file (default: any error of its restore
-                operation)
+            refusals (tuple): the errors of its restore operation
+                with which TensorFlow may refuse a file
 
         Returns:
             list: for each task {"shape", "dtype", "values"}, or
@@ -962,9 +1014,8 @@ def tensorflow_reads(tasks, work_dir, refusals=None):
         results = json.load(fh)
     assert len(results) == len(tasks)
     for result in results:
-        assert ("values" in result) != ("refused" in result), result
-        assert refusals is None or result.get("refused", refusals[0]) in \
-            refusals, result
+        assert ("values" in result) != (result.get("refused") in refusals), \
+            result
     return results
 
 
@@ -1067,7 +1118,7 @@ def test_random_messages_as_tensorflow_reads_them(tf, tmp_path):
             dtype = ours.get("dtype", "float32")
             tasks.append([prefix, TENSORFLOW_TYPES.get(dtype, dtype),
                           "restore"])
-    results = tensorflow_reads(tasks, str(tmp_path))
+    results = tensorflow_reads(tasks, str(tmp_path), REFUSALS_OF_RANDOM_FILES)
 
     counts = collections.Counter()
     for task, ours, theirs in zip(tasks, here, results):
@@ -1099,13 +1150,22 @@ def test_object_graphs_as_tensorflow_parses_them(tf):
     def theirs(data):
         graph = trackable_object_graph_pb2.TrackableObjectGraph.FromString(
             data)
+        # (TensorFlow before 2.8 has no registered savers)
         return [([(child.local_name, child.node_id)
                   for child in node.children],
                  [(one.name, one.full_name, one.checkpoint_key)
-                  for one in node.attributes]) for node in graph.nodes]
+                  for one in node.attributes],
+                 node.registered_saver.name
+                 if hasattr(node, "registered_saver") else None)
+                for node in graph.nodes]
 
-    assert loading._objects_in_object_graph(memoryview(object_graph(
-        graph_nodes()))) == theirs(object_graph(graph_nodes()))
+    def same(ours, parsed):
+        return len(ours) == len(parsed) and all(
+            a[:2] == b[:2] and b[2] in (None, a[2])
+            for a, b in zip(ours, parsed))
+
+    assert same(loading._objects_in_object_graph(memoryview(object_graph(
+        graph_nodes()))), theirs(object_graph(graph_nodes())))
     rng = random.Random(4)
     counts = collections.Counter()
     for _ in range(3000):
@@ -1124,7 +1184,7 @@ def test_object_graphs_as_tensorflow_parses_them(tf):
             continue
         with warnings.catch_warnings():
             warnings.simplefilter("error")
-            assert ours == theirs(data), data
+            assert same(ours, theirs(data)), data
         counts["the same"] += 1
     assert counts["the same"] > 500 and counts["refused by both"] > 300, \
         counts

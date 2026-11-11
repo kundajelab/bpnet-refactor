@@ -537,8 +537,8 @@ class Checkpoint(object):
     def _read(self, key, entry, start, length):
         """
             `length` bytes of a tensor, from its byte `start`, after
-            checking that the data file holds what the index says the
-            tensor has
+            checking that the data file has them. (As for TensorFlow,
+            a tensor of no bytes can be anywhere.)
         """
 
         path = "{}.data-{:05d}-of-{:05d}".format(
@@ -549,11 +549,13 @@ class Checkpoint(object):
                     "{} is missing (the data of the checkpoint {})".format(
                         path, self.prefix))
             self._files[path] = os.path.getsize(path)
-        if entry["offset"] + entry["size"] > self._files[path]:
+        end = entry["offset"] + start + length
+        if length and end > self._files[path]:
             raise CorruptCheckpointError(
-                "{} is cut short: tensor {} ends at byte {} of {}".format(
-                    path, key, entry["offset"] + entry["size"],
-                    self._files[path]))
+                "{} is cut short: tensor {} is read to byte {} of {}".format(
+                    path, key, end, self._files[path]))
+        if not length:
+            return b""
         with open(path, "rb") as fh:
             fh.seek(entry["offset"] + start)
             data = fh.read(length)
@@ -628,7 +630,7 @@ class Checkpoint(object):
                 return strings[0]
             out = np.empty(count, dtype=object)
             out[:] = strings
-            return out.reshape(shape)
+            return self._shaped(out, shape, key)
 
         if entry["dtype"] not in _TYPES:
             raise UnsupportedModelError(
@@ -643,5 +645,19 @@ class Checkpoint(object):
         if _unmask(entry["crc"]) != crc32c(data):
             raise corrupt("does not have the checksum that is stored "
                           "with it")
-        return np.frombuffer(data, dtype=dtype).reshape(shape).astype(
-            dtype.newbyteorder("="))
+        return self._shaped(np.frombuffer(data, dtype=dtype), shape,
+                            key).astype(dtype.newbyteorder("="))
+
+    def _shaped(self, array, shape, key):
+        """
+            The array in the shape of the tensor. (A tensor of no
+            elements can have a shape that numpy arrays do not have:
+            (0, 2**62).)
+        """
+
+        try:
+            return array.reshape(shape)
+        except ValueError as error:
+            raise UnsupportedModelError(
+                "{}: tensor {} has a shape that numpy arrays do not have "
+                "({}: {})".format(self.index_path, key, shape, error))

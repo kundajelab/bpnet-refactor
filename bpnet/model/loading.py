@@ -328,20 +328,29 @@ def _weights_in_saved_model(path):
                 reader.index_path))
     try:
         variables = _variables_in_object_graph(memoryview(object_graph))
+    except UnsupportedModelError as error:
+        raise UnsupportedModelError("{}: {}".format(reader.index_path, error))
     except ValueError as error:
         raise CorruptCheckpointError(
             "{}: its object graph cannot be read ({})".format(
                 reader.index_path, error))
 
-    found = {}
+    found, tensors = {}, {}
     for variable_name, full_name, checkpoint_key in variables:
         layer = full_name.rsplit("/", 1)[0]
         if variable_name in found.get(layer, {}):
-            # (the weights are filed by name: two layers of one name
-            # cannot be told apart, and keras does not write them)
-            raise CorruptCheckpointError(
-                "{}: its object graph has two variables {} of a layer "
-                "{}".format(reader.index_path, variable_name, layer))
+            # the weights are filed by the names of the variables, so
+            # a name can be there once. Keras writes it twice for two
+            # layers that share a variable, which the models of this
+            # package do not do
+            if tensors[layer, variable_name] == checkpoint_key:
+                raise UnsupportedModelError(
+                    "{}: two layers share the variable {} (tied "
+                    "weights)".format(reader.index_path, full_name))
+            raise UnsupportedModelError(
+                "{}: two variables have the name {}".format(
+                    reader.index_path, full_name))
+        tensors[layer, variable_name] = checkpoint_key
         if not full_name:
             # (TensorFlow writes none for a variable that was made
             # with an empty name; the layers of this package name
@@ -378,10 +387,11 @@ def _objects_in_object_graph(object_graph):
         graph, and the children of an object have names of their own.
 
         Returns:
-            list: for every object (children, attributes), the
+            list: for every object (children, attributes, saver): the
                 children as (name, number of the object), the
                 attributes as (name, full name of the variable, name
-                of its tensor in the checkpoint)
+                of its tensor in the checkpoint), and the name of the
+                saver that is registered for the object ('' for none)
 
         Raises:
             ValueError: the graph is not what the format says
@@ -392,7 +402,7 @@ def _objects_in_object_graph(object_graph):
     for number, kind, node in _fields(object_graph):
         if number != 1 or kind != _BYTES:
             continue
-        children, attributes = [], []
+        children, attributes, saver = [], [], ""
         for field, field_kind, value in _fields(node):
             if field_kind != _BYTES:
                 continue
@@ -434,13 +444,15 @@ def _objects_in_object_graph(object_graph):
                 # and later)
                 for part, part_kind, part_value in _fields(value):
                     if part in (1, 2) and part_kind == _BYTES:
-                        _text(part_value)
+                        name = _text(part_value)
+                        if part == 1:
+                            saver = name
             elif field == 5:
                 # has_checkpoint_values: a message of one number
                 # (TensorFlow 2.9 and later)
                 for _ in _fields(value):
                     pass
-        objects.append((children, attributes))
+        objects.append((children, attributes, saver))
     if not objects:
         raise ValueError("it has no objects")
     for node_id in references:
@@ -456,7 +468,8 @@ def _variables_in_object_graph(object_graph):
         of a checkpoint: its first object is the model, which refers
         to its layers with weights ('layer_with_weights-<i>'), each of
         which refers to its variables. (The models of this package:
-        a layer that is itself a model with layers is not followed.)
+        a layer whose weights are those of layers inside it, such as
+        a model used as a layer, is reported as not supported.)
 
         Returns:
             list: for each variable (its name in the layer, its full
@@ -464,13 +477,25 @@ def _variables_in_object_graph(object_graph):
 
         Raises:
             ValueError: the graph is not what the format says
+            UnsupportedModelError: an object of the graph is saved by
+                a registered saver, or a layer with weights has no
+                variables of its own
     """
 
     objects = _objects_in_object_graph(object_graph)
+    for _, _, saver in objects:
+        if saver:
+            # (TensorFlow 2.8 and later restore such an object with
+            # the function registered under that name and fail without
+            # it; earlier versions do not know the field)
+            raise UnsupportedModelError(
+                "an object of its object graph is saved by a registered "
+                "saver ({})".format(saver))
     found = []
     for local_name, node_id in objects[0][0]:
         if not local_name.startswith("layer_with_weights-"):
             continue
+        before = len(found)
         for variable_name, variable_id in objects[node_id][0]:
             values = [(full_name, checkpoint_key)
                       for name, full_name, checkpoint_key
@@ -487,6 +512,11 @@ def _variables_in_object_graph(object_graph):
                     "a variable ({}) without the name of its "
                     "tensor".format(full_name or variable_name))
             found.append((variable_name, full_name, checkpoint_key))
+        if len(found) == before:
+            raise UnsupportedModelError(
+                "a layer with weights ({}) has no variables of its own: "
+                "its weights are those of layers inside it".format(
+                    local_name))
     return found
 
 
@@ -501,6 +531,10 @@ def _weights_in_hdf5(path):
                 "no 'model_weights')".format(path))
         group = f["model_weights"]
         for layer in group:
+            if not isinstance(group[layer], h5py.Group):
+                raise ValueError(
+                    "{}: the weights of layer {} are not a group".format(
+                        path, layer))
             names = group[layer].attrs.get("weight_names", [])
             for name in names:
                 if isinstance(name, bytes):
