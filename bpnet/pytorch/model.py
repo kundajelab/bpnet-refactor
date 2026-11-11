@@ -70,9 +70,11 @@ _ACTIVATIONS = {
 }
 
 
-#: other names TensorFlow accepts for a type (these are its own: for
-#: numpy 'float' is float64)
-_TYPE_NAMES = {"half": "float16", "float": "float32", "double": "float64"}
+#: the names TensorFlow has for the float types (these are its own:
+#: for numpy 'float' is float64), and numpy's name for each
+_TYPE_NAMES = {"half": "float16", "float16": "float16",
+               "float": "float32", "float32": "float32",
+               "double": "float64", "float64": "float64"}
 
 
 def _variable_type(config):
@@ -80,7 +82,8 @@ def _variable_type(config):
         The type the variables of a layer were saved with, by the
         layer's settings: its type under the name numpy has for it,
         or float32 under a mixed precision policy. None when the file
-        does not say.
+        does not say, or says it with a name that is not known here
+        (the weights then decide alone).
     """
 
     stored = config.get("dtype")
@@ -96,7 +99,10 @@ def _variable_type(config):
                 config.get("name"), stored))
     if stored.startswith("mixed_"):
         return "float32"
-    return _TYPE_NAMES.get(stored, stored)
+    if stored.endswith("_ref"):
+        # the reference types of TensorFlow 1: the same storage
+        stored = stored[:-len("_ref")]
+    return _TYPE_NAMES.get(stored)
 
 
 def channels_first(array):

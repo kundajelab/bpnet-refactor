@@ -6,6 +6,7 @@
 """
 
 import copy
+import json
 import math
 import os
 
@@ -462,8 +463,13 @@ def test_weights_must_have_the_type_the_layers_were_saved_with():
 
     # the other names TensorFlow has for the types (for numpy 'float'
     # is float64: these are TensorFlow's)
-    for name, kind, right, wrong in (("double", "float64", weights, single),
-                                     ("float", "float32", single, weights)):
+    for name, kind, right, wrong in (
+            ("double", "float64", weights, single),
+            ("float", "float32", single, weights),
+            ("float32_ref", "float32", single, weights),
+            ("float_ref", "float32", single, weights),
+            ("float64_ref", "float64", weights, single),
+            ("double_ref", "float64", weights, single)):
         other = changed(architecture, "first", dtype=name)
         model = pytorch_model.from_architecture(other, right)
         assert model.saved_types["first"] == kind
@@ -472,9 +478,23 @@ def test_weights_must_have_the_type_the_layers_were_saved_with():
             pytorch_model.from_architecture(other, wrong)
         assert "was saved with the type {}".format(kind) in \
             str(failure.value)
-    assert pytorch_model.Model(changed(
-        architecture, "first", dtype="half")).saved_types["first"] == \
-        "float16"
+    for name, kind in (("half", "float16"), ("float16", "float16"),
+                       ("half_ref", "float16")):
+        assert pytorch_model.Model(changed(
+            architecture, "first", dtype=name)).saved_types["first"] == kind
+        with pytest.raises(UnsupportedModelError) as failure:
+            pytorch_model.from_architecture(
+                changed(architecture, "first", dtype=name), single)
+        assert "was saved with the type float16" in str(failure.value)
+    # a name that is not known is not compared with anything: the
+    # weights decide alone
+    for name in ("bfloat16", "float128", "some_policy"):
+        other = changed(architecture, "first", dtype=name)
+        assert pytorch_model.Model(other).saved_types["first"] is None
+        for given, kind in ((single, torch.float32), (weights,
+                                                      torch.float64)):
+            model = pytorch_model.from_architecture(other, given)
+            assert model.layers["first"].weight.dtype == kind
 
     # on purpose
     model = pytorch_model.from_architecture(double)
@@ -1033,6 +1053,47 @@ def test_layers_that_keras_saved_as_double(tf, tmp_path, name):
     with torch.no_grad():
         found = model(torch.tensor(batch)).numpy()
     np.testing.assert_allclose(found, expected, rtol=1e-12, atol=1e-12)
+
+
+@pytest.mark.parametrize("name,kind", [
+    ("float32_ref", "float32"), ("float_ref", "float32"),
+    ("float64_ref", "float64"), ("double_ref", "float64")])
+def test_layers_with_a_reference_type(tf, name, kind):
+    """
+        The reference types of TensorFlow 1 are valid types of a keras
+        layer (with an initializer that accepts them), stored under
+        their own names, with variables of the plain type
+    """
+
+    x = tf.keras.Input((3,), name="x", dtype=kind)
+    dense = tf.keras.layers.Dense(
+        2, name="dense", kernel_initializer="zeros",
+        dtype=tf.keras.mixed_precision.Policy(name))
+    keras = tf.keras.Model(x, dense(x))
+    rng = np.random.RandomState(13)
+    values = [rng.normal(size=w.shape).astype(kind)
+              for w in keras.get_weights()]
+    keras.set_weights(values)
+    architecture = loading._plain(json.loads(keras.to_json()))["config"]
+    stored = [layer["config"]["dtype"] for layer in architecture["layers"]
+              if layer["name"] == "dense"]
+    assert stored == [name]
+    weights = {"dense": {"kernel": values[0], "bias": values[1]}}
+    model = pytorch_model.from_architecture(architecture, weights)
+    assert model.saved_types == {"dense": kind}
+    batch = rng.normal(size=(4, 3)).astype(kind)
+    expected = keras(tf.constant(batch)).numpy()
+    with torch.no_grad():
+        found = model(torch.tensor(batch)).numpy()
+    assert found.dtype == expected.dtype == np.dtype(kind)
+    np.testing.assert_allclose(found, expected, rtol=1e-5, atol=1e-6)
+    # weights of the other precision are refused
+    other = "float64" if kind == "float32" else "float32"
+    with pytest.raises(UnsupportedModelError, match="was saved with"):
+        pytorch_model.from_architecture(
+            architecture, {"dense": {key: value.astype(other)
+                                     for key, value in
+                                     weights["dense"].items()}})
 
 
 def test_model_saved_as_hdf5(tf, tmp_path):
