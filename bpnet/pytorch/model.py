@@ -17,14 +17,30 @@
     (batch, values). channels_first() and channels_last() convert
     arrays of batches between the two.
 
-    Every activation is a module of its own (also the one that a
-    Keras layer has built in), so that attribution methods that hook
-    the nonlinearities find them.
+    Layers with weights, activations and dropout are modules, under
+    the names of the layers (`Model.layers`); cropping, addition,
+    concatenation, pooling, flattening and the sum of the control
+    counts are steps of forward() without a module. Every activation
+    is a module of its own (also the one that a Keras layer has built
+    in, as '<layer>_activation'), and no module is used twice, so that
+    attribution methods that hook the nonlinearities find each of
+    them once.
 
     The parameters are those of the modules ('layers.<layer>.weight',
     'layers.<layer>.bias' in the model's state dictionary, in
     PyTorch's layout); get_weights() and set_weights() exchange them
     with the layout of the saved models.
+
+    What is supported is what the models of this package are made of,
+    which is less than Keras accepts for the same layer classes:
+    Conv1D with 'valid' or 'same' padding and no stride, Dense after
+    pooling or flattening, the activations of _ACTIVATIONS, Add of
+    equal shapes, Concatenate along the channels, one task. Anything
+    else is an UnsupportedModelError, never another computation.
+
+    forward() takes its inputs by position or by name and checks
+    their shapes: the model can be traced (torch.jit.trace keeps the
+    computation and drops the check) but not scripted.
 """
 
 import re
@@ -36,11 +52,43 @@ from bpnet.model import loading
 from bpnet.model.loading import UnsupportedModelError
 
 #: activations a Conv1D or Dense layer of Keras may have built in
+#: (besides 'linear'), by the names Keras stores, and their modules
 _ACTIVATIONS = {
     "relu": torch.nn.ReLU,
     "tanh": torch.nn.Tanh,
     "sigmoid": torch.nn.Sigmoid,
+    "elu": torch.nn.ELU,
+    "selu": torch.nn.SELU,
+    # log(1 + exp(x)); PyTorch returns x itself above the threshold,
+    # where the two differ by less than 1e-13
+    "softplus": lambda: torch.nn.Softplus(beta=1.0, threshold=30.0),
+    "softsign": torch.nn.Softsign,
+    "swish": torch.nn.SiLU,
+    "silu": torch.nn.SiLU,
+    # Keras' default: the exact form, with the error function
+    "gelu": torch.nn.GELU,
 }
+
+
+def _variable_type(config):
+    """
+        The type the variables of a layer were saved with, by the
+        layer's settings: its type, or float32 under a mixed precision
+        policy. None when the file does not say.
+    """
+
+    stored = config.get("dtype")
+    if isinstance(stored, dict) and \
+            stored.get("class_name") in ("Policy", "DTypePolicy") and \
+            isinstance(stored.get("config", {}).get("name"), str):
+        stored = stored["config"]["name"]
+    if stored is None:
+        return None
+    if not isinstance(stored, str):
+        raise UnsupportedModelError(
+            "Layer {}: dtype {} is not supported".format(
+                config.get("name"), stored))
+    return "float32" if stored.startswith("mixed_") else stored
 
 
 def channels_first(array):
@@ -90,12 +138,16 @@ class Model(torch.nn.Module):
                 forward() returns
             shapes (dict): layer name -> shape of its output without
                 the batch axis, in PyTorch's layout
+            saved_types (dict): name of a layer with weights -> the
+                type its variables were saved with ('float32',
+                'float64'), None when the layer graph does not say
     """
 
     def __init__(self, architecture):
         super(Model, self).__init__()
         self.layers = torch.nn.ModuleDict()
         self.shapes = {}
+        self.saved_types = {}
         #: (layer name, kind, names of its inputs, settings) in an
         #: order in which every layer comes after its inputs
         self._steps = []
@@ -108,6 +160,8 @@ class Model(torch.nn.Module):
         names = [layer["name"] for layer in pending]
         if len(set(names)) != len(names):
             raise UnsupportedModelError("Layer names are not unique")
+        #: the names of all layers, with or without a module
+        self._names = set(names)
         while pending:
             remaining = []
             for layer in pending:
@@ -187,6 +241,7 @@ class Model(torch.nn.Module):
                 shape[0], int(config["filters"]), width, dilation=dilation,
                 bias=bool(config.get("use_bias", True))))
             self.shapes[name] = (int(config["filters"]), length)
+            self.saved_types[name] = _variable_type(config)
             settings["activation"] = self._activation(name, config)
         elif kind == "Dense":
             self._needs(name, shape, 1)
@@ -194,6 +249,7 @@ class Model(torch.nn.Module):
                 shape[0], int(config["units"]),
                 bias=bool(config.get("use_bias", True))))
             self.shapes[name] = (int(config["units"]),)
+            self.saved_types[name] = _variable_type(config)
             settings["activation"] = self._activation(name, config)
         elif kind == "ReLU":
             loading._expect(config, max_value=None, negative_slope=0.0,
@@ -214,6 +270,10 @@ class Model(torch.nn.Module):
             if not isinstance(cropping, (list, tuple)):
                 cropping = (cropping, cropping)
             left, right = int(cropping[0]), int(cropping[1])
+            if left < 0 or right < 0:
+                raise UnsupportedModelError(
+                    "Layer {}: cropping {} is not supported".format(
+                        name, (left, right)))
             if left + right >= shape[1]:
                 raise UnsupportedModelError(
                     "Layer {} crops {} of {} positions".format(
@@ -304,6 +364,12 @@ class Model(torch.nn.Module):
                 "Layer {}: activation {} is not supported".format(
                     name, activation))
         key = name + "_activation"
+        if key in self._names:
+            # a layer of this name, with or without a module
+            raise UnsupportedModelError(
+                "Layer names are not unique: {} (the activation that a "
+                "layer 'x' has built in is 'x_activation' here)".format(
+                    key))
         self._register(key, _ACTIVATIONS[activation]())
         return key
 
@@ -461,15 +527,17 @@ def get_weights(model):
             model (Model): the model
 
         Returns:
-            dict: layer name -> {'kernel': array, 'bias': array}
+            dict: layer name -> {'kernel': array, 'bias': array},
+                copies: changing them does not change the model
     """
 
     weights = {}
     for name, module in _weighted(model).items():
         kernel = module.weight.detach().cpu().numpy()
-        # (the exchange of axes is its own inverse for both layouts)
-        weights[name] = {"kernel": np.ascontiguousarray(
-            _from_keras(module, kernel))}
+        # (the exchange of axes is its own inverse for both layouts;
+        # a copy: the array of .numpy() is the memory of the parameter)
+        weights[name] = {"kernel": np.array(
+            _from_keras(module, kernel), order="C")}
         if module.bias is not None:
             weights[name]["bias"] = module.bias.detach().cpu().numpy().copy()
     return weights
@@ -501,7 +569,9 @@ def from_architecture(architecture, weights=None):
         or float64 for a model that was saved in float64. (A model
         that was saved under a mixed precision policy has float32
         weights and computes in float32 here, where Keras computes
-        most of it in float16.)
+        most of it in float16.) Weights of another type than the layer
+        graph says the layer was saved with are refused; to convert
+        weights on purpose, give them to set_weights().
 
         Args:
             architecture (dict): see
@@ -515,6 +585,14 @@ def from_architecture(architecture, weights=None):
 
     model = Model(architecture)
     if weights is not None:
+        for name, declared in model.saved_types.items():
+            found = sorted({str(np.asarray(value).dtype)
+                            for value in weights.get(name, {}).values()})
+            if declared is not None and found not in ([], [declared]):
+                raise UnsupportedModelError(
+                    "Layer {}: its saved weights are {}, and the layer "
+                    "was saved with the type {}".format(
+                        name, found, declared))
         model.to(_saved_type(weights))
         set_weights(model, weights)
     return model.eval()

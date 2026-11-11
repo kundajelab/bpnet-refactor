@@ -6,6 +6,7 @@
 """
 
 import copy
+import math
 import os
 
 import numpy as np
@@ -99,7 +100,9 @@ def hand_computed(weights, sequence, control):
     from_flat = activated.reshape(len(activated), -1) @ \
         weights["from_flat"]["kernel"] + weights["from_flat"]["bias"]
     leaky = np.where(from_flat > 0, from_flat, 0.2 * from_flat)
-    summed = np.log(np.exp(control).sum(axis=1, keepdims=True))
+    largest = control.max(axis=1, keepdims=True)
+    summed = largest + np.log(np.exp(control - largest).sum(
+        axis=1, keepdims=True))
     out = np.concatenate([from_pooled, leaky, summed], axis=1) @ \
         weights["out"]["kernel"] + weights["out"]["bias"]
     return activated, out
@@ -138,6 +141,56 @@ def test_graph_written_by_hand():
             pytorch_model.channels_first(sequence)))
     assert all(torch.equal(a, b) for a, b in zip(found, again))
 
+    # control counts whose exponentials cannot be represented
+    control = np.array([[1000.0, 999.0], [-1000.0, -1001.0], [800.0, -800.0],
+                        [0.0, 0.0], [3.0, -2.0], [1e-3, 2e-3], [5.0, 5.0]])
+    expected = hand_computed(weights, sequence, control)
+    assert np.isfinite(expected[1]).all()
+    with torch.no_grad():
+        found = model(torch.tensor(pytorch_model.channels_first(sequence)),
+                      torch.tensor(control))
+    np.testing.assert_allclose(found[1].numpy(), expected[1],
+                               rtol=1e-12, atol=1e-12)
+
+
+def test_model_with_one_output_returns_a_tensor():
+    architecture, weights = hand_made()
+    one = copy.deepcopy(architecture)
+    one["output_layers"] = [["out", 0, 0]]
+    rng = np.random.RandomState(5)
+    inputs = (torch.tensor(rng.normal(size=(3, 4, 30))),
+              torch.tensor(rng.normal(size=(3, 2))))
+    with torch.no_grad():
+        both = pytorch_model.from_architecture(architecture, weights)(*inputs)
+        single = pytorch_model.from_architecture(one, weights)(*inputs)
+    assert isinstance(both, tuple) and len(both) == 2
+    assert isinstance(single, torch.Tensor)
+    assert torch.equal(single, both[1])
+
+
+def test_every_module_runs_once_in_a_forward_pass():
+    """
+        What methods that hook the modules rely on: a forward pass
+        calls every module of the model exactly once
+    """
+
+    architecture, weights = hand_made()
+    model = pytorch_model.from_architecture(architecture, weights)
+    calls = {name: 0 for name in model.layers}
+
+    def count(name):
+        def hook(module, inputs, output):
+            calls[name] += 1
+        return hook
+
+    for name, module in model.layers.items():
+        module.register_forward_hook(count(name))
+    with torch.no_grad():
+        model(torch.zeros(2, 4, 30, dtype=torch.float64),
+              torch.zeros(2, 2, dtype=torch.float64))
+    assert calls == {name: 1 for name in model.layers}
+    assert len(calls) == 10
+
 
 def test_every_activation_is_a_module():
     architecture, weights = hand_made()
@@ -150,6 +203,7 @@ def test_every_activation_is_a_module():
         "from_pooled_activation": "Tanh", "dropped": "Dropout",
         "from_flat": "Linear", "leaky": "LeakyReLU", "out": "Linear"}
     assert model.layers["leaky"].negative_slope == 0.2
+    assert model.layers["dropped"].p == 0.5
     assert model.layers["dilated"].dilation == (2,)
     assert model.layers["dilated"].bias is None
     assert model.layers["from_pooled"].bias is None
@@ -188,6 +242,32 @@ def test_weights_go_there_and_back():
     for name in ("from_pooled", "from_flat"):
         assert np.array_equal(model.layers[name].weight.detach().numpy(),
                               weights[name]["kernel"].T)
+
+    # what is read back does not share memory with the model, in
+    # either direction (also a kernel with one output, whose exchange
+    # of axes needs no copy)
+    before = pytorch_model.get_weights(model)
+    for name in back:
+        for key in back[name]:
+            back[name][key][...] = 7.0
+    after = pytorch_model.get_weights(model)
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.fill_(-3.0)
+    for name in weights:
+        for key in weights[name]:
+            assert np.array_equal(after[name][key], weights[name][key])
+            assert np.array_equal(before[name][key], weights[name][key])
+    # and the arrays that were given are not the model's memory either
+    pytorch_model.set_weights(model, weights)
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.fill_(-3.0)
+    reference, _ = hand_made()[1], None
+    for name in weights:
+        for key in weights[name]:
+            assert np.array_equal(weights[name][key], reference[name][key])
+    pytorch_model.set_weights(model, weights)
 
     # the parameters under the names of the layers: what a state
     # dictionary of the model holds, and another model takes
@@ -241,6 +321,113 @@ def test_model_has_the_type_of_the_saved_weights():
             pytorch_model.from_architecture(architecture, saved)
         assert "are not supported (all float32 or all float64)" in \
             str(failure.value)
+
+
+def erf(x):
+    return np.vectorize(math.erf)(x)
+
+
+#: the activations by the names Keras stores, from their definitions
+ACTIVATIONS = {
+    "relu": lambda x: np.maximum(x, 0.0),
+    "tanh": np.tanh,
+    "sigmoid": lambda x: 1.0 / (1.0 + np.exp(-x)),
+    "elu": lambda x: np.where(x > 0, x, np.expm1(np.minimum(x, 0.0))),
+    "selu": lambda x: 1.0507009873554805 * np.where(
+        x > 0, x, 1.6732632423543772 * np.expm1(np.minimum(x, 0.0))),
+    "softplus": lambda x: np.maximum(x, 0.0) + np.log1p(np.exp(-np.abs(x))),
+    "softsign": lambda x: x / (1.0 + np.abs(x)),
+    "swish": lambda x: x / (1.0 + np.exp(-x)),
+    "silu": lambda x: x / (1.0 + np.exp(-x)),
+    "gelu": lambda x: 0.5 * x * (1.0 + erf(x / np.sqrt(2.0))),
+}
+
+
+def one_dense_layer(activation, units=4):
+    architecture = {
+        "name": "one", "layers": [
+            entry("InputLayer", "x", batch_input_shape=[None, 3]),
+            entry("Dense", "dense", ["x"], units=units,
+                  activation=activation)],
+        "input_layers": [["x", 0, 0]], "output_layers": [["dense", 0, 0]]}
+    rng = np.random.RandomState(7)
+    weights = {"dense": {"kernel": rng.normal(size=(3, units)),
+                         "bias": rng.normal(size=units)}}
+    return architecture, weights
+
+
+def test_supported_activations_are_the_tested_ones():
+    assert sorted(pytorch_model._ACTIVATIONS) == sorted(ACTIVATIONS)
+
+
+@pytest.mark.parametrize("activation", sorted(ACTIVATIONS))
+def test_activation_built_into_a_layer(activation):
+    architecture, weights = one_dense_layer(activation)
+    model = pytorch_model.from_architecture(architecture, weights)
+    assert sorted(model.layers) == ["dense", "dense_activation"]
+    rng = np.random.RandomState(8)
+    # also far out, where the exponentials are large or vanish
+    x = np.concatenate([rng.normal(size=(40, 3)),
+                        rng.normal(size=(40, 3)) * 30.0])
+    before = x @ weights["dense"]["kernel"] + weights["dense"]["bias"]
+    assert np.abs(before).max() > 40 and (np.abs(before) < 0.5).any()
+    with torch.no_grad():
+        found = model(torch.tensor(x)).numpy()
+    np.testing.assert_allclose(found, ACTIVATIONS[activation](before),
+                               rtol=1e-12, atol=1e-13)
+
+
+def test_linear_layer_has_no_activation_module():
+    for activation in ("linear", None):
+        architecture, weights = one_dense_layer(activation)
+        model = pytorch_model.from_architecture(architecture, weights)
+        assert sorted(model.layers) == ["dense"]
+    architecture, weights = one_dense_layer("linear")
+    del architecture["layers"][1]["config"]["activation"]
+    assert sorted(pytorch_model.from_architecture(
+        architecture, weights).layers) == ["dense"]
+
+
+def test_weights_must_have_the_type_the_layers_were_saved_with():
+    """
+        The layer graph says which type the variables of a layer had;
+        weights of another type are not loaded as if nothing had
+        happened (set_weights converts on purpose)
+    """
+
+    architecture, weights = hand_made()
+    single = as_type(weights, np.float32)
+    model = pytorch_model.from_architecture(architecture, weights)
+    assert model.saved_types == {name: None for name in weights}
+
+    double = changed(architecture, "first", dtype="float64")
+    model = pytorch_model.from_architecture(double, weights)
+    assert model.saved_types["first"] == "float64"
+    assert model.layers["first"].weight.dtype == torch.float64
+    with pytest.raises(UnsupportedModelError) as failure:
+        pytorch_model.from_architecture(double, single)
+    assert "Layer first: its saved weights are ['float32'], and the " \
+        "layer was saved with the type float64" in str(failure.value)
+
+    # under a mixed precision policy the variables are float32
+    for policy in ({"class_name": "Policy",
+                    "config": {"name": "mixed_float16"}},
+                   {"module": "keras", "class_name": "DTypePolicy",
+                    "config": {"name": "mixed_bfloat16"},
+                    "registered_name": None}):
+        mixed = changed(architecture, "out", dtype=policy)
+        model = pytorch_model.from_architecture(mixed, single)
+        assert model.saved_types["out"] == "float32"
+        assert model.layers["out"].weight.dtype == torch.float32
+        with pytest.raises(UnsupportedModelError) as failure:
+            pytorch_model.from_architecture(mixed, weights)
+        assert "Layer out: its saved weights are ['float64']" in \
+            str(failure.value)
+
+    # on purpose
+    model = pytorch_model.from_architecture(double)
+    pytorch_model.set_weights(model, single)
+    assert model.layers["first"].weight.dtype == torch.float32
 
 
 def test_dropout_acts_in_training_mode_only():
@@ -321,10 +508,16 @@ def changed(architecture, name, **settings):
     ("together", {"axis": 0}, "concatenates along axis 0"),
     ("first", {"strides": [2]}, "strides"),
     ("first", {"padding": "causal"}, "padding causal is not supported"),
-    ("first", {"activation": "selu"}, "activation selu is not supported"),
+    ("first", {"activation": "exponential"},
+     "activation exponential is not supported"),
+    ("first", {"activation": {"class_name": "ReLU"}}, "activation"),
     ("first", {"kernel_size": [40]}, "shorter than its kernel"),
     ("cropped", {"cropping": [14, 14]}, "crops 28 of 28 positions"),
     ("cropped", {"cropping": [1, 2]}, "adds outputs of shapes"),
+    # what Keras computes for a negative width is not a crop
+    ("cropped", {"cropping": [0, -1]}, "cropping (0, -1) is not supported"),
+    ("cropped", {"cropping": [-1, 0]}, "cropping (-1, 0) is not supported"),
+    ("first", {"dtype": 5}, "dtype 5 is not supported"),
     ("sum_relu", {"max_value": 6.0}, "max_value"),
     ("first", {"groups": 2}, "groups"),
     ("first", {"data_format": "channels_first"}, "data_format"),
@@ -407,6 +600,11 @@ def renamed(architecture, old, new):
     # built in
     ("sum_relu", "first_activation",
      "Layer names are not unique: first_activation"),
+    # also by a layer that has no module
+    ("pooled", "first_activation",
+     "Layer names are not unique: first_activation"),
+    ("control", "from_pooled_activation",
+     "Layer names are not unique: from_pooled_activation"),
     # names that a PyTorch module cannot have
     ("sum_relu", "sum.relu", "PyTorch cannot register a module"),
     ("sum_relu", "keys", "PyTorch cannot register a module"),
@@ -688,17 +886,80 @@ def test_model_with_same_padding(tf, tmp_path):
             atol=2e-5 * np.abs(b).max())
 
 
+@pytest.mark.parametrize("activation", sorted(ACTIVATIONS))
+def test_activations_are_those_of_keras(tf, activation):
+    try:
+        theirs = tf.keras.activations.get(activation)
+    except ValueError:
+        pytest.skip("this keras has no activation {}".format(activation))
+    rng = np.random.RandomState(9)
+    x = np.concatenate([rng.normal(size=200), rng.normal(size=200) * 30.0])
+    expected = theirs(tf.constant(x, dtype=tf.float64)).numpy()
+    module = pytorch_model._ACTIVATIONS[activation]()
+    found = module(torch.tensor(x)).numpy()
+    # (keras' gelu is 5e-9 from its definition in float64, on
+    # TensorFlow 2.4.1 and 2.15.1 alike; its error function is exact)
+    atol = 1e-8 if activation == "gelu" else 1e-12
+    np.testing.assert_allclose(found, expected, rtol=1e-10, atol=atol)
+    np.testing.assert_allclose(ACTIVATIONS[activation](x), expected,
+                               rtol=1e-10, atol=atol)
+
+
+def test_graph_that_keras_builds(tf, tmp_path):
+    """
+        Convolutions that keep the length with kernels and dilations
+        for which the padding is not the same on both sides, one of
+        them without a bias, activations built into layers, one
+        output: against the Keras model, which is saved and read here
+    """
+
+    layers = tf.keras.layers
+    x = layers.Input((50, 4), name="sequence")
+    y = layers.Conv1D(5, 4, dilation_rate=3, padding="same",
+                      activation="elu", name="a")(x)
+    y = layers.Conv1D(3, 2, dilation_rate=5, padding="same",
+                      use_bias=False, name="b")(y)
+    y = layers.Conv1D(4, 6, padding="same", activation="softplus",
+                      name="c")(y)
+    y = layers.Flatten(name="flat")(y)
+    y = layers.Dense(6, activation="selu", name="d")(y)
+    y = layers.Dense(2, activation="sigmoid", use_bias=False, name="e")(y)
+    keras = tf.keras.Model(x, y, name="small")
+    rng = np.random.RandomState(10)
+    keras.set_weights([rng.normal(0, 0.3, size=w.shape).astype(np.float32)
+                       for w in keras.get_weights()])
+    batch = rng.normal(size=(5, 50, 4)).astype(np.float32)
+    expected = keras(tf.constant(batch), training=False).numpy()
+    path = str(tmp_path / "model")
+    keras.save(path)
+
+    model = pytorch_model.load_model(path)
+    assert {name: type(module).__name__
+            for name, module in model.layers.items()} == {
+        "a": "Conv1d", "a_activation": "ELU", "b": "Conv1d", "c": "Conv1d",
+        "c_activation": "Softplus", "d": "Linear", "d_activation": "SELU",
+        "e": "Linear", "e_activation": "Sigmoid"}
+    assert model.layers["b"].bias is None and model.layers["e"].bias is None
+    with torch.no_grad():
+        found = model(torch.tensor(pytorch_model.channels_first(batch)))
+    assert isinstance(found, torch.Tensor)
+    np.testing.assert_allclose(found.numpy(), expected, rtol=2e-5,
+                               atol=2e-5 * np.abs(expected).max())
+
+
 def test_model_saved_as_hdf5(tf, tmp_path):
     from tests.test_arch import forward_case, predict
 
     made = forward_case("two strands with control")
     path = str(tmp_path / "model.h5")
+    made["model"].save(path)
     try:
-        made["model"].save(path)
         loading.read_architecture(path)
-    except Exception:
-        pytest.skip("this keras writes no layer graph of the model class "
-                    "to HDF5")
+    except UnsupportedModelError as error:
+        # keras 2.13 and later write no layer graph of this model
+        # class to HDF5
+        assert "without a layer graph" in str(error)
+        pytest.skip(str(error))
     model = pytorch_model.load_model(path)
     with torch.no_grad():
         found = model(*to_torch(made["inputs"], model, np.float32))
