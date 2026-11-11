@@ -290,23 +290,49 @@ if NEWER:
         setting("cuda", "rnn", "ieee")), cudnn=True)
 
 # computing on a GPU. With TF32 that cannot be switched off nothing
-# is computed there; on the CPU it is (TF32 is a matter of GPUs)
-start_over(cudnn=True)
-before = state()
-try:
-    with attribution._FullPrecision(torch.device("cuda")):
-        inside = resolved() if NEWER else state()
-except RuntimeError as error:
-    inside = None
-    assert STUCK and "keeps TF32 on for matrix products on a GPU" in \
-        str(error) and "TORCH_ALLOW_TF32_CUBLAS_OVERRIDE" in str(error), error
-assert (inside is None) == bool(STUCK), inside
-if NEWER:
-    assert set(inside.values()) == {"ieee"}, inside
-elif not STUCK:
-    assert inside == (False, False, "highest"), inside
-assert state() == before
+# is computed there, and what was set on the way in is put back; on
+# the CPU it is computed (TF32 is a matter of GPUs)
+for precision in ("highest", "high", "medium"):
+    for cudnn in (True, False):
+        start_over(cudnn=True)
+        matmul(precision)
+        flag(b.cudnn, cudnn)
+        before = state()
+        try:
+            with attribution._FullPrecision(torch.device("cuda")):
+                inside = resolved() if NEWER else state()
+        except RuntimeError as error:
+            inside = None
+            assert STUCK and "keeps TF32 on for matrix products on a " \
+                "GPU" in str(error) and "TORCH_ALLOW_TF32_CUBLAS_OVERRIDE" \
+                in str(error), error
+        assert (inside is None) == bool(STUCK), inside
+        if NEWER:
+            assert set(inside.values()) == {"ieee"}, inside
+        elif not STUCK:
+            assert inside == (False, False, "highest"), inside
+        assert state() == before, (precision, cudnn, before, state())
 print("as before:", "a GPU, TF32 stuck" if STUCK else "a GPU")
+
+if not NEWER:
+    # a cuDNN whose TF32 flag does not go off (made up: the flag reads
+    # True whatever is set): nothing is computed on a GPU either
+    start_over()
+    kind = type(b.cudnn)
+    real = kind.__dict__["allow_tf32"]
+    kind.allow_tf32 = property(lambda self: True, lambda self, value: None)
+    try:
+        try:
+            with attribution._FullPrecision(torch.device("cuda")):
+                raise AssertionError("computed with TF32")
+        except RuntimeError as error:
+            assert "keeps TF32 on for convolutions" in str(error), error
+        with attribution._FullPrecision():
+            assert torch.get_float32_matmul_precision() == "highest"
+    finally:
+        kind.allow_tf32 = real
+    assert state() == (True, STUCK, "highest"), state()
+    print("as before:", "a cuDNN flag that stays on")
 
 # the autocast of the caller: off inside, on again afterwards
 with torch.autocast("cpu", dtype=torch.bfloat16):
@@ -367,7 +393,8 @@ def test_precision_is_full_inside_and_as_it_was_afterwards(override):
         assert "as before: a GPU" in checked
     else:
         assert "switches: older" in lines
-        assert len(checked) == 10, checked
+        assert len(checked) == 11, checked
+        assert "as before: a cuDNN flag that stays on" in checked
         # (PyTorch 2.0 to 2.8 switch TF32 off also with the variable)
         import torch
         stuck = override and int(torch.__version__.split(".")[0]) < 2

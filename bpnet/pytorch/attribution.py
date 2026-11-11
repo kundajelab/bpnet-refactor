@@ -152,13 +152,20 @@ def resolve_device(device):
             torch.device
 
         Raises:
-            ValueError: not a device of PyTorch; a device that is
-                neither a CPU nor a CUDA GPU (the scores are verified
-                on these); a GPU that PyTorch does not see
+            ValueError: not the name of a device of PyTorch or a
+                torch.device; a device that is neither a CPU nor a
+                CUDA GPU (the scores are verified on these); a GPU
+                that PyTorch does not see
     """
 
     if device is None:
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if not isinstance(device, (str, torch.device)):
+        # (torch.device also takes numbers and bytes, and keeps the
+        # number of a GPU in eight bits: see below)
+        raise ValueError(
+            "device {!r}: the name of a device ('cpu', 'cuda', 'cuda:1', "
+            "...) or a torch.device is expected".format(device))
     try:
         found = torch.device(device)
     except (RuntimeError, ValueError, TypeError) as error:
@@ -174,12 +181,12 @@ def resolve_device(device):
         # the number of the GPU as it was given: torch.device keeps it
         # in eight bits ('cuda:256' is cuda:0 to it, 'cuda:255' is
         # 'cuda', 'cuda:128' is cuda:-128)
+        index = found.index or 0
         if isinstance(device, str):
-            index = int(device.partition(":")[2] or 0)
-        elif isinstance(device, int):
-            index = device
-        else:
-            index = found.index or 0
+            # (torch.device takes plain digits after the colon)
+            number = device.partition(":")[2]
+            index = int(number) if number.isdecimal() else -1 if number \
+                else 0
         if not 0 <= index < seen:
             raise ValueError("device {}: PyTorch sees {} GPU(s) here".format(
                 device, seen))

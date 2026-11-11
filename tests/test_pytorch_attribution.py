@@ -563,6 +563,42 @@ def test_models_with_other_nonlinear_layers_are_refused(case):
             attribution.check_model(other)
 
 
+@pytest.mark.parametrize("saved_as", [
+    "float32", "float64", "mixed_float16", "mixed_bfloat16"])
+def test_models_of_the_types_the_loader_makes_are_scored(saved_as):
+    """
+        The loader makes a model of float32, or of float64 when it
+        was saved so; a model saved under a mixed precision policy
+        has float32 weights and is a float32 model here. Each is
+        scored in its type.
+    """
+
+    params = small_params()
+    architecture, saved = without_control(params)
+    kind = np.float64 if saved_as == "float64" else np.float32
+    declared = saved_as if not saved_as.startswith("mixed_") else {
+        "class_name": "Policy", "config": {"name": saved_as}}
+    for layer in architecture["layers"]:
+        if layer["class_name"] in ("Conv1D", "Dense"):
+            layer["config"]["dtype"] = declared
+    model = pytorch_model.from_architecture(architecture, {
+        name: {key: value.astype(kind) for key, value in weights.items()}
+        for name, weights in saved.items()})
+    assert {parameter.dtype for parameter in model.parameters()} == {
+        torch.float64 if kind is np.float64 else torch.float32}
+    attribution.check_model(model)
+    sequences = random_sequences(2, params["input_len"], seed=9)
+    found = attribution.hypothetical_scores(
+        model, "counts", sequences, num_shuffles=3, device="cpu")
+    assert found.dtype == kind
+    exact = attribution.hypothetical_scores(
+        pytorch_model.from_architecture(*without_control(params)), "counts",
+        sequences, num_shuffles=3, device="cpu")
+    assert exact.dtype == np.float64
+    close = 1e-12 if kind is np.float64 else 2e-4
+    assert np.abs(found - exact).max() <= close * np.abs(exact).max()
+
+
 def with_logsumexp(params, of):
     """
         A model without control inputs whose two log counts go through
@@ -641,7 +677,14 @@ def test_devices_the_scores_are_computed_on(case, monkeypatch):
         assert attribution.resolve_device("cuda:0") == torch.device("cuda:0")
     for device, message in (
             ("nowhere", "device nowhere: not a device of PyTorch"),
-            (3, "device 3: "),
+            # (torch.device takes numbers and bytes too; a name or a
+            # torch.device is expected here)
+            (3, "device 3: the name of a device .* or a torch.device is "
+             "expected"),
+            (0, "device 0: the name of a device"),
+            (np.int64(0), "the name of a device .* is expected"),
+            (b"cpu", "device b'cpu': the name of a device"),
+            (b"cuda:0", "device b'cuda:0': the name of a device"),
             ("mps", "device mps: the scores are computed on a CPU or a CUDA "
              "GPU .*, not on a device of the kind mps"),
             ("xpu", "not on a device of the kind xpu"),
@@ -655,8 +698,6 @@ def test_devices_the_scores_are_computed_on(case, monkeypatch):
             ("cuda:255", "device cuda:255: PyTorch sees"),
             ("cuda:256", "device cuda:256: PyTorch sees"),
             (torch.device("cuda:128"), "device cuda:-128: PyTorch sees")):
-        if device == 3 and there > 3:
-            continue
         with pytest.raises(ValueError, match=message):
             attribution.resolve_device(device)
         with pytest.raises(ValueError, match=message):
@@ -680,6 +721,11 @@ def test_devices_the_scores_are_computed_on(case, monkeypatch):
                    torch.device("cuda:128")):
         with pytest.raises(ValueError, match=r"PyTorch sees 1 GPU\(s\) "
                            "here"):
+            attribution.resolve_device(device)
+    for device in (0, 255, 256, np.int64(255), np.int64(256), b"cuda:0",
+                   b"cuda:255", b"cuda:256"):
+        with pytest.raises(ValueError, match="the name of a device .* is "
+                           "expected"):
             attribution.resolve_device(device)
 
 
