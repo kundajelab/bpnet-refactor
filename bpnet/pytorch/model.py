@@ -82,8 +82,10 @@ def _variable_type(config):
         The type the variables of a layer were saved with, by the
         layer's settings: its type under the name numpy has for it,
         or float32 under a mixed precision policy. None when the file
-        does not say, or says it with a name that is not known here
-        (the weights then decide alone).
+        does not say. A name that is not one of TensorFlow's names
+        for a float type is returned as it is: no weights have such a
+        type, so that a model which declares one is refused, as the
+        keras loader refuses it.
     """
 
     stored = config.get("dtype")
@@ -102,7 +104,7 @@ def _variable_type(config):
     if stored.endswith("_ref"):
         # the reference types of TensorFlow 1: the same storage
         stored = stored[:-len("_ref")]
-    return _TYPE_NAMES.get(stored)
+    return _TYPE_NAMES.get(stored, stored)
 
 
 def channels_first(array):

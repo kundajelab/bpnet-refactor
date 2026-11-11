@@ -486,15 +486,20 @@ def test_weights_must_have_the_type_the_layers_were_saved_with():
             pytorch_model.from_architecture(
                 changed(architecture, "first", dtype=name), single)
         assert "was saved with the type float16" in str(failure.value)
-    # a name that is not known is not compared with anything: the
-    # weights decide alone
-    for name in ("bfloat16", "float128", "some_policy"):
+    # a type that is none of these is not one the weights can have:
+    # a model that declares it is refused, whatever its weights
+    for name in ("bfloat16", "bfloat16_ref", "int32", "complex64",
+                 "some_policy"):
         other = changed(architecture, "first", dtype=name)
-        assert pytorch_model.Model(other).saved_types["first"] is None
-        for given, kind in ((single, torch.float32), (weights,
-                                                      torch.float64)):
-            model = pytorch_model.from_architecture(other, given)
-            assert model.layers["first"].weight.dtype == kind
+        declared = name[:-4] if name.endswith("_ref") else name
+        assert pytorch_model.Model(other).saved_types["first"] == declared
+        for given in (single, weights):
+            with pytest.raises(UnsupportedModelError) as failure:
+                pytorch_model.from_architecture(other, given)
+            assert "was saved with the type {}".format(declared) in \
+                str(failure.value)
+        # (without weights there is nothing to compare)
+        pytorch_model.from_architecture(other)
 
     # on purpose
     model = pytorch_model.from_architecture(double)
