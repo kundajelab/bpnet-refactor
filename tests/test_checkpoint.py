@@ -452,18 +452,26 @@ def test_restart_points_of_a_block(tmp_path):
     # (fewer restart points than there could be is fine: the first)
     assert read(tmp_path, table_of_blocks(
         [(b"z", with_points(points[:1]))])) == dict(pairs)
-    for name, new in (
-            ("does not start at 0", points[1:]),
-            ("not in order", [0, points[2], points[1]]),
-            ("the same twice", [0, points[1], points[1]]),
-            ("none", []),
-            ("beyond the entries", points + [len(entries) + 4]),
-            ("in the middle of an entry", [0, points[1] + 1]),
-            # the entry there shares bytes with the key before it
-            ("at an entry that is not whole", [0, points[1] - 10])):
+    # the second entry starts after the ten bytes of the first, and
+    # shares four bytes with its key
+    assert good[10:13] == bytes([4, 1, 2])
+    for name, new, message in (
+            ("does not start at 0", points[1:], "not in order from 0"),
+            ("not in order", [0, points[2], points[1]],
+             "not in order from 0"),
+            ("the same twice", [0, points[1], points[1]],
+             "not in order from 0"),
+            ("none", [], "0 restart points"),
+            ("beyond the entries", points + [len(entries) + 4],
+             "a restart point is not at an entry"),
+            ("in the middle of an entry", [0, points[1] + 1],
+             "a restart point is not at an entry"),
+            ("at an entry whose key is not stored whole", [0, 10],
+             "a key at a restart point is not whole")):
         with pytest.raises(CorruptCheckpointError) as failure:
             read(tmp_path, table_of_blocks([(b"z", with_points(new))]))
         assert "is not in the table format" in str(failure.value), name
+        assert message in str(failure.value), name
 
 
 def test_numbers_have_the_width_of_their_fields():
