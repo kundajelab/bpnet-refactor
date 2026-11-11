@@ -4,17 +4,15 @@
     the documented format by a small writer of the tests' own, read
     from the models that three TensorFlow versions saved, and, where
     TensorFlow is installed, compared tensor for tensor with what its
-    own reader returns.
+    own reader returns. (The messages inside a checkpoint have tests
+    of their own: test_checkpoint_messages.py.)
 """
 
-import collections
 import hashlib
 import json
 import os
 import shutil
 import struct
-import subprocess
-import sys
 
 import numpy as np
 import pytest
@@ -25,7 +23,7 @@ from bpnet.model.loading import UnsupportedModelError
 
 from tests.model_helpers import (FIXTURE_MODELS, FIXTURE_VERSIONS,
                                  unpack_fixture_models)
-from tests.test_loading_formats import field, varint
+from tests.test_loading_formats import field, fixed32, fixed64, varint
 
 
 # --------------------------------------------------------------------
@@ -800,11 +798,11 @@ def test_what_the_index_says_is_checked_before_the_data_is_read(
         reader.get_tensor("s")
     assert reads == []
 
-    # a shape whose product does not fit 64 bits
+    # a shape of more elements than fit 63 bits
     write_checkpoint(prefix, {"x": value}, change=lambda name, settings:
                      settings.update(shape=(2 ** 40, 2 ** 40, 4)))
     with pytest.raises(CorruptCheckpointError,
-                       match="has 16 bytes; its shape"):
+                       match="a shape of more elements than a tensor can"):
         Checkpoint(prefix).get_tensor("x")
 
 
@@ -900,369 +898,6 @@ def test_strings_are_read_when_their_lengths_fit(tmp_path, monkeypatch):
                        match="does not have the size its strings need"):
         Checkpoint(prefix).get_tensor("three")
     assert reads == [10]
-
-
-# --------------------------------------------------------------------
-# the messages of the index, as protocol buffers read them
-# --------------------------------------------------------------------
-
-def fixed32(number, data):
-    assert len(data) == 4
-    return varint((number << 3) | 5) + data
-
-
-def fixed64(number, data):
-    assert len(data) == 8
-    return varint((number << 3) | 1) + data
-
-
-def checksum(crc):
-    return fixed32(6, struct.pack("<I", masked(crc)))
-
-
-def version(producer=1, consumer=0, bad=b""):
-    """
-        The header of a checkpoint with a version: who wrote it, the
-        first version of the readers it is for, the versions of the
-        readers it is not for
-    """
-
-    out = field(1, producer) if producer else b""
-    if consumer:
-        out += field(2, consumer)
-    return HEADER + field(3, out + bad)
-
-
-#: the data file of the cases below: sixteen numbers, a tensor of no
-#: strings, one of three strings, one of a string whose length is
-#: written in ten bytes with bits beyond the 64th, and room after them
-NUMBERS = np.arange(1, 17, dtype="<f4").tobytes()
-_, _, NO_STRINGS, NO_STRINGS_CRC = tensor_bytes(np.array([], dtype=object))
-_, _, THREE_STRINGS, THREE_STRINGS_CRC = tensor_bytes(
-    np.array([b"a", b"bc", b""], dtype=object))
-_lengths = struct.pack("<I", masked(crc_bit_by_bit(struct.pack("<I", 2))))
-ODD_STRING = b"\x82" + b"\x80" * 8 + b"\x7e" + _lengths + b"ab"
-ODD_STRING_CRC = crc_bit_by_bit(
-    _lengths + b"ab", crc_bit_by_bit(struct.pack("<I", 2)))
-DATA = NUMBERS + NO_STRINGS + THREE_STRINGS + ODD_STRING + bytes(16)
-AT_NO_STRINGS, AT_THREE_STRINGS, AT_ODD_STRING = 64, 68, 78
-assert DATA[AT_THREE_STRINGS:AT_ODD_STRING] == THREE_STRINGS
-
-#: the header of one data file; the entry of the first four numbers
-#: (float32, shape (4,), 16 bytes from the start of the data file) and
-#: what follows its type
-HEADER = field(1, 1)
-FIRST = np.arange(1, 5, dtype=np.float32)
-DIMENSION = field(2, field(1, 4))
-CHECKSUM = checksum(crc_bit_by_bit(NUMBERS[:16]))
-REST = field(2, DIMENSION) + field(5, 16) + CHECKSUM
-FOUR = field(1, 1) + REST
-#: bytes that read as a shape of one more dimension, of size 1
-LIKE_A_SHAPE = b"\x12\x02\x08\x01\x18\x00\x18\x00"
-
-Message = collections.namedtuple(
-    "Message", "name header entry ours stricter dtype")
-
-
-def damage(text="the entry of tensor x cannot be read"):
-    return (CorruptCheckpointError, text)
-
-
-def not_supported(text):
-    return (UnsupportedModelError, text)
-
-
-def case(name, entry=None, ours=None, header=None, stricter=False,
-         dtype="float32"):
-    """
-        A checkpoint of one tensor 'x' over the data file above
-
-        Args:
-            name (str): what is special about it
-            entry (bytes): the entry of the tensor in the index
-                (default: the first four numbers)
-            ours: what this reader returns (default: the first four
-                numbers), or (error it raises, text of its message)
-            header (bytes): the header of the index
-            stricter (bool): TensorFlow reads what this reader
-                refuses
-            dtype (str): the type TensorFlow is asked to restore
-    """
-
-    return Message(name, HEADER if header is None else header,
-                   FOUR if entry is None else entry,
-                   FIRST if ours is None else ours, stricter, dtype)
-
-
-BAD_HEADER = damage("its header cannot be read")
-OTHER_VERSION = not_supported("asks for another version of the format")
-BAD_STRINGS = damage("does not have the size its strings need")
-
-MESSAGES = [
-    case("as it is written"),
-
-    # a field of another kind (number, length delimited, fixed width)
-    # than its message gives it is passed over, whatever its bytes
-    # look like
-    case("the shape in a field of eight bytes",
-         FOUR + fixed64(2, LIKE_A_SHAPE)),
-    case("the shape in a field of four bytes",
-         FOUR + fixed32(2, LIKE_A_SHAPE[:4])),
-    case("the shape as a number", FOUR + field(2, 7)),
-    case("the type as text", FOUR + field(1, b"\x02")),
-    case("the type in four bytes", FOUR + fixed32(1, struct.pack("<I", 2))),
-    case("the data file as text", FOUR + field(3, b"\x01")),
-    case("the offset as text", FOUR + field(4, b"\x08")),
-    case("the offset in eight bytes",
-         FOUR + fixed64(4, struct.pack("<Q", 8))),
-    case("the size as text", FOUR + field(5, b"\x20")),
-    case("the size in eight bytes", FOUR + fixed64(5, struct.pack("<Q", 32))),
-    case("the checksum as a number", FOUR + field(6, 5)),
-    case("the checksum in eight bytes", FOUR + fixed64(6, bytes(8))),
-    case("the checksum as text", FOUR + field(6, b"abcd")),
-    case("slices as a number", FOUR + field(7, 1)),
-    case("slices in four bytes", FOUR + fixed32(7, b"abcd")),
-    case("in the shape: a dimension as a number, the unknown rank as text",
-         field(1, 1) + field(2, DIMENSION + field(2, 5) + field(3, b"\x01")) +
-         field(5, 16) + CHECKSUM),
-    case("in a dimension: the size as text and in eight bytes",
-         field(1, 1) + field(2, field(2, field(1, 4) + field(1, b"\x09") +
-                                      fixed64(1, struct.pack("<Q", 9)))) +
-         field(5, 16) + CHECKSUM),
-    case("fields that the message does not have",
-         FOUR + field(15, 3) + field(16, b"xyz") + fixed32(17, b"abcd") +
-         fixed64(18, bytes(8))),
-    case("a dimension with a name",
-         field(1, 1) + field(2, field(2, field(1, 4) + field(
-             2, u"länge".encode("utf-8")))) + field(5, 16) + CHECKSUM),
-    case("the number of data files as text, after the number",
-         header=HEADER + field(1, b"ab")),
-    case("the byte order as text", header=HEADER + field(2, b"\x01")),
-    case("the version as a number", header=HEADER + field(3, 7)),
-    case("in the version: its numbers as text and in fixed widths",
-         header=HEADER + field(3, field(1, b"ab") + field(2, b"\x05") +
-                               fixed32(3, struct.pack("<I", 1)) +
-                               fixed64(3, struct.pack("<Q", 1)) +
-                               fixed32(2, struct.pack("<I", 9)))),
-    # ... which leaves the entry without the field
-    case("the size only as text",
-         field(1, 1) + field(2, DIMENSION) + field(5, b"\x10") + CHECKSUM,
-         damage("has 0 bytes; its shape (4,) needs 16")),
-    case("the shape only as a number",
-         field(1, 1) + field(2, 7) + field(5, 16) + CHECKSUM,
-         damage("has 16 bytes; its shape () needs 4")),
-    case("the checksum only as a number",
-         field(1, 1) + field(2, DIMENSION) + field(5, 16) + field(6, 5),
-         damage("does not have the checksum that is stored with it")),
-    case("the number of data files only as text", header=field(1, b"ab"),
-         ours=(FileNotFoundError, "ckpt.data-00000-of-00000")),
-
-    # a message that is there twice counts as one, and of a number
-    # that is there twice the last one
-    case("the shape twice: the dimensions of both",
-         FOUR + field(2, field(2, field(1, 1))), FIRST.reshape(4, 1)),
-    case("numbers twice: the last ones",
-         field(1, 2) + field(5, 99) + field(4, 7) + FOUR + field(4, 0)),
-    case("the size of a dimension twice: the last one",
-         field(1, 1) + field(2, field(2, field(1, 9) + field(1, 4))) +
-         field(5, 16) + CHECKSUM),
-    case("the checksum twice: the last one",
-         field(1, 1) + field(2, DIMENSION) + field(5, 16) +
-         fixed32(6, b"abcd") + CHECKSUM),
-    case("the unknown rank twice: the last one",
-         field(1, 1) + field(2, DIMENSION + field(3, 1) + field(3, 0)) +
-         field(5, 16) + CHECKSUM),
-    case("the version twice: the last numbers",
-         header=HEADER + field(3, field(2, 5)) + field(3, field(2, 0))),
-    case("the version twice: the lists of both",
-         header=HEADER + field(3, field(3, 1)) + field(3, field(1, 4)),
-         ours=OTHER_VERSION),
-
-    # a number has the width of its field: 32 bits for the type, the
-    # data file and the versions, 64 for sizes; all are signed, and of
-    # a number of ten bytes 64 bits count
-    case("of the type the low 32 bits", field(1, 2 ** 32 + 1) + REST),
-    case("of the number of the data file the low 32 bits",
-         FOUR + field(3, 2 ** 32)),
-    case("of the number of data files the low 32 bits",
-         header=field(1, 2 ** 32 + 1)),
-    case("of the byte order the low 32 bits",
-         header=HEADER + field(2, 2 ** 32)),
-    case("of a type of ten bytes 64 bits",
-         b"\x08\x81" + b"\x80" * 8 + b"\x7e" + REST),
-    case("of a size of ten bytes 64 bits",
-         field(1, 1) + field(2, DIMENSION) + b"\x28\x90" + b"\x80" * 8 +
-         b"\x7e" + CHECKSUM),
-    case("the type -1", field(1, 2 ** 32 - 1) + REST,
-         not_supported("tensorflow.DataType -1")),
-    case("the data file -1", FOUR + field(3, 2 ** 32 - 1),
-         (FileNotFoundError, "ckpt.data--0001-of-00001")),
-    case("a negative size",
-         field(1, 1) + field(2, DIMENSION) + field(5, 2 ** 64 - 1) + CHECKSUM,
-         damage()),
-    case("a negative offset", FOUR + field(4, 2 ** 63), damage()),
-    case("a dimension of negative size",
-         field(1, 1) + field(2, field(2, field(1, 2 ** 64 - 1))) +
-         field(5, 16) + CHECKSUM, damage()),
-
-    # the versions: this reader is one of version 1, as TensorFlow's
-    case("version: as TensorFlow writes it", header=version()),
-    case("version: producer 0", header=version(producer=0)),
-    case("version: producer 7", header=version(producer=7)),
-    case("version: producer 2**32 + 5", header=version(producer=2 ** 32 + 5)),
-    case("version: for readers from 1", header=version(consumer=1)),
-    case("version: for readers from -1, in ten bytes",
-         header=version(consumer=2 ** 64 - 1)),
-    case("version: for readers from -1, in five bytes",
-         header=version(consumer=2 ** 32 - 1)),
-    case("version: for readers from 2**32",
-         header=version(consumer=2 ** 32)),
-    case("version: not for readers 2 and 5",
-         header=version(bad=field(3, 2) + field(3, 5))),
-    case("version: not for readers 2 and 300, in one field",
-         header=version(bad=field(3, varint(2) + varint(300)))),
-    case("version: not for reader -1",
-         header=version(bad=field(3, 2 ** 64 - 1))),
-    case("version: not for reader 2, in ten bytes",
-         header=version(bad=field(3, b"\x82" + b"\x80" * 8 + b"\x7e"))),
-    case("version: for readers from 2", header=version(consumer=2),
-         ours=OTHER_VERSION),
-    case("version: for readers from 999", header=version(consumer=999),
-         ours=OTHER_VERSION),
-    case("version: for readers from 2**32 + 2",
-         header=version(consumer=2 ** 32 + 2), ours=OTHER_VERSION),
-    case("version: not for reader 1", header=version(bad=field(3, 1)),
-         ours=OTHER_VERSION),
-    case("version: not for readers 3 and 1",
-         header=version(bad=field(3, 3) + field(3, 1)), ours=OTHER_VERSION),
-    case("version: not for readers 7 and 1, in one field",
-         header=version(bad=field(3, varint(7) + varint(1))),
-         ours=OTHER_VERSION),
-    case("version: not for reader 2**32 + 1",
-         header=version(bad=field(3, 2 ** 32 + 1)), ours=OTHER_VERSION),
-    case("version: not for reader 2**32 + 1, in one field",
-         header=version(bad=field(3, varint(2 ** 32 + 1))),
-         ours=OTHER_VERSION),
-    case("version: producer -1, in ten bytes",
-         header=version(producer=2 ** 64 - 1), ours=OTHER_VERSION),
-    case("version: producer -1, in five bytes",
-         header=version(producer=2 ** 32 - 1), ours=OTHER_VERSION),
-    case("version: producer -2**31", header=version(producer=2 ** 31),
-         ours=OTHER_VERSION),
-
-    # what is no message
-    case("a number that does not end",
-         field(1, 1) + b"\x28" + b"\xff" * 20, damage()),
-    case("a number of eleven bytes",
-         field(1, 1) + b"\x28" + b"\x80" * 10 + b"\x01" + REST, damage()),
-    case("a field that goes beyond the message",
-         FOUR + field(16, b"abcdef")[:-2], damage()),
-    case("a shape that is no message", FOUR + field(2, b"\x12\x05ab"),
-         damage()),
-    case("a dimension that is no message",
-         FOUR + field(2, field(2, b"\x08")), damage()),
-    case("field number 0", FOUR + b"\x00\x01", damage()),
-    case("field number 0 with text", FOUR + b"\x02\x01a", damage()),
-    case("a kind of field that does not exist",
-         FOUR + varint((9 << 3) | 6) + b"\x01", damage()),
-    case("the end of a group", FOUR + varint((9 << 3) | 4), damage()),
-    case("the checksum cut short", FOUR[:-1], damage()),
-    case("the name of a dimension that is not text",
-         field(1, 1) + field(2, field(2, field(1, 4) + field(
-             2, b"\xff\xfe"))) + field(5, 16) + CHECKSUM, damage()),
-    case("a header that is no message", header=HEADER + b"\x18",
-         ours=BAD_HEADER),
-    case("a version that is no message", header=HEADER + field(3, b"\x08"),
-         ours=BAD_HEADER),
-    case("a list of versions that is cut short",
-         header=HEADER + field(3, field(3, b"\x80")), ours=BAD_HEADER),
-    case("a list of versions with a number of eleven bytes",
-         header=HEADER + field(3, field(3, b"\xff" * 10 + b"\x01")),
-         ours=BAD_HEADER),
-
-    # strings
-    case("no strings", entry(7, (0,), AT_NO_STRINGS, 4, NO_STRINGS_CRC),
-         np.array([], dtype=object), dtype="string"),
-    case("three strings",
-         entry(7, (3,), AT_THREE_STRINGS, 10, THREE_STRINGS_CRC),
-         np.array([b"a", b"bc", b""], dtype=object), dtype="string"),
-
-    # where this reader is the stricter one: TensorFlow reads these
-    # files, which no writer makes
-    case("a group", FOUR + varint((9 << 3) | 3) + varint((9 << 3) | 4),
-         damage(), stricter=True),
-    case("a field number of more than 32 bits",
-         FOUR + varint(2 ** 32 + (15 << 3)) + b"\x03", damage(),
-         stricter=True),
-    case("the rank unknown",
-         field(1, 1) + field(2, DIMENSION + field(3, 1)) + field(5, 16) +
-         CHECKSUM, not_supported("has no known shape"), stricter=True),
-    case("33 dimensions",
-         field(1, 1) + field(2, DIMENSION + field(2, field(1, 1)) * 32) +
-         field(5, 16) + CHECKSUM, not_supported("has 33 dimensions"),
-         stricter=True),
-    case("32 dimensions",
-         field(1, 1) + field(2, DIMENSION + field(2, field(1, 1)) * 31) +
-         field(5, 16) + CHECKSUM, FIRST.reshape((4,) + (1,) * 31)),
-    case("big endian", header=HEADER + field(2, 1),
-         ours=not_supported("was not written on a little endian machine"),
-         stricter=True),
-    case("a byte order that does not exist", header=HEADER + field(2, 2),
-         ours=not_supported("was not written on a little endian machine"),
-         stricter=True),
-    case("saved in slices", FOUR + field(7, field(1, b"")),
-         not_supported("was saved in slices"), stricter=True),
-    case("no strings, and no checksum of their lengths",
-         entry(7, (0,), AT_NO_STRINGS, 0, 0), BAD_STRINGS, stricter=True,
-         dtype="string"),
-    case("no strings in a larger size",
-         entry(7, (0,), AT_NO_STRINGS, 14, NO_STRINGS_CRC), BAD_STRINGS,
-         stricter=True, dtype="string"),
-    case("three strings in a larger size",
-         entry(7, (3,), AT_THREE_STRINGS, 12, THREE_STRINGS_CRC), BAD_STRINGS,
-         stricter=True, dtype="string"),
-    case("three strings in a smaller size",
-         entry(7, (3,), AT_THREE_STRINGS, 5, THREE_STRINGS_CRC), BAD_STRINGS,
-         stricter=True, dtype="string"),
-    case("the length of a string in ten bytes, with bits beyond the 64th",
-         entry(7, (1,), AT_ODD_STRING, 16, ODD_STRING_CRC), BAD_STRINGS,
-         stricter=True, dtype="string"),
-]
-assert len({message.name for message in MESSAGES}) == len(MESSAGES)
-
-
-def write_case(prefix, message):
-    with open(prefix + ".data-00000-of-00001", "wb") as fh:
-        fh.write(DATA)
-    with open(prefix + ".index", "wb") as fh:
-        fh.write(table([(b"", message.header), (b"x", message.entry)]))
-    return prefix
-
-
-@pytest.mark.parametrize("message", MESSAGES,
-                         ids=[message.name for message in MESSAGES])
-def test_messages_of_the_index(tmp_path, message):
-    """
-        The header and the entries of the index are protocol buffer
-        messages, and TensorFlow reads them as protocol buffers do. So
-        does this reader, for what the messages say is read as
-        TensorFlow reads it or not at all: a field counts when it has
-        the kind its message gives it and is passed over otherwise, a
-        number has the width and the sign of its field, of a field
-        that is there twice the last one counts, and what is no
-        message is damage. (That TensorFlow reads these files the
-        same is tested below, where it is installed.)
-    """
-
-    prefix = write_case(str(tmp_path / "ckpt"), message)
-    if isinstance(message.ours, np.ndarray):
-        assert_same_tensor(Checkpoint(prefix).get_tensor("x"), message.ours)
-        return
-    error, text = message.ours
-    with pytest.raises(error) as failure:
-        Checkpoint(prefix).get_tensor("x")
-    assert type(failure.value) is error
-    assert text in str(failure.value)
 
 
 def test_fields_that_are_zero_may_be_written(tmp_path):
@@ -1532,6 +1167,9 @@ def test_weights_by_the_object_graph(tmp_path):
     nodes[3] = field(2, 9) + \
         field(2, field(1, b"OTHER") + field(3, b"no tensor")) + \
         attribute("conv/bias", BIAS)
+    # (a slot variable of the optimizer whose numbers are text)
+    nodes[4] += field(3, field(1, b"\x07") + field(2, b"m") +
+                      fixed32(3, b"abcd"))
     assert_weights(object_graph(nodes) + field(1, 3) + fixed32(1, b"abcd"))
 
     # a child without the number of its object is the first object,
@@ -1546,7 +1184,9 @@ def test_object_graph_that_is_not_one(tmp_path):
     """
         An object graph that is not what the format says is damage and
         reported as such (an error of the kind the tools report), not
-        as an index out of range or a missing key
+        as an index out of range or a missing key. The whole graph is
+        read: also the objects that do not lead to the weights, as the
+        class does with which TensorFlow reads it.
     """
 
     good = graph_nodes()
@@ -1579,16 +1219,14 @@ def test_object_graph_that_is_not_one(tmp_path):
         "a variable without the name of its tensor": (
             changed(2, field(2, field(1, b"VARIABLE_VALUE") +
                              field(2, b"conv/kernel"))),
-            "a variable without its name ('conv/kernel') or without the "
-            "name of its tensor ('')"),
+            "a variable (conv/kernel) without the name of its tensor"),
         "a variable with a number for the name of its tensor": (
             changed(2, field(2, field(1, b"VARIABLE_VALUE") +
                              field(2, b"conv/kernel") + field(3, 5))),
-            "or without the name of its tensor ('')"),
-        "a variable without its name": (
-            changed(2, field(2, field(1, b"VARIABLE_VALUE") +
-                             field(3, KERNEL.encode("utf-8")))),
-            "a variable without its name ('')"),
+            "a variable (conv/kernel) without the name of its tensor"),
+        "a variable without a name and without the name of its tensor": (
+            changed(3, field(2, field(1, b"VARIABLE_VALUE"))),
+            "a variable (bias) without the name of its tensor"),
         "a name that is not text": (
             changed(0, field(1, field(1, 1) + field(2, layer + b"\xff"))),
             "codec can't decode"),
@@ -1604,7 +1242,70 @@ def test_object_graph_that_is_not_one(tmp_path):
             changed(0, field(1, b"\x12\x05ab")), "Truncated"),
         "a variable that is no message": (
             changed(2, field(2, b"\x0a\x7f")), "Truncated"),
+        # what follows the first variable of an object is read too
+        "something after a variable": (
+            changed(2, good[2] + b"\x00"), "field number 0"),
+        "a second variable that is no message": (
+            changed(2, good[2] + field(2, b"\x0a\x7f")), "Truncated"),
+        # ... and the objects that do not lead to the weights: the
+        # optimizer, its variable, the slot variables of an optimizer,
+        # the fields of later TensorFlow versions
+        "something after the optimizer": (
+            changed(4, good[4] + b"\x00"), "field number 0"),
+        "a child of the optimizer that is not there": (
+            changed(4, good[4] + reference("beta", 999)),
+            "an object refers to object 999 of 6"),
+        "the name of a child of the optimizer that is not text": (
+            changed(4, field(1, field(1, 5) + field(2, b"\xff"))),
+            "codec can't decode"),
+        "the tensor of the optimizer's variable that is not text": (
+            changed(5, field(2, field(1, b"VARIABLE_VALUE") +
+                             field(2, b"Adam/iter") + field(3, b"\xff"))),
+            "codec can't decode"),
+        "a slot variable for a variable that is not there": (
+            changed(4, good[4] + field(3, field(1, 6) + field(2, b"m") +
+                                       field(3, 5))),
+            "an object refers to object 6 of 6"),
+        "a slot variable that is not there": (
+            changed(4, good[4] + field(3, field(1, 2) + field(2, b"m") +
+                                       field(3, 2 ** 32 - 1))),
+            "an object refers to object -1 of 6"),
+        "the name of a slot that is not text": (
+            changed(4, good[4] + field(3, field(1, 2) + field(2, b"\xfe") +
+                                       field(3, 5))),
+            "codec can't decode"),
+        "a slot variable that is no message": (
+            changed(4, good[4] + field(3, b"\x08")), "Truncated"),
+        "the name of a saver that is not text": (
+            changed(1, good[1] + field(4, field(1, b"\xff"))),
+            "codec can't decode"),
+        "a saver that is no message": (
+            changed(1, good[1] + field(4, b"\x0a\x05a")), "Truncated"),
+        "a mark of values that is no message": (
+            changed(1, good[1] + field(5, b"\x08")), "Truncated"),
+        # what TensorFlow would restore from is not clear, and no
+        # writer makes it: two children of one name, two values of
+        # one variable
+        "two layers of one name": (
+            changed(0, good[0] + reference("layer_with_weights-0", 4)),
+            "an object has two children named 'layer_with_weights-0'"),
+        "two variables of one name": (
+            changed(1, good[1] + reference("kernel", 3)),
+            "an object has two children named 'kernel'"),
+        "two children of the optimizer of one name": (
+            changed(4, good[4] + reference("iter", 5)),
+            "an object has two children named 'iter'"),
+        "a variable with two values": (
+            changed(2, good[2] + attribute("x/y", BIAS)),
+            "a variable (conv/kernel) with 2 values"),
+        "a field number in two bytes": (
+            changed(4, b"\x8a\x00" + good[4][1:]),
+            "in more bytes than it needs"),
+        "a length in six bytes": (
+            changed(4, good[4][:1] + b"\x88\x80\x80\x80\x80\x00" +
+                    good[4][2:]), "in more bytes than it needs"),
     }
+    assert good[4][:2] == b"\x0a\x08"
     for name, (graph, text) in wrong.items():
         model = saved_model_with(tmp_path, graph)
         with pytest.raises(CorruptCheckpointError) as failure:
@@ -1629,6 +1330,63 @@ def test_object_graph_that_is_not_one(tmp_path):
         with pytest.raises(UnsupportedModelError,
                            match="variable conv/bias holds text"):
             loading.read_weights(model)
+
+    # a variable of a layer that has no name (TensorFlow writes none
+    # for a variable that was made with an empty name): which layer it
+    # belongs to cannot be told, and it is said so
+    for graph in (changed(2, field(2, field(1, b"VARIABLE_VALUE") +
+                                   field(3, KERNEL.encode("utf-8")))),
+                  changed(2, attribute("", KERNEL))):
+        model = saved_model_with(tmp_path, graph)
+        with pytest.raises(UnsupportedModelError) as failure:
+            loading.read_weights(model)
+        assert "a variable of a layer has no name (its tensor is {})".format(
+            KERNEL) in str(failure.value)
+    # ... the unnamed variable of the optimizer does not matter
+    assert sorted(loading.read_weights(saved_model_with(
+        tmp_path, changed(5, attribute("", STEP))))) == ["conv"]
+
+    # two layers whose variables have the same names: the weights are
+    # filed by name, so they cannot be told apart
+    nodes = list(good)
+    nodes[0] = good[0] + reference("layer_with_weights-1", 6)
+    nodes.append(reference("kernel", 7))
+    nodes.append(attribute("conv/kernel", BIAS))
+    model = saved_model_with(tmp_path, object_graph(nodes))
+    with pytest.raises(CorruptCheckpointError,
+                       match="has two variables kernel of a layer conv"):
+        loading.read_weights(model)
+    # (with a name of its own the second layer is read)
+    nodes[7] = attribute("dense/kernel", BIAS)
+    weights = loading.read_weights(saved_model_with(
+        tmp_path, object_graph(nodes)))
+    assert sorted(weights) == ["conv", "dense"]
+    assert_same_tensor(weights["dense"]["kernel"], graph_tensors()[BIAS])
+
+
+def test_objects_of_the_graph():
+    """
+        What the reader takes from an object graph: for every object
+        its children and its attributes
+    """
+
+    good = graph_nodes()
+    more = good[4] + field(3, field(1, 2) + field(2, b"m") + field(3, 5)) + \
+        field(4, field(1, b"saver") + field(2, b"object")) + \
+        field(5, field(1, 1)) + field(9, b"unknown")
+    objects = loading._objects_in_object_graph(memoryview(
+        object_graph(good[:4] + [more] + good[5:])))
+    assert objects == [
+        ([("layer_with_weights-0", 1), ("layer-1", 1), ("optimizer", 4)], []),
+        ([("kernel", 2), ("bias", 3)], []),
+        ([], [("VARIABLE_VALUE", "conv/kernel", KERNEL)]),
+        ([], [("VARIABLE_VALUE", "conv/bias", BIAS)]),
+        ([("iter", 5)], []),
+        ([], [("VARIABLE_VALUE", "Adam/iter", STEP)]),
+    ]
+    assert loading._variables_in_object_graph(memoryview(
+        object_graph(good))) == [("kernel", "conv/kernel", KERNEL),
+                                 ("bias", "conv/bias", BIAS)]
 
 
 # --------------------------------------------------------------------
@@ -1660,94 +1418,6 @@ def assert_as_tensorflow_reads(tf, prefix):
             assert_same_tensor(found, expected)
             kinds.add(expected.dtype.name)
     return kinds
-
-
-#: what TensorFlow restores from the checkpoints of a list, written
-#: down one by one; the program of a process of its own (below)
-TENSORFLOW_READS = r'''
-import json
-import sys
-
-import tensorflow as tf
-
-tasks = json.load(open(sys.argv[1]))
-with open(sys.argv[3], "a") as out:
-    for number in range(int(sys.argv[2]), len(tasks)):
-        prefix, dtype, how = tasks[number]
-        out.write(json.dumps({"task": number}) + "\n")
-        out.flush()
-        try:
-            if how == "restore":
-                # what restores the variables of a model
-                tensor = tf.raw_ops.RestoreV2(
-                    prefix=prefix, tensor_names=["x"], shape_and_slices=[""],
-                    dtypes=[getattr(tf, dtype)])[0]
-            else:
-                # the reader of tf.train.load_checkpoint
-                tensor = tf.constant(
-                    tf.train.load_checkpoint(prefix).get_tensor("x"))
-            flat = tf.reshape(tensor, [-1]).numpy()
-            if flat.dtype == object:
-                values = [bytes(value).hex() for value in flat.tolist()]
-            else:
-                values = flat.tobytes().hex()
-            result = {"shape": tensor.shape.as_list(),
-                      "dtype": str(flat.dtype), "values": values}
-        except Exception as error:
-            result = {"error": "{}: {}".format(
-                type(error).__name__, error)[:400]}
-        result["task"] = number
-        out.write(json.dumps(result) + "\n")
-        out.flush()
-'''
-
-
-def tensorflow_reads(tasks, work_dir):
-    """
-        What TensorFlow reads from each checkpoint of a list, in
-        processes of their own: on some files TensorFlow ends the
-        process (the reading goes on after such a file in a new one).
-
-        Args:
-            tasks (list): (path of the checkpoint, type of its tensor
-                'x', "restore" for the operation that restores the
-                variables of a model or "reader" for the reader of
-                tf.train.load_checkpoint)
-            work_dir (str): a directory for the files of the exchange
-
-        Returns:
-            list: for each task {"shape", "dtype", "values"}, or
-                {"error": the error TensorFlow raised}, or {"ended":
-                the exit status of the process that TensorFlow ended}
-    """
-
-    tasks_path = os.path.join(work_dir, "tasks.json")
-    out_path = os.path.join(work_dir, "read.jsonl")
-    with open(tasks_path, "w") as fh:
-        json.dump(tasks, fh)
-    env = dict(os.environ, CUDA_VISIBLE_DEVICES="", TF_CPP_MIN_LOG_LEVEL="3")
-    results, start = {}, 0
-    while start < len(tasks):
-        done = subprocess.run(
-            [sys.executable, "-c", TENSORFLOW_READS, tasks_path, str(start),
-             out_path], env=env, stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE, timeout=1800)
-        problem = done.stderr.decode("utf-8", "replace")[-2000:]
-        assert os.path.isfile(out_path), problem
-        with open(out_path) as fh:
-            for line in fh:
-                line = json.loads(line)
-                results.setdefault(line["task"], {}).update(line)
-        assert results and max(results) >= start, problem
-        last = max(results)
-        if len(results[last]) == 1:
-            # announced and not read: the process ended on it
-            assert done.returncode != 0, problem
-            results[last]["ended"] = done.returncode
-        else:
-            assert done.returncode == 0 and last == len(tasks) - 1, problem
-        start = last + 1
-    return [results[number] for number in range(len(tasks))]
 
 
 @pytest.mark.parametrize("directory", sorted(FIXTURE_MODELS))
@@ -1801,48 +1471,3 @@ def test_checkpoint_that_tensorflow_writes_here(tf, tmp_path):
     size, position = checkpoint._number(footer, position)
     blocks = checkpoint._entries(index[offset:offset + size], "index")
     assert len(blocks) > 1
-
-
-def test_messages_of_the_index_as_tensorflow_reads_them(tf, tmp_path):
-    """
-        The checkpoints of test_messages_of_the_index, read by the
-        TensorFlow that is installed: what this reader reads,
-        TensorFlow reads the same, with the operation that restores
-        the variables of a model and with the reader of
-        tf.train.load_checkpoint; what this reader refuses, TensorFlow
-        refuses too, but for the cases marked as stricter here, which
-        it reads.
-    """
-
-    tasks, cases = [], []
-    for number, message in enumerate(MESSAGES):
-        directory = tmp_path / "case_{:03d}".format(number)
-        directory.mkdir()
-        prefix = write_case(str(directory / "ckpt"), message)
-        read_here = isinstance(message.ours, np.ndarray)
-        for how in ("restore", "reader") if read_here else ("restore",):
-            tasks.append([prefix, message.dtype, how])
-            cases.append((message, how))
-    results = tensorflow_reads(tasks, str(tmp_path))
-
-    counts = collections.Counter()
-    for (message, how), result in zip(cases, results):
-        where = (message.name, how, result)
-        if isinstance(message.ours, np.ndarray):
-            assert "values" in result, where
-            assert result["shape"] == list(message.ours.shape), where
-            if message.ours.dtype == object:
-                assert result["values"] == [
-                    value.hex() for value in message.ours.reshape(-1)], where
-            else:
-                assert result["dtype"] == message.ours.dtype.name, where
-                assert result["values"] == message.ours.tobytes().hex(), where
-            counts["the same"] += 1
-        elif message.stricter:
-            assert "values" in result, where
-            counts["read by TensorFlow only"] += 1
-        else:
-            assert "values" not in result, where
-            counts["refused by both"] += 1
-    assert sorted(counts) == ["read by TensorFlow only", "refused by both",
-                              "the same"]

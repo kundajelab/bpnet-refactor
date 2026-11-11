@@ -36,6 +36,24 @@ def field(number, value):
     return varint((number << 3) | 2) + varint(len(value)) + value
 
 
+def fixed32(number, data):
+    """
+        A field of four bytes
+    """
+
+    assert len(data) == 4
+    return varint((number << 3) | 5) + data
+
+
+def fixed64(number, data):
+    """
+        A field of eight bytes
+    """
+
+    assert len(data) == 8
+    return varint((number << 3) | 1) + data
+
+
 def test_fields_of_a_message():
     message = field(1, 5) + field(2, b"abc") + field(300, 2 ** 40 + 3) + \
         field(7, b"") + varint((4 << 3) | 5) + b"\x01\x02\x03\x04" + \
@@ -111,6 +129,21 @@ def test_truncated_or_foreign_data_is_not_read_as_a_message():
                  varint(2 ** 32 + (15 << 3)) + b"\x03"):
         with pytest.raises(ValueError, match="field number"):
             list(loading._fields(memoryview(data)))
+    # a field number with its kind, and a length, are written in as
+    # few bytes as they need (the readers of protocol buffers do not
+    # agree on other ways of writing them)
+    for data in (b"\x88\x00\x01", b"\x88\x80\x80\x80\x80\x00\x01",
+                 b"\x88" + b"\x80" * 8 + b"\x02\x01",
+                 b"\x12\x83\x00abc", b"\x12\x83\x80\x80\x80\x80\x00abc"):
+        with pytest.raises(ValueError, match="in more bytes than it needs"):
+            list(loading._fields(memoryview(data)))
+    assert [(n, k, bytes(v)) for n, k, v in loading._fields(memoryview(
+        b"\x12\x80\x01" + bytes(128)))] == [(2, 2, bytes(128))]
+    # a field has less than 2 GB
+    for length, message in ((2 ** 31 - 16, "a field of 2147483632 bytes"),
+                            (2 ** 31 - 17, "Truncated")):
+        with pytest.raises(ValueError, match=message):
+            list(loading._fields(memoryview(b"\x12" + varint(length))))
 
 
 def keras_json(layers=()):
@@ -215,3 +248,33 @@ def test_paths_that_are_not_saved_models(tmp_path):
     with pytest.raises(loading.UnsupportedModelError,
                        match="MyModel model without a layer graph"):
         loading.read_architecture(str(tmp_path / "subclassed"))
+
+
+def test_hdf5_files_that_do_not_hold_weights(tmp_path):
+    h5py = pytest.importorskip("h5py")
+    path = str(tmp_path / "other.h5")
+    with h5py.File(path, "w") as f:
+        f.create_dataset("x", data=[1, 2])
+    with pytest.raises(loading.UnsupportedModelError,
+                       match="it has no 'model_weights'"):
+        loading.read_weights(path)
+    # a layer that lists weights it does not have
+    with h5py.File(path, "w") as f:
+        layer = f.create_group("model_weights").create_group("conv")
+        layer.attrs["weight_names"] = [b"conv/kernel:0", b"conv/bias:0"]
+        layer.create_group("conv").create_dataset("kernel:0", data=[1.0])
+    with pytest.raises(ValueError) as failure:
+        loading.read_weights(path)
+    assert "layer conv lists the weights conv/bias:0 and does not have " \
+        "them" in str(failure.value)
+    with h5py.File(path, "a") as f:
+        f["model_weights/conv/conv"].create_dataset("bias:0", data=[2.0])
+    weights = loading.read_weights(path)
+    assert sorted(weights) == ["conv"]
+    assert {name: value.tolist() for name, value in
+            weights["conv"].items()} == {"kernel": [1.0], "bias": [2.0]}
+    # not an HDF5 file
+    with open(path, "wb") as fh:
+        fh.write(b"something else")
+    with pytest.raises(OSError):
+        loading.read_weights(path)

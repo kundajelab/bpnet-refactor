@@ -71,6 +71,29 @@ def _varint(buffer, position):
 
 #: the kinds of field of the protocol buffer wire format ("wire types")
 _VARINT, _FIXED64, _BYTES, _FIXED32 = 0, 1, 2, 5
+#: the longest field that protocol buffer readers take
+_LONGEST = 0x7FFFFFFF - 16
+
+
+def _prefix(buffer, position):
+    """
+        What a field starts with: its number with its kind, or its
+        length. A varint that fits 32 bits, written in as few bytes as
+        it needs: the readers of protocol buffers do not agree on
+        longer ones (one reads a field number of ten bytes, another
+        refuses one of six), and no writer makes them.
+
+        Returns:
+            tuple: (value, position after it)
+    """
+
+    value, after = _varint(buffer, position)
+    if after - position > 5 or value >> 32 or \
+            (after - position > 1 and buffer[after - 1] == 0):
+        raise ValueError(
+            "Not a protocol buffer message (a field number or a length "
+            "of more than 32 bits, or in more bytes than it needs)")
+    return value, after
 
 
 def _int32(value):
@@ -107,16 +130,19 @@ def _fields(buffer):
 
     position, end = 0, len(buffer)
     while position < end:
-        key, position = _varint(buffer, position)
+        key, position = _prefix(buffer, position)
         number, wire_type = key >> 3, key & 7
-        if key >> 32 or number == 0:
+        if number == 0:
             raise ValueError(
-                "Not a protocol buffer message (field number {})".format(
-                    number))
+                "Not a protocol buffer message (field number 0)")
         if wire_type == 0:
             value, position = _varint(buffer, position)
         elif wire_type == 2:
-            length, position = _varint(buffer, position)
+            length, position = _prefix(buffer, position)
+            if length > _LONGEST:
+                raise ValueError(
+                    "Not a protocol buffer message (a field of {} "
+                    "bytes)".format(length))
             value = buffer[position:position + length]
             position += length
         elif wire_type in (1, 5):
@@ -309,6 +335,21 @@ def _weights_in_saved_model(path):
 
     found = {}
     for variable_name, full_name, checkpoint_key in variables:
+        layer = full_name.rsplit("/", 1)[0]
+        if variable_name in found.get(layer, {}):
+            # (the weights are filed by name: two layers of one name
+            # cannot be told apart, and keras does not write them)
+            raise CorruptCheckpointError(
+                "{}: its object graph has two variables {} of a layer "
+                "{}".format(reader.index_path, variable_name, layer))
+        if not full_name:
+            # (TensorFlow writes none for a variable that was made
+            # with an empty name; the layers of this package name
+            # their variables)
+            raise UnsupportedModelError(
+                "{}: a variable of a layer has no name (its tensor is "
+                "{}), so the layer it belongs to cannot be told".format(
+                    reader.index_path, checkpoint_key))
         if checkpoint_key not in reader:
             raise CorruptCheckpointError(
                 "{} has no tensor {}, which its object graph names "
@@ -319,17 +360,103 @@ def _weights_in_saved_model(path):
             raise UnsupportedModelError(
                 "{}: variable {} holds text, not numbers".format(
                     reader.index_path, full_name))
-        layer = full_name.rsplit("/", 1)[0]
         found.setdefault(layer, {})[variable_name] = value
     return found
+
+
+def _text(value):
+    return bytes(value).decode("utf-8")
+
+
+def _objects_in_object_graph(object_graph):
+    """
+        The objects of the object graph of a checkpoint
+        (TrackableObjectGraph), each with its children and its
+        attributes. The whole graph is read and checked, not only the
+        part that leads to the weights: every message in it is one,
+        every text is text, every reference is to an object of the
+        graph, and the children of an object have names of their own.
+
+        Returns:
+            list: for every object (children, attributes), the
+                children as (name, number of the object), the
+                attributes as (name, full name of the variable, name
+                of its tensor in the checkpoint)
+
+        Raises:
+            ValueError: the graph is not what the format says
+    """
+
+    objects, references = [], []
+    # TrackableObjectGraph.nodes
+    for number, kind, node in _fields(object_graph):
+        if number != 1 or kind != _BYTES:
+            continue
+        children, attributes = [], []
+        for field, field_kind, value in _fields(node):
+            if field_kind != _BYTES:
+                continue
+            if field == 1:
+                # children: node_id, local_name
+                node_id, local_name = 0, ""
+                for part, part_kind, part_value in _fields(value):
+                    if part == 1 and part_kind == _VARINT:
+                        node_id = _int32(part_value)
+                    elif part == 2 and part_kind == _BYTES:
+                        local_name = _text(part_value)
+                if any(local_name == name for name, _ in children):
+                    # (TensorFlow restores the first of them, or
+                    # both: no writer makes them)
+                    raise ValueError(
+                        "an object has two children named {!r}".format(
+                            local_name))
+                children.append((local_name, node_id))
+                references.append(node_id)
+            elif field == 2:
+                # attributes: name, full_name, checkpoint_key
+                texts = {1: "", 2: "", 3: ""}
+                for part, part_kind, part_value in _fields(value):
+                    if part in texts and part_kind == _BYTES:
+                        texts[part] = _text(part_value)
+                attributes.append((texts[1], texts[2], texts[3]))
+            elif field == 3:
+                # slot_variables: original_variable_node_id, slot_name,
+                # slot_variable_node_id
+                ids = {1: 0, 3: 0}
+                for part, part_kind, part_value in _fields(value):
+                    if part in ids and part_kind == _VARINT:
+                        ids[part] = _int32(part_value)
+                    elif part == 2 and part_kind == _BYTES:
+                        _text(part_value)
+                references.extend(ids.values())
+            elif field == 4:
+                # registered_saver: name, object_name (TensorFlow 2.8
+                # and later)
+                for part, part_kind, part_value in _fields(value):
+                    if part in (1, 2) and part_kind == _BYTES:
+                        _text(part_value)
+            elif field == 5:
+                # has_checkpoint_values: a message of one number
+                # (TensorFlow 2.9 and later)
+                for _ in _fields(value):
+                    pass
+        objects.append((children, attributes))
+    if not objects:
+        raise ValueError("it has no objects")
+    for node_id in references:
+        if not 0 <= node_id < len(objects):
+            raise ValueError("an object refers to object {} of {}".format(
+                node_id, len(objects)))
+    return objects
 
 
 def _variables_in_object_graph(object_graph):
     """
         The variables of the layers with weights in the object graph
-        of a checkpoint (TrackableObjectGraph): its first object is
-        the model, which refers to its layers with weights, each of
-        which refers to its variables
+        of a checkpoint: its first object is the model, which refers
+        to its layers with weights ('layer_with_weights-<i>'), each of
+        which refers to its variables. (The models of this package:
+        a layer that is itself a model with layers is not followed.)
 
         Returns:
             list: for each variable (its name in the layer, its full
@@ -339,56 +466,27 @@ def _variables_in_object_graph(object_graph):
             ValueError: the graph is not what the format says
     """
 
-    # TrackableObjectGraph.nodes
-    nodes = [node for number, kind, node in _fields(object_graph)
-             if number == 1 and kind == _BYTES]
-    if not nodes:
-        raise ValueError("it has no objects")
-
-    def children(node):
-        # TrackableObject.children[i]: node_id, local_name
-        found = []
-        for number, kind, reference in _fields(node):
-            if number != 1 or kind != _BYTES:
-                continue
-            node_id, local_name = 0, ""
-            for field_number, field_kind, value in _fields(reference):
-                if field_number == 1 and field_kind == _VARINT:
-                    node_id = _int32(value)
-                elif field_number == 2 and field_kind == _BYTES:
-                    local_name = bytes(value).decode("utf-8")
-            if not 0 <= node_id < len(nodes):
-                raise ValueError(
-                    "an object refers to object {} of {}".format(
-                        node_id, len(nodes)))
-            found.append((local_name, node_id))
-        return found
-
-    def variable(node):
-        # TrackableObject.attributes[i]: name, full_name, checkpoint_key
-        for number, kind, attribute in _fields(node):
-            if number != 2 or kind != _BYTES:
-                continue
-            values = {n: bytes(v).decode("utf-8")
-                      for n, k, v in _fields(attribute)
-                      if n in (1, 2, 3) and k == _BYTES}
-            if values.get(1) == "VARIABLE_VALUE":
-                if not values.get(2) or not values.get(3):
-                    raise ValueError(
-                        "a variable without its name ({!r}) or without "
-                        "the name of its tensor ({!r})".format(
-                            values.get(2, ""), values.get(3, "")))
-                return values[2], values[3]
-        return None
-
+    objects = _objects_in_object_graph(object_graph)
     found = []
-    for local_name, node_id in children(nodes[0]):
+    for local_name, node_id in objects[0][0]:
         if not local_name.startswith("layer_with_weights-"):
             continue
-        for variable_name, variable_id in children(nodes[node_id]):
-            names = variable(nodes[variable_id])
-            if names is not None:
-                found.append((variable_name,) + names)
+        for variable_name, variable_id in objects[node_id][0]:
+            values = [(full_name, checkpoint_key)
+                      for name, full_name, checkpoint_key
+                      in objects[variable_id][1] if name == "VARIABLE_VALUE"]
+            if not values:
+                continue
+            if len(values) > 1:
+                raise ValueError(
+                    "a variable ({}) with {} values".format(
+                        values[0][0] or variable_name, len(values)))
+            full_name, checkpoint_key = values[0]
+            if not checkpoint_key:
+                raise ValueError(
+                    "a variable ({}) without the name of its "
+                    "tensor".format(full_name or variable_name))
+            found.append((variable_name, full_name, checkpoint_key))
     return found
 
 
@@ -397,12 +495,20 @@ def _weights_in_hdf5(path):
 
     found = {}
     with h5py.File(path, "r") as f:
+        if "model_weights" not in f:
+            raise UnsupportedModelError(
+                "{} does not hold the weights of a keras model (it has "
+                "no 'model_weights')".format(path))
         group = f["model_weights"]
         for layer in group:
             names = group[layer].attrs.get("weight_names", [])
             for name in names:
                 if isinstance(name, bytes):
                     name = name.decode("utf-8")
+                if name not in group[layer]:
+                    raise ValueError(
+                        "{}: layer {} lists the weights {} and does not "
+                        "have them".format(path, layer, name))
                 # '<layer>/kernel:0'
                 variable = name.split("/")[-1].split(":")[0]
                 found.setdefault(layer, {})[variable] = \

@@ -12,14 +12,18 @@
     checkpoint: the checksum of every block of the index and of every
     tensor that is read (CRC-32C). A file that is cut short or changed
     is reported, not read as something else: what these files say is
-    read as TensorFlow reads it, or not at all. (For files that no
-    writer makes the reader is the stricter of the two in places,
-    which the tests list.)
+    read as TensorFlow reads it, or not at all. Where the TensorFlow
+    versions do not agree with each other (2.4 and 2.11 read the
+    messages of the index with another protocol buffer reader than
+    2.15), a file is read only if all of them read it the same. For
+    files that no writer makes the reader is therefore the stricter
+    one in places, which the tests list.
 
     What is not supported (and reported as such): variables that were
     saved in slices (partitioned variables), an index with compressed
-    blocks (TensorFlow does not write one), big endian data, tensors
-    of more than 32 dimensions or marked as of unknown shape.
+    blocks (TensorFlow 1.2 and later do not write them), big endian
+    data, tensors of more than 32 dimensions or marked as of unknown
+    shape.
 """
 
 import os
@@ -400,6 +404,7 @@ class Checkpoint(object):
                 elif number == 3 and kind == _BYTES:
                     # VersionDef: producer, min_consumer, bad_consumers
                     # (a list: one field each, or all in one field)
+                    single = False
                     for field, field_kind, part in _fields(value):
                         if field == 1 and field_kind == _VARINT:
                             producer = _int32(part)
@@ -408,10 +413,20 @@ class Checkpoint(object):
                         elif field == 3 and field_kind == _VARINT:
                             bad.append(_int32(part))
                         elif field == 3 and field_kind == _BYTES:
+                            if single:
+                                # (the protocol buffer reader of
+                                # TensorFlow before 2.12 takes the
+                                # length of such a list for a member
+                                # of it, and its members for fields)
+                                raise ValueError(
+                                    "a list of versions right after a "
+                                    "single one, which the TensorFlow "
+                                    "versions read differently")
                             position = 0
                             while position < len(part):
                                 one, position = _varint(part, position)
                                 bad.append(_int32(one))
+                        single = field == 3 and field_kind == _VARINT
         except ValueError as error:
             raise CorruptCheckpointError(
                 "{}: its header cannot be read ({})".format(
@@ -489,12 +504,17 @@ class Checkpoint(object):
                     sliced = True
             if entry["offset"] < 0 or entry["size"] < 0:
                 raise ValueError("a negative offset or size")
+            # (as TensorFlow: the number of elements fits 63 bits
+            # after every dimension, also when a later one is 0)
             count = 1
             for size in entry["shape"]:
                 if size < 0:
                     raise ValueError("a dimension of unknown or negative "
                                      "size")
                 count *= size
+                if count >> 63:
+                    raise ValueError("a shape of more elements than a "
+                                     "tensor can have")
             entry["count"] = count
         except ValueError as error:
             raise CorruptCheckpointError(
