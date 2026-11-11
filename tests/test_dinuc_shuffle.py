@@ -317,6 +317,27 @@ def test_nothing_waits_for_a_compilation(monkeypatch):
     assert shaputils._compiled_walk() is shaputils._COMPILED_WALK[0]
 
 
+def test_walk_that_another_thread_has_just_compiled_is_used(monkeypatch):
+    """
+        A thread that finds no compiled walk, and gets the lock only
+        after the thread that compiled it has let go, takes that walk
+        and does not compile another
+    """
+
+    class JustReleased(object):
+        def acquire(self, blocking=True):
+            shaputils._COMPILED_WALK.append("the walk of the other thread")
+            return True
+
+        def release(self):
+            pass
+
+    monkeypatch.setattr(shaputils, "_COMPILED_WALK", [])
+    monkeypatch.setattr(shaputils, "_COMPILING", JustReleased())
+    assert shaputils._compiled_walk() == "the walk of the other thread"
+    assert shaputils._COMPILED_WALK == ["the walk of the other thread"]
+
+
 FORKED_WHILE_COMPILING = """
 import os, signal, sys, threading
 import numpy as np
