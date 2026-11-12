@@ -42,7 +42,8 @@ def mean_shap(shaps_list,output_path):
     input_seqs_lst=[]
     # the files that were read
     read=[]
-    for shap_h5 in shaps_list.split(','):
+    given=shaps_list.split(',')
+    for shap_h5 in given:
         try:
             # everything of a fold or nothing of it: a file that
             # cannot be read whole is left out whole
@@ -53,8 +54,14 @@ def mean_shap(shaps_list,output_path):
             # be one of fewer folds for want of memory)
             raise
         except Exception as error:
-            print(f'{shap_h5} does not exist or cannot be read '
-                  f'({type(error).__name__}: {error})')
+            # a fold that is not there or cannot be read is left out
+            # with a warning, and the mean is that of the others. (The
+            # warning is a line on the standard error: one given with
+            # the warnings module is not shown under PYTHONWARNINGS=
+            # ignore, and the mean of fewer folds would be silent.)
+            print(f'WARNING: {shap_h5} does not exist or cannot be read '
+                  f'({type(error).__name__}: {error}): it is left out of '
+                  f'the mean', file=sys.stderr, flush=True)
             continue
         read.append(shap_h5)
         hyp_scores_lst.append(fold[0])
@@ -66,6 +73,9 @@ def mean_shap(shaps_list,output_path):
     if not read:
         sys.exit(f'None of the score files could be read ({shaps_list}): '
                  f'{output_path} is not written')
+    if len(read) < len(given):
+        print(f'WARNING: {output_path} is the mean of {len(read)} of '
+              f'{len(given)} folds', file=sys.stderr, flush=True)
 
     # the folds must be of the same peaks and the same sequences: a
     # mean over anything else would be written under the peaks and the
@@ -80,7 +90,11 @@ def mean_shap(shaps_list,output_path):
                 sys.exit(f'{shap_h5} and {read[0]} do not have the same '
                          f'{what}: {output_path} is not written')
 
-    hyp_scores_mean = np.nanmean(np.array(hyp_scores_lst),axis=0)
+    # in float32: the folds hold their scores in float16, in which
+    # the sum of several folds is rounded at every step (and two
+    # scores of 40,000 add up to infinity)
+    hyp_scores_mean = np.nanmean(np.array(hyp_scores_lst),axis=0,
+                                 dtype=np.float32)
 
     num_examples = hyp_scores_mean.shape[0]
 
