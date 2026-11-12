@@ -8,10 +8,9 @@
 
     The scripts stop with a message rather than write a wrong mean:
     when the folds are not of the same peaks or sequences, and when
-    no fold can be read. One thing they do today is open to question
-    and marked as such in its tests: a fold that is missing or cannot
-    be read is left out of the mean with a message (left out whole:
-    nothing of it is counted), and the mean of the others is written.
+    no fold can be read. A fold that is missing or cannot be read is
+    left out of the mean with a warning (left out whole: nothing of
+    it is counted), and the mean of the others is written.
 """
 
 import os
@@ -33,9 +32,10 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LONG = "chrUn_KI270302v1"
 
 
-def run_script(name, arguments, cwd):
+def run_script(name, arguments, cwd, python_options=()):
     done = subprocess.run(
-        [sys.executable, os.path.join(REPO, "bpnet", "utils", name)] +
+        [sys.executable] + list(python_options) +
+        [os.path.join(REPO, "bpnet", "utils", name)] +
         [str(a) for a in arguments], cwd=str(cwd),
         env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"),
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -144,16 +144,16 @@ def filters(path):
     return found
 
 
-def float16_mean_bound(stored):
+def mean_bound(stored):
     """
-        How far the mean a script computes in float16 can be from the
-        mean of the stored scores: one rounding per addition and one
-        for the division, each of half a unit in the last place of a
-        value no larger than the sum of the magnitudes
+        How far the mean the script computes in float32 can be from
+        the mean of the stored scores: one rounding per addition and
+        one for the division, each of half a unit in the last place
+        (2 ** -25) of a value no larger than the sum of the magnitudes
     """
 
     magnitudes = np.sum(np.abs(np.asarray(stored, dtype=np.float64)), axis=0)
-    return len(stored) * 2.0 ** -11 * magnitudes + 1e-7
+    return len(stored) * 2.0 ** -25 * magnitudes
 
 
 @pytest.fixture(scope="module")
@@ -189,7 +189,7 @@ def test_mean_scores_are_written(mean_shap):
 def test_mean_score_file(mean_shap, kind):
     """
         The peaks and sequences of the folds, and for every base the
-        mean of its scores over the folds
+        mean of its scores over the folds, to the rounding of float32
     """
 
     paths, sequences, stored = mean_shap[kind]
@@ -208,7 +208,7 @@ def test_mean_score_file(mean_shap, kind):
     assert found["hyp_scores"].shape == (len(PEAKS), LENGTH, 4)
     expected = np.mean(np.asarray(stored, dtype=np.float64), axis=0)
     difference = np.abs(found["hyp_scores"].astype(np.float64) - expected)
-    assert (difference <= float16_mean_bound(stored)).all()
+    assert (difference <= mean_bound(stored)).all()
     # (the mean, not the scores of one fold)
     for fold in stored:
         assert np.abs(fold - expected).max() > 0.01
@@ -225,11 +225,46 @@ def test_mean_score_file(mean_shap, kind):
             "input_seqs": [BLOSC]}
 
 
+def test_mean_is_computed_in_float32(tmp_path):
+    """
+        The folds hold their scores in float16; their mean is computed
+        and stored in float32. Two folds whose scores are neighbours
+        in float16 have a mean halfway between, which float16 cannot
+        hold; and two scores of 40,000, whose sum is beyond float16,
+        have the mean 40,000. (The mean used to be computed in
+        float16: the first rounded to one of the neighbours, the
+        second infinite.)
+    """
+
+    paths, _, stored = score_files(tmp_path, folds=2, seed=5)
+    first = stored[0].copy()
+    first[0, 0, 0], first[0, 0, 1] = 40000, -40000
+    second = np.nextafter(first, np.float16(np.inf))
+    second[0, 0, :2] = first[0, 0, :2]
+    assert second.dtype == np.float16 and (second != first).sum() > 700
+    for path, scores in zip(paths, (first, second)):
+        with h5py.File(path, "r+") as f:
+            f["hyp_scores"][...] = scores
+    out = tmp_path / "out"
+    out.mkdir()
+    code, output = run_script("mean_shap.py", [
+        "--counts_shaps", ",".join(paths), "--output_dir", out], tmp_path)
+    assert code == 0, output[-3000:]
+    found, types = read_scores(str(out / "counts_mean_shap_scores.h5"))
+    expected = (first.astype(np.float64) + second.astype(np.float64)) / 2
+    assert types["hyp_scores"] == np.float32
+    assert np.array_equal(found["hyp_scores"], expected)
+    assert found["hyp_scores"][0, 0, 0] == 40000
+    assert found["hyp_scores"][0, 0, 1] == -40000
+    # most of these means are no float16 numbers
+    assert (expected.astype(np.float16) != expected).sum() > 700
+
+
 def test_mean_is_exact_where_the_arithmetic_is(tmp_path):
     """
         Scores that are multiples of 1/8: their sum over four folds
-        and its quarter are exact in the float16 the folds are stored
-        in, so the mean in the file is the mean, to the last bit
+        and its quarter are exact, so the mean in the file is the
+        mean, to the last bit
     """
 
     paths, _, stored = score_files(tmp_path, folds=4, seed=3, eighths=True)
@@ -257,7 +292,7 @@ def test_mean_of_one_kind_of_score(tmp_path):
     found, _ = read_scores(str(out / "profile_mean_shap_scores.h5"))
     expected = np.mean(np.asarray(stored, dtype=np.float64), axis=0)
     assert (np.abs(found["hyp_scores"] - expected) <=
-            float16_mean_bound(stored)).all()
+            mean_bound(stored)).all()
 
 
 def test_score_that_is_missing_in_a_fold_is_left_out_of_the_mean(tmp_path):
@@ -278,15 +313,16 @@ def test_score_that_is_missing_in_a_fold_is_left_out_of_the_mean(tmp_path):
     two = [stored[0], stored[2]]
     expected = np.mean(np.asarray(two, dtype=np.float64), axis=0)[2, 5, 1]
     assert abs(found["hyp_scores"][2, 5, 1] - expected) <= \
-        float16_mean_bound(two)[2, 5, 1]
+        mean_bound(two)[2, 5, 1]
     assert np.isfinite(found["hyp_scores"]).all()
 
 
-def test_fold_that_is_not_there_is_left_out_today(tmp_path):
+def test_fold_that_is_not_there_is_left_out_with_a_warning(tmp_path):
     """
-        What the script does today (open to question): a file that is
-        not there is named in a message and left out, and the mean of
-        the other folds is written without an error
+        A file that is not there is named in a warning and left out,
+        and the mean of the other folds is written without an error;
+        a second warning says of how many folds the mean is. Run with
+        `python -W error::UserWarning` the script stops instead.
     """
 
     paths, _, stored = score_files(tmp_path, folds=3)
@@ -297,11 +333,28 @@ def test_fold_that_is_not_there_is_left_out_today(tmp_path):
         "--counts_shaps", ",".join(paths[:2] + [missing]),
         "--output_dir", out], tmp_path)
     assert code == 0, output[-3000:]
-    assert missing + " does not exist" in output
+    assert "UserWarning: " + missing + " does not exist or cannot be " \
+        "read" in output
+    assert "it is left out of the mean" in output
+    assert "UserWarning: {}/counts_mean_shap_scores.h5 is the mean of 2 " \
+        "of 3 folds".format(out) in output
     found, _ = read_scores(str(out / "counts_mean_shap_scores.h5"))
     expected = np.mean(np.asarray(stored[:2], dtype=np.float64), axis=0)
     assert (np.abs(found["hyp_scores"] - expected) <=
-            float16_mean_bound(stored[:2])).all()
+            mean_bound(stored[:2])).all()
+    # with every fold there, no warning
+    code, output = run_script("mean_shap.py", [
+        "--counts_shaps", ",".join(paths), "--output_dir", out], tmp_path)
+    assert code == 0 and "Warning" not in output, output[-3000:]
+    # the warning made an error: nothing is written
+    os.remove(str(out / "counts_mean_shap_scores.h5"))
+    code, output = run_script("mean_shap.py", [
+        "--counts_shaps", ",".join(paths[:2] + [missing]),
+        "--output_dir", out], tmp_path,
+        python_options=["-W", "error::UserWarning"])
+    assert code != 0, output[-3000:]
+    assert missing + " does not exist or cannot be read" in output
+    assert os.listdir(str(out)) == []
 
 
 @pytest.mark.parametrize("other", ["chromosomes", "starts", "ends",
@@ -462,12 +515,14 @@ def test_fold_that_is_read_in_part_is_left_out_whole(tmp_path, missing):
     code, output = run_script("mean_shap.py", [
         "--counts_shaps", ",".join(paths), "--output_dir", out], tmp_path)
     assert code == 0, output[-3000:]
-    assert paths[1] + " does not exist or cannot be read (KeyError" in output
+    assert "UserWarning: " + paths[1] + " does not exist or cannot be " \
+        "read (KeyError" in output
+    assert "is the mean of 2 of 3 folds" in output
     found, _ = read_scores(str(out / "counts_mean_shap_scores.h5"))
     two = [stored[0], stored[2]]
     expected = np.mean(np.asarray(two, dtype=np.float64), axis=0)
     assert (np.abs(found["hyp_scores"] - expected) <=
-            float16_mean_bound(two)).all()
+            mean_bound(two)).all()
     assert np.array_equal(found["input_seqs"], sequences)
     assert text(found["coords_chrom"]) == [chrom for chrom, _ in PEAKS]
 
@@ -867,7 +922,9 @@ def test_prediction_fold_read_in_part_is_left_out_whole(tmp_path, missing):
     code, output = run_script("mean_predictions.py", [
         "--prediction_h5s", ",".join(paths), "-o", out], tmp_path)
     assert code == 0, output[-3000:]
-    assert paths[1] + " has problems or does not exist (KeyError" in output
+    assert "UserWarning: " + paths[1] + " has problems or does not " \
+        "exist (KeyError" in output
+    assert "is the mean of 2 of 3 folds" in output
     found, regions = regions_of_the_mean_file(out)
     rows = [REGIONS.index(region) for region in regions]
     np.testing.assert_allclose(
@@ -957,10 +1014,12 @@ def test_mean_predictions_without_bigwigs(tmp_path):
         found["pred_prof"], expected_mean_profile(profiles)[rows], rtol=1e-5)
 
 
-def test_prediction_file_that_is_not_there_is_left_out_today(tmp_path):
+def test_prediction_file_that_is_not_there_is_left_out_with_a_warning(
+        tmp_path):
     """
-        What the script does today (open to question): a file that is
-        not there is named in a message and left out of the mean
+        A file that is not there is named in a warning and left out
+        of the mean; a second warning says of how many folds the mean
+        is
     """
 
     paths, profiles = prediction_files(tmp_path, folds=2, seed=6)
@@ -970,7 +1029,11 @@ def test_prediction_file_that_is_not_there_is_left_out_today(tmp_path):
         "--prediction_h5s", ",".join(paths + [missing]), "-o", out],
         tmp_path)
     assert code == 0, output[-3000:]
-    assert missing + " has problems or does not exist" in output
+    assert "UserWarning: " + missing + " has problems or does not " \
+        "exist" in output
+    assert "it is left out of the mean" in output
+    assert "UserWarning: {}/mean_predictions.h5 is the mean of 2 of 3 " \
+        "folds".format(out) in output
     found, regions = regions_of_the_mean_file(out)
     rows = [REGIONS.index(region) for region in regions]
     np.testing.assert_allclose(

@@ -6,6 +6,7 @@ import gc
 import pyBigWig
 import os
 import sys
+import warnings
 
 parser = argparse.ArgumentParser(description="Take a mean of prediction h5s and save the outputs as both hdf5 format and bigwigs. PROVIDE ABSOLUTE PATHS!")
 
@@ -70,8 +71,12 @@ def mean_predictions(predictions_list,h5_out_path):
             # be one of fewer folds for want of memory)
             raise
         except Exception as error:
-            print(f'{predictions_h5} has problems or does not exist '
-                  f'({type(error).__name__}: {error})')
+            # a fold that is not there or cannot be read is left out
+            # with a warning, and the mean is that of the others
+            # (python -W error::UserWarning makes it an error)
+            warnings.warn(f'{predictions_h5} has problems or does not exist '
+                          f'({type(error).__name__}: {error}): it is left '
+                          f'out of the mean')
             continue
 
         if np.any(pred_prof<=0) or np.any(pred_logcounts<=0):
@@ -100,6 +105,9 @@ def mean_predictions(predictions_list,h5_out_path):
         sys.exit(f'None of the prediction files could be read '
                  f'({",".join(predictions_list)}): {h5_out_path} is not '
                  f'written')
+    if len(read) < len(predictions_list):
+        warnings.warn(f'{h5_out_path} is the mean of {len(read)} of '
+                      f'{len(predictions_list)} folds')
 
     # the folds must be of the same regions
     for what, values in (('chromosomes', chrom_lst), ('starts', start_lst),
