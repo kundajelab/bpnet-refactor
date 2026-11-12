@@ -7,7 +7,6 @@ import numpy as np
 import argparse
 import gc
 import sys
-import warnings
 
 
 parser = argparse.ArgumentParser(description="calculate mean shap over the given h5s")
@@ -56,11 +55,13 @@ def mean_shap(shaps_list,output_path):
             raise
         except Exception as error:
             # a fold that is not there or cannot be read is left out
-            # with a warning, and the mean is that of the others
-            # (python -W error::UserWarning makes it an error)
-            warnings.warn(f'{shap_h5} does not exist or cannot be read '
-                          f'({type(error).__name__}: {error}): it is left '
-                          f'out of the mean')
+            # with a warning, and the mean is that of the others. (The
+            # warning is a line on the standard error: one given with
+            # the warnings module is not shown under PYTHONWARNINGS=
+            # ignore, and the mean of fewer folds would be silent.)
+            print(f'WARNING: {shap_h5} does not exist or cannot be read '
+                  f'({type(error).__name__}: {error}): it is left out of '
+                  f'the mean', file=sys.stderr, flush=True)
             continue
         read.append(shap_h5)
         hyp_scores_lst.append(fold[0])
@@ -73,8 +74,8 @@ def mean_shap(shaps_list,output_path):
         sys.exit(f'None of the score files could be read ({shaps_list}): '
                  f'{output_path} is not written')
     if len(read) < len(given):
-        warnings.warn(f'{output_path} is the mean of {len(read)} of '
-                      f'{len(given)} folds')
+        print(f'WARNING: {output_path} is the mean of {len(read)} of '
+              f'{len(given)} folds', file=sys.stderr, flush=True)
 
     # the folds must be of the same peaks and the same sequences: a
     # mean over anything else would be written under the peaks and the

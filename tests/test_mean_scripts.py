@@ -32,12 +32,11 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LONG = "chrUn_KI270302v1"
 
 
-def run_script(name, arguments, cwd, python_options=()):
+def run_script(name, arguments, cwd, **environment):
     done = subprocess.run(
-        [sys.executable] + list(python_options) +
-        [os.path.join(REPO, "bpnet", "utils", name)] +
+        [sys.executable, os.path.join(REPO, "bpnet", "utils", name)] +
         [str(a) for a in arguments], cwd=str(cwd),
-        env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"),
+        env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1", **environment),
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         universal_newlines=True, timeout=600)
     return done.returncode, done.stdout
@@ -147,13 +146,16 @@ def filters(path):
 def mean_bound(stored):
     """
         How far the mean the script computes in float32 can be from
-        the mean of the stored scores: one rounding per addition and
-        one for the division, each of half a unit in the last place
-        (2 ** -25) of a value no larger than the sum of the magnitudes
+        the mean of the stored scores. Every addition is rounded by at
+        most 2 ** -24 of its result, which is no larger than the sum
+        of the magnitudes: n - 1 additions, divided by n, and one more
+        rounding of the quotient (itself at most that sum over n)
+        come to 2 ** -24 of the sum of the magnitudes, in whatever
+        order the values are added.
     """
 
     magnitudes = np.sum(np.abs(np.asarray(stored, dtype=np.float64)), axis=0)
-    return len(stored) * 2.0 ** -25 * magnitudes
+    return 2.0 ** -24 * magnitudes
 
 
 @pytest.fixture(scope="module")
@@ -321,8 +323,9 @@ def test_fold_that_is_not_there_is_left_out_with_a_warning(tmp_path):
     """
         A file that is not there is named in a warning and left out,
         and the mean of the other folds is written without an error;
-        a second warning says of how many folds the mean is. Run with
-        `python -W error::UserWarning` the script stops instead.
+        a second warning says of how many folds the mean is. The
+        warnings are lines on the standard error, shown also where
+        Python's own warnings are switched off.
     """
 
     paths, _, stored = score_files(tmp_path, folds=3)
@@ -333,28 +336,29 @@ def test_fold_that_is_not_there_is_left_out_with_a_warning(tmp_path):
         "--counts_shaps", ",".join(paths[:2] + [missing]),
         "--output_dir", out], tmp_path)
     assert code == 0, output[-3000:]
-    assert "UserWarning: " + missing + " does not exist or cannot be " \
-        "read" in output
-    assert "it is left out of the mean" in output
-    assert "UserWarning: {}/counts_mean_shap_scores.h5 is the mean of 2 " \
-        "of 3 folds".format(out) in output
+    warnings = [line for line in output.splitlines()
+                if line.startswith("WARNING: ")]
+    assert len(warnings) == 2, output[-3000:]
+    assert warnings[0].startswith(
+        "WARNING: " + missing + " does not exist or cannot be read (")
+    assert warnings[0].endswith(": it is left out of the mean")
+    assert warnings[1] == "WARNING: {}/counts_mean_shap_scores.h5 is the " \
+        "mean of 2 of 3 folds".format(out)
     found, _ = read_scores(str(out / "counts_mean_shap_scores.h5"))
     expected = np.mean(np.asarray(stored[:2], dtype=np.float64), axis=0)
     assert (np.abs(found["hyp_scores"] - expected) <=
             mean_bound(stored[:2])).all()
+    # the same two lines where Python's warnings are switched off
+    code, quiet = run_script("mean_shap.py", [
+        "--counts_shaps", ",".join(paths[:2] + [missing]),
+        "--output_dir", out], tmp_path, PYTHONWARNINGS="ignore")
+    assert code == 0, quiet[-3000:]
+    assert [line for line in quiet.splitlines()
+            if line.startswith("WARNING: ")] == warnings
     # with every fold there, no warning
     code, output = run_script("mean_shap.py", [
         "--counts_shaps", ",".join(paths), "--output_dir", out], tmp_path)
-    assert code == 0 and "Warning" not in output, output[-3000:]
-    # the warning made an error: nothing is written
-    os.remove(str(out / "counts_mean_shap_scores.h5"))
-    code, output = run_script("mean_shap.py", [
-        "--counts_shaps", ",".join(paths[:2] + [missing]),
-        "--output_dir", out], tmp_path,
-        python_options=["-W", "error::UserWarning"])
-    assert code != 0, output[-3000:]
-    assert missing + " does not exist or cannot be read" in output
-    assert os.listdir(str(out)) == []
+    assert code == 0 and "WARNING" not in output.upper(), output[-3000:]
 
 
 @pytest.mark.parametrize("other", ["chromosomes", "starts", "ends",
@@ -515,8 +519,8 @@ def test_fold_that_is_read_in_part_is_left_out_whole(tmp_path, missing):
     code, output = run_script("mean_shap.py", [
         "--counts_shaps", ",".join(paths), "--output_dir", out], tmp_path)
     assert code == 0, output[-3000:]
-    assert "UserWarning: " + paths[1] + " does not exist or cannot be " \
-        "read (KeyError" in output
+    assert "WARNING: " + paths[1] + " does not exist or cannot be read " \
+        "(KeyError" in output
     assert "is the mean of 2 of 3 folds" in output
     found, _ = read_scores(str(out / "counts_mean_shap_scores.h5"))
     two = [stored[0], stored[2]]
@@ -922,8 +926,8 @@ def test_prediction_fold_read_in_part_is_left_out_whole(tmp_path, missing):
     code, output = run_script("mean_predictions.py", [
         "--prediction_h5s", ",".join(paths), "-o", out], tmp_path)
     assert code == 0, output[-3000:]
-    assert "UserWarning: " + paths[1] + " has problems or does not " \
-        "exist (KeyError" in output
+    assert "WARNING: " + paths[1] + " has problems or does not exist " \
+        "(KeyError" in output
     assert "is the mean of 2 of 3 folds" in output
     found, regions = regions_of_the_mean_file(out)
     rows = [REGIONS.index(region) for region in regions]
@@ -1029,11 +1033,20 @@ def test_prediction_file_that_is_not_there_is_left_out_with_a_warning(
         "--prediction_h5s", ",".join(paths + [missing]), "-o", out],
         tmp_path)
     assert code == 0, output[-3000:]
-    assert "UserWarning: " + missing + " has problems or does not " \
-        "exist" in output
-    assert "it is left out of the mean" in output
-    assert "UserWarning: {}/mean_predictions.h5 is the mean of 2 of 3 " \
-        "folds".format(out) in output
+    warnings = [line for line in output.splitlines()
+                if line.startswith("WARNING: ")]
+    assert len(warnings) == 2, output[-3000:]
+    assert warnings[0].startswith(
+        "WARNING: " + missing + " has problems or does not exist (")
+    assert warnings[0].endswith(": it is left out of the mean")
+    assert warnings[1] == "WARNING: {}/mean_predictions.h5 is the mean " \
+        "of 2 of 3 folds".format(out)
+    code, quiet = run_script("mean_predictions.py", [
+        "--prediction_h5s", ",".join(paths + [missing]), "-o", out],
+        tmp_path, PYTHONWARNINGS="ignore")
+    assert code == 0, quiet[-3000:]
+    assert [line for line in quiet.splitlines()
+            if line.startswith("WARNING: ")] == warnings
     found, regions = regions_of_the_mean_file(out)
     rows = [REGIONS.index(region) for region in regions]
     np.testing.assert_allclose(
