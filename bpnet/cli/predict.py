@@ -324,6 +324,9 @@ def metrics_update(
         true_profile_smooth_prob = true_profile_smooth / np.sum(
             true_profile_smooth)
         pred_profile_prob = pred_profile / np.sum(pred_profile)
+        # a constant prediction has to be recognised before the sum is
+        # nudged to exactly 1, which changes one element
+        pred_is_constant = np.unique(pred_profile_prob).size == 1
         pred_profile_prob = _fix_sum_to_one(pred_profile_prob)
 
         # metrics 
@@ -335,7 +338,7 @@ def metrics_update(
         # different approach to check if the array has the same value.
         # If true then pearson correlation is undefined 
         if np.unique(true_profile_smooth_prob).size == 1 or \
-            np.unique(pred_profile_prob).size == 1:
+            pred_is_constant:
             metrics_tracker['profile_pearsonrs'][example_idx, track_idx] = 0
             metrics_tracker['profile_spearmanrs'][example_idx, track_idx] = 0
         else:
